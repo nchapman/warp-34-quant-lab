@@ -68,8 +68,11 @@ Full receipts and Hugging Face model cards are stored in [`results/`](results/):
 
 | Model | Artifact (`nchapman/*`) | Size | `probe-v4` PPL (BF16 → Quant) | `probe-v4` `weighted_kl` | `probe-guard` `weighted_kl` (`mean_kl`) | MTP Iso `mean_kl` (Top-1) | Vision Iso `mean_kl` (Top-1) | Vision Guard Iso Top-1 |
 |---|---|---:|---|---:|---|---:|---:|---:|
+| `Qwen/Qwen3.5-0.8B` | [`Qwen3.5-0.8B-W4A16-HGPTQ`](results/dense-w4a16-hgptq/0.8b-g64-h64/README.md) | `0.79 GiB` | `4.1695 → 4.3593` (`+4.552%`) | `0.090123` | `0.144566` (`0.104081`) | `0.036357` (`89.71%`) | `0.031343` (`92.38%`) | `98.52%` |
 | `Qwen/Qwen3.5-2B` | [`Qwen3.5-2B-W4A16-HGPTQ`](results/dense-w4a16-hgptq/g64-h64/README.md) | `1.84 GiB` | `3.8302 → 3.8942` (`+1.669%`) | `0.072782` | `0.072536` (`0.057225`) | `0.025525` (`91.87%`) | `0.015169` (`97.45%`) | — |
+| `Qwen/Qwen3.5-4B` | [`Qwen3.5-4B-W4A16-HGPTQ`](results/dense-w4a16-hgptq/4b-g64-h64/README.md) | `3.21 GiB` | `4.0299 → 4.1446` (`+2.846%`) | `0.094853` | `0.086273` (`0.063317`) | `0.018534` (`93.47%`) | `0.004737` (`99.67%`) | `98.52%` |
 | `Qwen/Qwen3.5-9B` | [`Qwen3.5-9B-W4A16-HGPTQ`](results/dense-w4a16-hgptq/9b-g64-h64/README.md) | `7.62 GiB` | `3.5754 → 3.6428` (`+1.887%`) | `0.072561` | `0.056641` (`0.039547`) | `0.012801` (`94.80%`) | `0.007640` (`98.09%`) | — |
+| `ornith-ai/Ornith-1.5-9B` | [`Ornith-1.5-9B-W4A16-HGPTQ`](results/dense-w4a16-hgptq/9b-ornith-g64-h64/README.md) | `7.62 GiB` | `6.6829 → 6.8463` (`+2.446%`) | `0.183540` | `0.152303` (`0.109793`) | `0.015852` (`94.11%`) | `0.015336` (`96.03%`) | `96.30%` |
 | `Qwen/Qwen3.8-27B` | [`Qwen3.8-27B-W4A16-HGPTQ`](results/dense-w4a16-hgptq/27b-g64-h64/README.md) | `17.33 GiB` | `8.5438 → 8.5189` (`-0.292%`) | `0.115968` | `0.081058` (`0.063923`) | `0.010930` (`96.22%`) | `0.015734` (`97.45%`) | — |
 | `Qwen/Qwen3.6-35B-A3B` | [`Qwen3.6-35B-A3B-W4A16-HGPTQ`](results/qwen36-35b-a3b-w4a16-hgptq/README.md) | `19.24 GiB` | `4.0208 → 4.0078` (`-0.324%`) | `0.086829` | `0.061499` (`0.049570`) | `0.011294` (`95.71%`) | `0.007712` (`98.34%`) | `99.26%` |
 | `Qwen/Qwen3.8-Flash-Next` | [`Qwen3.8-Flash-Next-W4A16-HGPTQ`](results/qwen38-flash-next-w4a16-hgptq/README.md) | `93.42 GiB` | `3.6085 → 3.5963` (`-0.338%`) | `0.050367` | `0.130763` (`0.100696`) | `0.021747` (`95.01%`) | `0.017132` (`96.69%`) | `99.26%` |

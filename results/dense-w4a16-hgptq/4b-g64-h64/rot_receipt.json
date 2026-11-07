@@ -1,0 +1,22 @@
+{
+  "model": "4b",
+  "base_snapshot": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+  "group_size": 64,
+  "hadamard_block_size": 64,
+  "actorder": "static",
+  "dampening_frac": 0.01,
+  "quantize_mtp": true,
+  "quantize_vision": true,
+  "component_quant_mode": "gptq",
+  "shard_counts": {
+    "stripped_transform_weights": 1,
+    "mtp_quantized": 7,
+    "vision_quantized": 98,
+    "vision_fc2_channel": 0
+  },
+  "calib": "data/calib-cascade-v1.jsonl",
+  "num_samples": 999,
+  "max_seq_length": 4096,
+  "quant_wall_s": 653.95,
+  "template_sha": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2"
+}
