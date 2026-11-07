@@ -1,0 +1,186 @@
+{
+  "base_model": "incoai/Qwen3.8-Flash-Next-DFlash2",
+  "verifier_model": "nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ",
+  "target_layer_ids": [
+    5,
+    15,
+    25,
+    35,
+    45
+  ],
+  "calib_sequences": 96,
+  "eval_sequences": 32,
+  "eval_blocks": 2048,
+  "eval_drafted_tokens": 14336,
+  "calib_time_s": 38.87,
+  "arms": {
+    "BF16_Reference": {
+      "tau": 2.7600227557122707,
+      "oracle_top16_tau": 4.1689453125,
+      "recall_at_16": 0.5967494419642857,
+      "selector_acc": 0.7011104617182934,
+      "unary_loss": 2.4939571861177683,
+      "selector_loss": 2.6380615234375,
+      "pos_acc": {
+        "pos_1": 0.61669921875,
+        "pos_2": 0.4560546875,
+        "pos_3": 0.365234375,
+        "pos_4": 0.2958984375,
+        "pos_5": 0.2646484375,
+        "pos_6": 0.2275390625,
+        "pos_7": 0.21044921875
+      },
+      "size_mib": 1150.26,
+      "unary_kl_vs_bf16": 0.0,
+      "unary_median_kl_vs_bf16": 0.0,
+      "unary_p99_kl_vs_bf16": 0.0,
+      "unary_top1_agree": 1.0,
+      "sel_top1_agree": 1.0
+    },
+    "W4_RTN_g64_h0_45linear": {
+      "tau": 2.702352587133646,
+      "oracle_top16_tau": 4.123046875,
+      "recall_at_16": 0.5850306919642857,
+      "selector_acc": 0.7010850125193753,
+      "unary_loss": 2.4866987504065037,
+      "selector_loss": 2.62420654296875,
+      "pos_acc": {
+        "pos_1": 0.61328125,
+        "pos_2": 0.443359375,
+        "pos_3": 0.35986328125,
+        "pos_4": 0.28955078125,
+        "pos_5": 0.255859375,
+        "pos_6": 0.21044921875,
+        "pos_7": 0.205078125
+      },
+      "size_mib": 530.63,
+      "unary_kl_vs_bf16": 0.18378005921840668,
+      "unary_median_kl_vs_bf16": 0.08040305972099304,
+      "unary_p99_kl_vs_bf16": 1.7864035367965698,
+      "unary_top1_agree": 0.8053152901785714,
+      "sel_top1_agree": 0.8070591517857143
+    },
+    "W4_RTN_g64_h64_45linear": {
+      "tau": 2.717600256204605,
+      "oracle_top16_tau": 4.140625,
+      "recall_at_16": 0.5929827008928571,
+      "selector_acc": 0.6970944594753559,
+      "unary_loss": 2.469005761668086,
+      "selector_loss": 2.61431884765625,
+      "pos_acc": {
+        "pos_1": 0.6162109375,
+        "pos_2": 0.451171875,
+        "pos_3": 0.3623046875,
+        "pos_4": 0.28369140625,
+        "pos_5": 0.26025390625,
+        "pos_6": 0.22314453125,
+        "pos_7": 0.197265625
+      },
+      "size_mib": 530.63,
+      "unary_kl_vs_bf16": 0.15383467078208923,
+      "unary_median_kl_vs_bf16": 0.07071283459663391,
+      "unary_p99_kl_vs_bf16": 1.39225435256958,
+      "unary_top1_agree": 0.8200334821428571,
+      "sel_top1_agree": 0.8160574776785714
+    },
+    "W4_HGPTQ_g64_h64_35linear (attn+mlp)": {
+      "tau": 2.751580808311701,
+      "oracle_top16_tau": 4.1708984375,
+      "recall_at_16": 0.5960518973214286,
+      "selector_acc": 0.7023990637799883,
+      "unary_loss": 2.4903579261153936,
+      "selector_loss": 2.636962890625,
+      "pos_acc": {
+        "pos_1": 0.6162109375,
+        "pos_2": 0.455078125,
+        "pos_3": 0.36376953125,
+        "pos_4": 0.29638671875,
+        "pos_5": 0.2587890625,
+        "pos_6": 0.22412109375,
+        "pos_7": 0.20751953125
+      },
+      "size_mib": 553.58,
+      "unary_kl_vs_bf16": 0.026615532115101814,
+      "unary_median_kl_vs_bf16": 0.011648365296423435,
+      "unary_p99_kl_vs_bf16": 0.2348233014345169,
+      "unary_top1_agree": 0.9232700892857143,
+      "sel_top1_agree": 0.9143415178571429
+    },
+    "W4_HGPTQ_g64_h64_45linear (+conv)": {
+      "tau": 2.751641120761633,
+      "oracle_top16_tau": 4.16552734375,
+      "recall_at_16": 0.5959821428571429,
+      "selector_acc": 0.701310861423221,
+      "unary_loss": 2.489694010466337,
+      "selector_loss": 2.632080078125,
+      "pos_acc": {
+        "pos_1": 0.6181640625,
+        "pos_2": 0.4560546875,
+        "pos_3": 0.36474609375,
+        "pos_4": 0.2958984375,
+        "pos_5": 0.25927734375,
+        "pos_6": 0.22412109375,
+        "pos_7": 0.2080078125
+      },
+      "size_mib": 530.63,
+      "unary_kl_vs_bf16": 0.02757122740149498,
+      "unary_median_kl_vs_bf16": 0.012147665955126286,
+      "unary_p99_kl_vs_bf16": 0.23985837399959564,
+      "unary_top1_agree": 0.9222935267857143,
+      "sel_top1_agree": 0.9146902901785714
+    },
+    "W4_HGPTQ_g64_h64_46linear (+conv+fc)": {
+      "tau": 2.7503677532076836,
+      "oracle_top16_tau": 4.16064453125,
+      "recall_at_16": 0.5946568080357143,
+      "selector_acc": 0.7022873900293255,
+      "unary_loss": 2.4899476412683725,
+      "selector_loss": 2.63262939453125,
+      "pos_acc": {
+        "pos_1": 0.615234375,
+        "pos_2": 0.45751953125,
+        "pos_3": 0.3662109375,
+        "pos_4": 0.29833984375,
+        "pos_5": 0.2578125,
+        "pos_6": 0.22216796875,
+        "pos_7": 0.20849609375
+      },
+      "size_mib": 484.73,
+      "unary_kl_vs_bf16": 0.030689861625432968,
+      "unary_median_kl_vs_bf16": 0.013903786428272724,
+      "unary_p99_kl_vs_bf16": 0.2680710256099701,
+      "unary_top1_agree": 0.9203404017857143,
+      "sel_top1_agree": 0.9124581473214286
+    },
+    "W4_HGPTQ_g64_h64_47linear (+sel_proj)": {
+      "tau": 2.7503677532076836,
+      "oracle_top16_tau": 4.16064453125,
+      "recall_at_16": 0.5946568080357143,
+      "selector_acc": 0.6998240469208211,
+      "unary_loss": 2.4899476412683725,
+      "selector_loss": 2.63043212890625,
+      "pos_acc": {
+        "pos_1": 0.615234375,
+        "pos_2": 0.45751953125,
+        "pos_3": 0.3662109375,
+        "pos_4": 0.29833984375,
+        "pos_5": 0.2578125,
+        "pos_6": 0.22216796875,
+        "pos_7": 0.20849609375
+      },
+      "size_mib": 483.81,
+      "unary_kl_vs_bf16": 0.030689861625432968,
+      "unary_median_kl_vs_bf16": 0.013903786428272724,
+      "unary_p99_kl_vs_bf16": 0.2680710256099701,
+      "unary_top1_agree": 0.9203404017857143,
+      "sel_top1_agree": 0.9081333705357143
+    }
+  },
+  "exported_checkpoint": {
+    "path": "out/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ",
+    "safetensors_bytes": 556422320,
+    "safetensors_mib": 530.65,
+    "safetensors_gib": 0.5182,
+    "quantized_linears": 45
+  }
+}

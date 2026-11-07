@@ -161,7 +161,8 @@ Because the 9B/27B/35B ViT MLP has `intermediate_size = 4304 = 269 × 16`, the 2
 - **2B**: [`nchapman/Qwen3.5-2B-W4A16-HGPTQ`](https://huggingface.co/nchapman/Qwen3.5-2B-W4A16-HGPTQ) (`SHA256SUMS` digest: `b6dc3bcf2638bdb998ee922ce755ad570be1f03fb41a3b5587d6ed3cb51e74a4`; see `receipts/g64-h64/hub-SHA256SUMS.txt`)
 - **9B**: [`nchapman/Qwen3.5-9B-W4A16-HGPTQ`](https://huggingface.co/nchapman/Qwen3.5-9B-W4A16-HGPTQ) (`SHA256SUMS` digest: `0589647f11e5145a54caba42efb54a5aafd82b1652802141b59f4a172ffa3c07`; see `receipts/9b-g64-h64/hub-SHA256SUMS.txt`)
 - **27B**: [`nchapman/Qwen3.8-27B-W4A16-HGPTQ`](https://huggingface.co/nchapman/Qwen3.8-27B-W4A16-HGPTQ) (`SHA256SUMS` digest: `bdda0b679feddb5344fe15d624e28503db736b5924a8bc3ebadad2ef2e03806e`; see `receipts/27b-g64-h64/hub-SHA256SUMS.txt`)
-- **27B DFlash2 Speculative Drafter**: [`nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ`](https://huggingface.co/nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ) (`1,338.9 MiB` / `1.31 GiB`; see `dflash2-27b-w4-ablation.json`)
+- **27B DFlash2 Speculative Drafter**: [`nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ`](https://huggingface.co/nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ) (`1,338.9 MiB` / `1.31 GiB`; see `dflash2-27b-probe.json`)
+- **Flash-Next DFlash2 Speculative Drafter**: [`nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ`](https://huggingface.co/nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ) (`530.6 MiB` / `0.52 GiB`; see `dflash2-flash-next-probe.json`)
 - **35B-A3B (`MoE`)**: [`nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ`](https://huggingface.co/nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ) (`SHA256SUMS` digest: `cb98ab7a9b41ae09f81673181b7d1f61f1b96c756add13099a51af8745d6a778`; see `receipts/35b-g64-h64/hub-SHA256SUMS.txt`)
 
 See also [`blog-4bit-vs-8bit-and-gguf.md`](blog-4bit-vs-8bit-and-gguf.md) for the companion writeup comparing `HGPTQ-g64` against off-the-shelf 4-bit, mixed 4/8-bit (`RCO-15%`), and Unsloth `Q4_K_M` / `UD-Q4_K_XL` GGUFs.
@@ -260,5 +261,24 @@ We applied the same `W4A16-HGPTQ-g64` recipe to [`incoai/Qwen3.8-27B-DFlash2`](h
 | **`W4_HGPTQ g64-h64` (45 linears: `+conv`, sweet spot)** | **1,338.9** | **0.02309 (−57.6%)** | **0.01074** | **0.1876 (−62.1%)** | **92.63%** | **92.03%** | **2.535** | **53.88%** | **56.5% / 38.9% / 29.4%** |
 | **`W4_HGPTQ g64-h64` (46 linears: `+conv+fc`)** | **1,155.3** | 0.02546 | 0.01210 | 0.2148 | 92.05% | 91.73% | **2.535** | 53.84% | 56.1% / 38.8% / 29.4% |
 | `W4_HGPTQ g64-h64` (47 linears: `+sel_proj`) | 1,153.4 | 0.02546 | 0.01210 | 0.2148 | 92.05% | 91.60% | 2.535 | 53.84% | 56.1% / 38.8% / 29.4% |
+
+---
+
+## 11. Follow-Up: Quantizing the 5-Layer `incoai/Qwen3.8-Flash-Next-DFlash2` Speculative Drafter (`dflash2-flash-next-probe.json`)
+
+We applied the same `W4A16-HGPTQ-g64` recipe locally on an `NVIDIA GB10` (`121 GiB` unified memory) to [`incoai/Qwen3.8-Flash-Next-DFlash2`](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) (`1,150.3 MiB` / `1.123 GiB` in BF16; 5 `Qwen3DFlash2DecoderLayer` blocks at `hidden_size=2560`, `intermediate_size=7680`, `block_size=8`, `target_layer_ids=[5, 15, 25, 35, 45]`, `GroupedDynamicCausalConv` + bilinear `CandidateSelector`).
+
+- **5-Tap Hyper-Connection Streaming Capture**: Streamed `nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ` shard-by-shard across 96 calibration sequences (`data/calib-cascade-v1.jsonl`) and 32 evaluation sequences (`data/probe-v4.jsonl`), capturing completed zero-based layer outputs at `[5, 15, 25, 35, 45]` averaged across the 4 hyper-connection streams (`hidden_states.unflatten(-1, (4, 2560)).mean(dim=-2)`) plus post-`hyper_connection_mixer` final hidden states (`38.87s` calibration time across all 47 `DFlash2` linear modules).
+- **Evaluation**: 32 sequences (`512` tokens each, `2,048` 8-token draft blocks = `14,336` drafted tokens) from `data/probe-v4.jsonl`.
+
+| `Qwen3.8-Flash-Next-DFlash2` Arm | Size (MiB) | Unary KL vs BF16 ↓ | Median KL ↓ | `p99` KL ↓ | Unary Top-1 Agree ↑ | Selector Top-1 Agree ↑ | Verifier Accept $\tau$ ↑ | Recall@16 ↑ | Pos-1 / Pos-2 / Pos-3 Acc ↑ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| **`BF16_Reference`** (unquantized) | 1,150.3 | 0.00000 | 0.00000 | 0.0000 | 100.00% | 100.00% | **2.760** | **59.67%** | 61.7% / 45.6% / 36.5% |
+| `W4_RTN g64-h0` (45 layer linears) | 530.6 | 0.18378 | 0.08040 | 1.7864 | 80.53% | 80.71% | 2.702 | 58.50% | 61.3% / 44.3% / 36.0% |
+| `W4_RTN g64-h64` (data-free Hadamard) | 530.6 | 0.15383 | 0.07071 | 1.3923 | 82.00% | 81.61% | 2.718 | 59.30% | 61.6% / 45.1% / 36.2% |
+| **`W4_HGPTQ g64-h64` (35 linears: `attn+mlp`)** | 553.6 | **0.02662 (−85.5%)** | **0.01165** | **0.2348 (−86.9%)** | **92.33%** | **91.43%** | **2.752** | **59.61%** | 61.6% / 45.5% / 36.4% |
+| **`W4_HGPTQ g64-h64` (45 linears: `+conv`, sweet spot)** | **530.6** | **0.02757 (−85.0%)** | **0.01215** | **0.2399 (−86.6%)** | **92.23%** | **91.47%** | **2.752** | **59.60%** | **61.8% / 45.6% / 36.5%** |
+| **`W4_HGPTQ g64-h64` (46 linears: `+conv+fc`)** | **484.7** | 0.03069 | 0.01390 | 0.2681 | 92.03% | 91.25% | 2.750 | 59.47% | 61.5% / 45.8% / 36.6% |
+| `W4_HGPTQ g64-h64` (47 linears: `+sel_proj`) | 483.8 | 0.03069 | 0.01390 | 0.2681 | 92.03% | 90.81% | 2.750 | 59.47% | 61.5% / 45.8% / 36.6% |
 
 

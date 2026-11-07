@@ -79,6 +79,13 @@ Full receipts and Hugging Face model cards are stored in [`results/`](results/):
 | `ornith-ai/Ornith-1.5-35B-A3B` | [`Ornith-1.5-35B-A3B-W4A16-HGPTQ`](results/ornith-15-35b-a3b-w4a16-hgptq/README.md) | `19.24 GiB` | `10.8033 → 10.2988` (`-4.669%`) | `0.124465` | `0.255849` (`0.184066`) | `0.023655` (`90.90%`) | `0.026757` (`97.02%`) | `97.04%` |
 | `Qwen/Qwen3.8-Flash-Next` | [`Qwen3.8-Flash-Next-W4A16-HGPTQ`](results/qwen38-flash-next-w4a16-hgptq/README.md) | `93.42 GiB` | `3.6085 → 3.5963` (`-0.338%`) | `0.050367` | `0.130763` (`0.100696`) | `0.021747` (`95.01%`) | `0.017132` (`96.69%`) | `99.26%` |
 
+### Companion DFlash2 Block-Diffusion Speculative Drafters (`W4A16-HGPTQ`)
+
+| Base Drafter | Artifact (`nchapman/*`) | Size (BF16 → Quant) | Streamed Decoder Weights / Draft Step | Acceptance Length $\tau$ (BF16 → Quant) | `Recall@16` (BF16 → Quant) | Unary KL vs BF16 | Unary / Selector Top-1 Agreement |
+|---|---|---|---|---|---|---|---|
+| `incoai/Qwen3.8-27B-DFlash2` | [`Qwen3.8-27B-DFlash2-W4A16-HGPTQ`](results/dense-w4a16-hgptq/dflash2-27b-README.md) | `3.58 GiB → 1.31 GiB` (`2.74×`) | `3,175 MiB → 843 MiB` (`3.76×`) | `2.540 → 2.535` (`99.8%`) | `53.88% → 53.88%` (`100.0%`) | `0.023087` | `92.63% / 92.03%` |
+| `incoai/Qwen3.8-Flash-Next-DFlash2` | [`Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ`](results/dense-w4a16-hgptq/dflash2-flash-next-README.md) | `1.12 GiB → 0.52 GiB` (`2.17×`) | `843.8 MiB → 224.1 MiB` (`3.76×`) | `2.760 → 2.752` (`99.7%`) | `59.67% → 59.60%` (`99.9%`) | `0.027571` | `92.23% / 91.47%` |
+
 ---
 
 ## Architecture & Engineering Lessons Learned
