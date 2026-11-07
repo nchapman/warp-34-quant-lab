@@ -18,6 +18,8 @@ tags:
 
 4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ (`HGPTQ`) + 4-bit `Custom-LUT4` Layer-1 PLE** quantization of [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) across **Text (`74,028` linears), Layer-1 Per-Layer Embedding (`51.2B` params), Native MTP (`1,543` linears), and Vision (`110` linears)**, reducing the checkpoint payload from `335.28 GiB` (`360 GB`) in BF16 to **`93.42 GiB` (`3.59×` smaller)** across `59` safetensors shards.
 
+> **Summary:** Compresses a `335 GiB` (`360 GB`) 512-expert MoE + `51.2B`-parameter Layer-1 Per-Layer Embedding (PLE) model by `3.6×` down to `93.42 GiB` (`62.7 GiB` text + `26.8 GiB` 4-bit LUT PLE + `1.3 GiB` MTP + `0.2 GiB` vision). Achieves the tightest BF16 tracking in the entire lineup (`0.050` KL divergence, `-0.34%` perplexity delta, `95.0%` speculative drafter agreement, and `96.7%–99.3%` vision agreement), though rare out-of-distribution multilingual/formatting prompts see slightly higher variance (`+10.9%` holdout perplexity, `0.101` token KL) when hitting cold experts and N-gram rows.
+
 ## Quality vs. BF16 Base Model (`Qwen/Qwen3.8-Flash-Next`)
 
 Teacher-forced evaluation comparing this checkpoint directly against the unquantized BF16 base model:

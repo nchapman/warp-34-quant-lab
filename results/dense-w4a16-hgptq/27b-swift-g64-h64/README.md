@@ -16,6 +16,8 @@ tags:
 
 4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ (`HGPTQ`)** quantization of [ukisai/Swift-1.5-Qwen3.8-27b](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b) across **Text (`400` linears), Native MTP (`7` linears), and Vision (`110` linears)**, reducing the checkpoint payload from `51.75 GiB` in BF16 to **`17.33 GiB` (`2.99×` smaller)**.
 
+> **Summary:** Compresses `Swift-1.5-Qwen3.8-27b` by `3.0×` (`51.8 GiB → 17.33 GiB`) to fit on a **single 24 GB GPU**. Tracks the BF16 fine-tune closely across text (`0.127` KL divergence), speculative drafting (`96.2%` top-1 agreement), and vision (`97.0%–97.8%` top-1 agreement). *(Note: Perplexity reads `4.1%` lower than BF16 because 4-bit quantization slightly softens the fine-tune’s sharp logit spikes on low-probability tokens.)*
+
 ## Quality vs. BF16 Base Model (`ukisai/Swift-1.5-Qwen3.8-27b`)
 
 Teacher-forced evaluation comparing this checkpoint directly against the unquantized BF16 base model:

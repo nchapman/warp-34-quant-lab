@@ -16,6 +16,8 @@ tags:
 
 4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ (`HGPTQ`)** quantization of [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) across **Text (`400` linears), Native MTP (`7` linears), and Vision (`110` linears)**, reducing the checkpoint payload from `51.75 GiB` in BF16 to **`17.33 GiB` (`2.99×` smaller)**.
 
+> **Summary:** Compresses a `51.8 GiB` dense model by `3.0×` (`17.33 GiB`, saving `34.4 GiB` of VRAM) so it fits on a **single 24 GB GPU (RTX 3090 / 4090)** with ~6.5 GiB left for KV cache. At 27B scale, 4-bit Hadamard GPTQ is nearly lossless: text perplexity matches BF16 (`8.54 → 8.52`), speculative drafter top-1 agreement is `96.2%`, and vision top-1 agreement is `97.5%`.
+
 ## Quality vs. BF16 Base Model (`Qwen/Qwen3.8-27B`)
 
 Teacher-forced evaluation comparing this checkpoint directly against the unquantized BF16 base model:

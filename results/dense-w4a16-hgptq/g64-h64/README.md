@@ -16,6 +16,8 @@ tags:
 
 4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ (`HGPTQ`)** quantization of [Qwen/Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B) across **Text (`150` linears), Native MTP (`7` linears), and Vision (`98` linears)**, reducing the checkpoint payload from `4.24 GiB` in BF16 to **`1.84 GiB` (`2.30×` smaller)**.
 
+> **Summary:** Shrinks the model `2.3×` (`4.24 GiB → 1.84 GiB`) to fit comfortably in 2–4 GB memory budgets with very little quality loss (`+1.7%` perplexity delta, `0.073` KL divergence). Outperforms standard unrotated 4-bit (`g32`) and mixed 4/8-bit quantization while using less memory, keeping `97.5%` vision top-1 agreement and `91.9%` speculative drafter agreement.
+
 ## Quality vs. BF16 Base Model (`Qwen/Qwen3.5-2B`)
 
 Teacher-forced evaluation comparing this checkpoint directly against the unquantized BF16 base model:

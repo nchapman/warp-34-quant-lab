@@ -17,6 +17,8 @@ tags:
 
 4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ (`HGPTQ`)** quantization of [ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B) across **Text (`30,970` linears), Native MTP (`775` linears), and Vision (`110` linears)**, reducing the checkpoint payload from `66.97 GiB` in BF16 to **`19.24 GiB` (`3.48×` smaller)**.
 
+> **Summary:** Compresses `Ornith-1.5-35B-A3B` by `3.5×` (`67.0 GiB → 19.24 GiB`) to fit within a **24 GB GPU** budget. Main-suite text tracking (`0.124` KL) and vision (`97.0%` top-1 agreement) are solid, with two caveats inherited from the sharp fine-tune: out-of-distribution holdout prompts show higher divergence (`0.256` KL), and speculative drafter agreement is lower (`90.9%` vs. `95.7%` on base `Qwen3.6-35B-A3B`) because the upstream fine-tune shifted the backbone away from its un-updated MTP head.
+
 ## Quality vs. BF16 Base Model (`ornith-ai/Ornith-1.5-35B-A3B`)
 
 Teacher-forced evaluation comparing this checkpoint directly against the unquantized BF16 base model:

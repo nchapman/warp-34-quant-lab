@@ -21,7 +21,7 @@ tags:
 
 4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ (`HGPTQ`)** quantization of [`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) (the 5-layer block-diffusion speculative drafter for [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B) and [`nchapman/Qwen3.8-27B-W4A16-HGPTQ`](https://huggingface.co/nchapman/Qwen3.8-27B-W4A16-HGPTQ)).
 
-> **Compresses `model.safetensors` `2.74×` (`3,670.5 MiB → 1,338.9 MiB`) and reduces streamed decoder weights per 8-token draft step `3.76×` (`3,175 MiB → 843 MiB`) while preserving `99.8%` of BF16 acceptance length $\tau$ (`2.540 → 2.535`) and `100.0%` of `Recall@16` (`53.88% → 53.88%`).**
+> **Summary:** Shrinks the 5-layer `DFlash2` block-diffusion drafter `2.7×` (`3.58 GiB → 1.31 GiB`) and cuts the decoder weights read from memory on every 8-token draft step by `3.8×` (`3,175 MiB → 843 MiB`). Preserves `99.8%` of the BF16 drafter's acceptance length (`2.540 → 2.535` tokens/step) and `100.0%` of its top-16 candidate recall (`53.88%`).
 
 ## Quality vs. BF16 Base Model (`incoai/Qwen3.8-27B-DFlash2`)
 

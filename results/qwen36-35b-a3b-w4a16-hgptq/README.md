@@ -17,6 +17,8 @@ tags:
 
 4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ (`HGPTQ`)** quantization of [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) across **Text (`30,970` linears), Native MTP (`775` linears), and Vision (`110` linears)**, reducing the checkpoint payload from `66.97 GiB` in BF16 to **`19.24 GiB` (`3.48×` smaller)**.
 
+> **Summary:** Compresses a `67.0 GiB` 256-expert MoE model by `3.5×` down to `19.24 GiB`—small enough to run entirely inside a **single 24 GB GPU** or with fast host-RAM expert offloading. Rotating and quantizing both routed and shared experts preserves BF16 text perplexity (`4.02 → 4.01`, `0.087` KL), `95.7%` speculative drafter agreement, and `98.3%–99.3%` vision top-1 agreement.
+
 ## Quality vs. BF16 Base Model (`Qwen/Qwen3.6-35B-A3B`)
 
 Teacher-forced evaluation comparing this checkpoint directly against the unquantized BF16 base model:

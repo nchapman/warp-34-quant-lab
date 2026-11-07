@@ -16,6 +16,8 @@ tags:
 
 4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ (`HGPTQ`)** quantization of [Qwen/Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B) across **Text (`200` linears), Native MTP (`7` linears), and Vision (`110` linears)**, reducing the checkpoint payload from `17.98 GiB` in BF16 to **`7.62 GiB` (`2.36×` smaller)**.
 
+> **Summary:** Shrinks an `18 GiB` model down to `7.62 GiB` (`2.4×` smaller), taking it from needing a 24 GB card down to fitting on 10–12 GB GPUs with room for context. One of the cleanest quants in the series: text divergence is very low (`0.073` KL, `+1.9%` perplexity), vision top-1 agreement is `98.1%`, and speculative drafter agreement reaches `94.8%`.
+
 ## Quality vs. BF16 Base Model (`Qwen/Qwen3.5-9B`)
 
 Teacher-forced evaluation comparing this checkpoint directly against the unquantized BF16 base model:
