@@ -18,6 +18,9 @@ def test_models_registry_defaults_to_w4a16_hgptq():
         assert info["quant_repo"].endswith("-W4A16-HGPTQ")
         rec = quant_recipe(info)
         assert rec["algo"] == "hgptq"
+        assert rec["calib"] == "data/calib-cascade-v1.jsonl"
+        assert rec["num_samples"] == 999
+        assert rec["max_seq_length"] == 4096
         assert rec["group_size"] == 64
         assert rec["hadamard_block_size"] == 64
         assert rec["actorder"] == "static"
@@ -66,3 +69,43 @@ def test_stamp_release_template_strips_embedded_chat_template():
         assert (d / "chat_template.jinja").is_file()
         tc = json.loads((d / "tokenizer_config.json").read_text(encoding="utf-8"))
         assert "chat_template" not in tc
+
+
+def test_frozen_data_sha256_and_disjointness():
+    import hashlib
+
+    root = Path(__file__).resolve().parents[1]
+    data_dir = root / "data"
+    sums_lines = (data_dir / "SHA256SUMS").read_text(encoding="utf-8").splitlines()
+    assert len(sums_lines) >= 8
+    for line in sums_lines:
+        expected_sha, rel_name = line.split(maxsplit=1)
+        rel_name = rel_name.strip()
+        actual_sha = hashlib.sha256((data_dir / rel_name).read_bytes()).hexdigest()
+        assert actual_sha == expected_sha, f"Checksum mismatch on {rel_name}"
+
+    first_user_by_file: dict[str, set[str]] = {}
+    for fname, expected_rows in (
+        ("calib-cascade-v1.jsonl", 999),
+        ("probe-v4.jsonl", 378),
+        ("probe-guard.jsonl", 76),
+        ("traj-v1.jsonl", 301),
+    ):
+        rows = [
+            json.loads(line)
+            for line in (data_dir / fname).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert len(rows) == expected_rows
+        u_set = set()
+        for r in rows:
+            msgs = r.get("messages") or r.get("conversations")
+            user_turns = [m["content"] for m in msgs if m["role"] == "user"]
+            assert user_turns
+            u_set.add(hashlib.sha256(user_turns[0].strip().encode()).hexdigest())
+        first_user_by_file[fname] = u_set
+
+    files = list(first_user_by_file)
+    for i, a in enumerate(files):
+        for b in files[i + 1 :]:
+            assert not (first_user_by_file[a] & first_user_by_file[b]), f"Prompt overlap between {a} and {b}"

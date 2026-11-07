@@ -103,9 +103,13 @@ class TestQwen38FlashNextQuant(unittest.TestCase):
         self.assertEqual(info["ple_layer_ids"], [2])
         self.assertTrue(info["vision_tower"])
         recipe = quant_recipe(info)
+        self.assertEqual(recipe["calib"], "data/calib-cascade-v1.jsonl")
+        self.assertEqual(recipe["num_samples"], 999)
+        self.assertEqual(recipe["max_seq_length"], 4096)
         self.assertEqual(recipe["group_size"], 64)
         self.assertEqual(recipe["hadamard_block_size"], 64)
         self.assertEqual(recipe["ple_group_size"], 32)
+        self.assertEqual(recipe["ple_cd_passes"], 1)
 
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp)

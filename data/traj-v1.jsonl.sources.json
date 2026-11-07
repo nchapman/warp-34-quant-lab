@@ -1,0 +1,129 @@
+{
+ "mode": "traj",
+ "seed": 0,
+ "output": "data/traj-v1.jsonl",
+ "sources": [
+  {
+   "dataset": "frozen-set (exclusion input)",
+   "file": "data/calib-cascade-v1.jsonl",
+   "sha256": "1c7964a0c402691c489626f33030570b8a3b0edbaa7f4daa62543b97e3fda9bf"
+  },
+  {
+   "dataset": "frozen-set (exclusion input)",
+   "file": "data/probe-v4.jsonl",
+   "sha256": "b694ac982064e9f6a822815b4b5b7a9c5ffc779ef53a378aaf63f5e09c120830"
+  },
+  {
+   "dataset": "frozen-set (exclusion input)",
+   "file": "data/probe-guard.jsonl",
+   "sha256": "bf383fafcd112ff33aad32057ef130be410799d87747074e7e0c6868991e2c4d"
+  },
+  {
+   "dataset": "nvidia/Nemotron-Cascade-2-SFT-Data (local pool)",
+   "file": "data-raw/cascade/terminal_agent_0.parquet",
+   "sha256": "3c4b274ca87f267ce942ef0fbb755085587ea21c183e91f471c8bc92c0430c5e"
+  },
+  {
+   "dataset": "nvidia/Nemotron-Cascade-2-SFT-Data (local pool)",
+   "file": "data-raw/cascade/swe_0.parquet",
+   "sha256": "d201c3068691495e59295b7ab82cc3ea42c6d909698df8198829833511add6af"
+  },
+  {
+   "dataset": "nvidia/Nemotron-Cascade-2-SFT-Data (local pool)",
+   "file": "data-raw/cascade/conversational_agent_0.parquet",
+   "sha256": "7008391dc104c498771d79a12545aecc06a76e9e137b451c3077815a90bb2b73"
+  },
+  {
+   "dataset": "nvidia/Nemotron-Cascade-2-SFT-Data (local pool)",
+   "file": "data-raw/cascade/math_0.parquet",
+   "sha256": "3b412fb7a5e36e526bbf480907a2e989097d671c21ec05e96e207ee9b974b832"
+  },
+  {
+   "dataset": "nvidia/Nemotron-Cascade-2-SFT-Data (local pool)",
+   "file": "data-raw/cascade/instruction_following_0.parquet",
+   "sha256": "4a506f405f0006c0b52ce4bd8f24c50b0143533be0bba9eef53bb2899c40bf56"
+  },
+  {
+   "dataset": "nvidia/Nemotron-Cascade-2-SFT-Data (local pool)",
+   "file": "data-raw/cascade/chat_0.parquet",
+   "sha256": "6844134f7b51527993831cabf92efc2e5602b93be9fac60c2849c9cdaed97d81"
+  },
+  {
+   "dataset": "nvidia/Nemotron-Cascade-2-SFT-Data (local pool)",
+   "file": "data-raw/cascade/chat_0.parquet",
+   "sha256": "6844134f7b51527993831cabf92efc2e5602b93be9fac60c2849c9cdaed97d81"
+  },
+  {
+   "dataset": "facebook/belebele",
+   "file": "data-raw/belebele_deu_Latn.parquet",
+   "sha256": "f954e1fac689723400590de639d40d72f5d00f715c1b44e96bf82a5bc2ecc8da",
+   "config": "deu_Latn",
+   "split": "test",
+   "revision": "7899cdfa4e1e0d733fd77c848e2c273cb1d32be2"
+  },
+  {
+   "dataset": "facebook/belebele",
+   "file": "data-raw/belebele_spa_Latn.parquet",
+   "sha256": "6f97fc04f1fcc466bfb00cd7e2e9f2496b2971340a46037c71a0d868efc2099f",
+   "config": "spa_Latn",
+   "split": "test",
+   "revision": "7899cdfa4e1e0d733fd77c848e2c273cb1d32be2"
+  },
+  {
+   "dataset": "facebook/belebele",
+   "file": "data-raw/belebele_fra_Latn.parquet",
+   "sha256": "a216ad3c248a443c60dc1780d75be1663bd626d31b861c260c39e68f0c1d1efa",
+   "config": "fra_Latn",
+   "split": "test",
+   "revision": "7899cdfa4e1e0d733fd77c848e2c273cb1d32be2"
+  },
+  {
+   "dataset": "facebook/belebele",
+   "file": "data-raw/belebele_ita_Latn.parquet",
+   "sha256": "be97dc122a110943d5c99ba0688a886f4c803f34b05f248f967818c321543e84",
+   "config": "ita_Latn",
+   "split": "test",
+   "revision": "7899cdfa4e1e0d733fd77c848e2c273cb1d32be2"
+  },
+  {
+   "dataset": "facebook/belebele",
+   "file": "data-raw/belebele_jpn_Jpan.parquet",
+   "sha256": "bdff2a719b85d0f9af5d40f85ab6eab471fdd9ffa3f242b9b1008cf201927f23",
+   "config": "jpn_Jpan",
+   "split": "test",
+   "revision": "7899cdfa4e1e0d733fd77c848e2c273cb1d32be2"
+  },
+  {
+   "dataset": "facebook/belebele",
+   "file": "data-raw/belebele_zho_Hans.parquet",
+   "sha256": "9f8c2a580d00a817a2b6e32aa68783a9bff64d5bc437d1baf3b3f6d0ab90ec8c",
+   "config": "zho_Hans",
+   "split": "test",
+   "revision": "7899cdfa4e1e0d733fd77c848e2c273cb1d32be2"
+  },
+  {
+   "dataset": "facebook/belebele",
+   "file": "data-raw/belebele_arb_Arab.parquet",
+   "sha256": "2873a50ef64b69f12d0c0b1e9f86338ccfe7a96f321e1bf2040a6b62daaef5d4",
+   "config": "arb_Arab",
+   "split": "test",
+   "revision": "7899cdfa4e1e0d733fd77c848e2c273cb1d32be2"
+  },
+  {
+   "dataset": "facebook/belebele",
+   "file": "data-raw/belebele_hin_Deva.parquet",
+   "sha256": "98d73c57470ad6d06314d18690c6a6c1be705692420184a659b83247f0bae6f2",
+   "config": "hin_Deva",
+   "split": "test",
+   "revision": "7899cdfa4e1e0d733fd77c848e2c273cb1d32be2"
+  },
+  {
+   "dataset": "facebook/belebele",
+   "file": "data-raw/belebele_rus_Cyrl.parquet",
+   "sha256": "572c677530b1b303ff3313dd9d4daf174135c5ea033cf5e520686cb45ec6de99",
+   "config": "rus_Cyrl",
+   "split": "test",
+   "revision": "7899cdfa4e1e0d733fd77c848e2c273cb1d32be2"
+  }
+ ]
+}

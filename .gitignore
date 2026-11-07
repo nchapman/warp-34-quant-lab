@@ -11,6 +11,7 @@ build/
 
 # Local environment overrides
 .env
+.pi/
 
 # Untracked run logs, generated vision image fixtures, and local model checkpoints
 /runs/
