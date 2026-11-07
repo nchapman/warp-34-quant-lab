@@ -24,12 +24,12 @@ Teacher-forced evaluation comparing this checkpoint directly against the unquant
 | Evaluation | BF16 Base (`Qwen/Qwen3.6-35B-A3B`) | **`Qwen3.6-35B-A3B-W4A16-HGPTQ`** | Notes |
 |---|---:|---:|---|
 | **Safetensors Size** | `66.97 GiB` (`71,903,776,776 B`) | **`19.24 GiB` (`20,661,694,432 B`)** | **`3.48×` compression** (`−47.72 GiB`) |
-| **Text Perplexity** (378 prompts, 840k tokens) ↓ | `4.0208` | **`3.9020` (`−2.96%`)** | Chat, math, science, coding, tool use, multilingual |
-| **Text Divergence vs. BF16** (weighted KL / token mean KL) ↓ | `0.0000` | **`0.0901` / `0.2331`** | Full-vocabulary FP32 KL divergence |
-| **General & Multilingual Holdout Perplexity** (76 prompts, 20k tokens) ↓ | `25.7581` | **`24.5307` (`−4.76%`)** | Token mean KL `0.0486` (weighted KL `0.0579`) |
-| **Native MTP (Speculative Drafter)** (11,583 positions) | `100.0%` Top-1 (`NLL 2.0268`) | **`95.93%` Top-1 (`NLL 2.0355`)** | Isolated MTP KL `0.0111` (end-to-end Top-1 `88.85%`, KL `0.1266`) |
-| **Vision (VQA, Charts, Documents & OCR)** (96 images, 302 tokens) | `1.0000` cos sim · `100.0%` Top-1 | **`0.9798` cos sim · `98.34%` Top-1** | Isolated ViT KL `0.0079` (end-to-end Top-1 `96.69%`, KL `0.0309`) |
-| **Vision (UI / ScreenSpot & Math OCR)** (48 images, 135 tokens) | `1.0000` cos sim · `100.0%` Top-1 | **`0.9845` cos sim · `99.26%` Top-1** | Isolated ViT KL `0.0239` (end-to-end Top-1 `98.52%`, KL `0.0434`) |
+| **Text Perplexity** (378 prompts, 840k tokens) ↓ | `4.0208` | **`4.0078` (`−0.32%`)** | Chat, math, science, coding, tool use, multilingual |
+| **Text Divergence vs. BF16** (weighted KL / token mean KL) ↓ | `0.0000` | **`0.0868` / `0.2277`** | Full-vocabulary FP32 KL divergence |
+| **General & Multilingual Holdout Perplexity** (76 prompts, 20k tokens) ↓ | `25.7581` | **`26.5040` (`+2.90%`)** | Token mean KL `0.0496` (weighted KL `0.0615`) |
+| **Native MTP (Speculative Drafter)** (11,583 positions) | `100.0%` Top-1 (`NLL 2.0268`) | **`95.71%` Top-1 (`NLL 2.0395`)** | Isolated MTP KL `0.0113` (end-to-end Top-1 `89.92%`, KL `0.1174`) |
+| **Vision (VQA, Charts, Documents & OCR)** (96 images, 302 tokens) | `1.0000` cos sim · `100.0%` Top-1 | **`0.9797` cos sim · `98.34%` Top-1** | Isolated ViT KL `0.0077` (end-to-end Top-1 `95.70%`, KL `0.0225`) |
+| **Vision (UI / ScreenSpot & Math OCR)** (48 images, 135 tokens) | `1.0000` cos sim · `100.0%` Top-1 | **`0.9845` cos sim · `99.26%` Top-1** | Isolated ViT KL `0.0241` (end-to-end Top-1 `98.52%`, KL `0.0240`) |
 
 ## What Is Quantized
 

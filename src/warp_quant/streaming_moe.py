@@ -1422,17 +1422,20 @@ def _quantize_decoder_layer_streaming(
 
     layer_tensors: dict[str, torch.Tensor] = {}
 
-    # Pack all calibration sequences into a single contiguous device tensor H_all [N_tot, hc_dim]
+    # Pack all calibration sequences into a single contiguous tensor H_all [N_tot, hc_dim]
     # slice-by-slice while freeing per-sequence buffers so 999x4096 never doubles H_all VRAM.
+    # When H_all exceeds 24 GiB (e.g. Qwen3.8-Flash-Next hc_count=4 -> 66.6 GiB at 999x4096),
+    # keep H_all in host RAM and stream tok_step=65536 chunks to GPU.
     seq_lens = [h.shape[1] for h in h_calib]
     n_tot = sum(seq_lens)
     sample_h = h_calib[0].squeeze(0)
-    H_all = torch.empty((n_tot, *sample_h.shape[1:]), dtype=sample_h.dtype, device=device)
+    h_all_bytes = n_tot * sample_h.shape[-1] * sample_h.element_size()
+    h_all_device = device if (device.type != "cuda" or h_all_bytes <= 24 * (1024**3)) else torch.device("cpu")
+    H_all = torch.empty((n_tot, *sample_h.shape[1:]), dtype=sample_h.dtype, device=h_all_device)
     cur_off = 0
     for i, slen in enumerate(seq_lens):
         H_all[cur_off : cur_off + slen].copy_(h_calib[i].squeeze(0), non_blocking=True)
-        if keep_calib_on_device:
-            h_calib[i] = torch.empty(0, device=device, dtype=H_all.dtype)
+        h_calib[i] = torch.empty(0, device=h_calib[i].device, dtype=H_all.dtype)
         cur_off += slen
     has_hc = hasattr(layer, "attn_hyper_connection")
     hc_count = layer.attn_hyper_connection.hc_count if has_hc else 1
@@ -1460,22 +1463,23 @@ def _quantize_decoder_layer_streaming(
 
     for s0 in range(0, n_tot, tok_step):
         s1 = min(s0 + tok_step, n_tot)
+        h_slice = H_all[s0:s1].to(device, non_blocking=True)
         if has_hc:
-            b_in, hyp_in, iw = layer.attn_hyper_connection(H_all[s0:s1].unsqueeze(0))
+            b_in, hyp_in, iw = layer.attn_hyper_connection(h_slice.unsqueeze(0))
             b_in_2d = b_in.squeeze(0)
             branch_in_all[s0:s1] = b_in_2d
-            H_all[s0:s1] = hyp_in.squeeze(0)
+            H_all[s0:s1].copy_(hyp_in.squeeze(0), non_blocking=True)
             inj_w_all[s0:s1] = iw.squeeze(0)
             del b_in, hyp_in, iw
         else:
-            b_in_2d = layer.input_layernorm(H_all[s0:s1])
+            b_in_2d = layer.input_layernorm(h_slice)
             branch_in_all[s0:s1] = b_in_2d
         if had_in > 0:
             x_2d = _hadamard_rotate_last_dim(b_in_2d, had_in, compute_dtype=torch.float32).float()
         else:
             x_2d = b_in_2d.float()
         h_attn_in.addmm_(x_2d.T, x_2d, beta=1.0, alpha=2.0)
-        del b_in_2d, x_2d
+        del h_slice, b_in_2d, x_2d
 
     # Quantize input projections and attach online Hadamard rotation hook
     in_hooks = []
@@ -1583,26 +1587,27 @@ def _quantize_decoder_layer_streaming(
     for s0 in range(0, n_tot, tok_step):
         s1 = min(s0 + tok_step, n_tot)
         attn_out = F.linear(pre_out_all[s0:s1], out_proj_mod.weight, out_proj_mod.bias)
+        h_slice = H_all[s0:s1].to(device, non_blocking=True)
         if has_hc:
-            h_post_attn = H_all[s0:s1] + (attn_out.unsqueeze(-2) * inj_w_all[s0:s1].unsqueeze(-1)).flatten(-2)
+            h_post_attn = h_slice + (attn_out.unsqueeze(-2) * inj_w_all[s0:s1].unsqueeze(-1)).flatten(-2)
             m_in, hyp_m, iw_m = layer.mlp_hyper_connection(h_post_attn.unsqueeze(0))
             x_raw = m_in.squeeze(0)
             mlp_in_all[s0:s1] = x_raw
-            H_all[s0:s1] = hyp_m.squeeze(0)
+            H_all[s0:s1].copy_(hyp_m.squeeze(0), non_blocking=True)
             inj_w_all[s0:s1] = iw_m.squeeze(0)
             del m_in, hyp_m, iw_m
         else:
-            h_post_attn = H_all[s0:s1] + attn_out
+            h_post_attn = h_slice + attn_out
             x_raw = layer.post_attention_layernorm(h_post_attn)
             mlp_in_all[s0:s1] = x_raw
-            H_all[s0:s1] = h_post_attn
+            H_all[s0:s1].copy_(h_post_attn, non_blocking=True)
 
         if had_moe_in > 0:
             x_rot = _hadamard_rotate_last_dim(x_raw, had_moe_in, compute_dtype=torch.float32).float()
         else:
             x_rot = x_raw.float()
         h_moe_in.addmm_(x_rot.T, x_rot, beta=1.0, alpha=2.0)
-        del attn_out, h_post_attn, x_raw, x_rot
+        del h_slice, attn_out, h_post_attn, x_raw, x_rot
     del pre_out_all
 
     # Quantize shared_expert.{gate_proj, up_proj} with W4A16-HGPTQ
@@ -1677,9 +1682,13 @@ def _quantize_decoder_layer_streaming(
 
     # Pre-rotate experts.gate_up_proj [E, 2*inter, hidden] by H_{had_moe_in}^T and quantize gate_proj + up_proj
     if had_moe_in > 0:
-        experts.gate_up_proj.data.copy_(
-            _hadamard_rotate_last_dim(experts.gate_up_proj.data, had_moe_in, compute_dtype=torch.float64)
-        )
+        for e0 in range(0, num_exp, 64):
+            e1 = min(e0 + 64, num_exp)
+            experts.gate_up_proj.data[e0:e1].copy_(
+                _hadamard_rotate_last_dim(
+                    experts.gate_up_proj.data[e0:e1], had_moe_in, compute_dtype=torch.float64
+                )
+            )
     for proj_name, sl in (("gate_proj", slice(0, inter)), ("up_proj", slice(inter, 2 * inter))):
         q_3d, wp_3d, ws_3d, wsh_1d = _gptq_quantize_and_pack_3d_experts(
             experts.gate_up_proj.data[:, sl, :].contiguous(),
@@ -1764,9 +1773,13 @@ def _quantize_decoder_layer_streaming(
 
     # Pre-rotate experts.down_proj [E, hidden, inter] by H_{had_moe_down}^T and quantize across all experts
     if had_moe_down > 0:
-        experts.down_proj.data.copy_(
-            _hadamard_rotate_last_dim(experts.down_proj.data, had_moe_down, compute_dtype=torch.float64)
-        )
+        for e0 in range(0, num_exp, 64):
+            e1 = min(e0 + 64, num_exp)
+            experts.down_proj.data[e0:e1].copy_(
+                _hadamard_rotate_last_dim(
+                    experts.down_proj.data[e0:e1], had_moe_down, compute_dtype=torch.float64
+                )
+            )
     q_down_3d, wp_down_3d, ws_down_3d, wsh_down_1d = _gptq_quantize_and_pack_3d_experts(
         experts.down_proj.data,
         norm_h_moe_down,
@@ -1788,11 +1801,13 @@ def _quantize_decoder_layer_streaming(
     for s0 in range(0, n_tot, tok_step):
         s1 = min(s0 + tok_step, n_tot)
         mlp_out = layer.mlp(mlp_in_all[s0:s1].unsqueeze(0)).squeeze(0)
+        h_slice = H_all[s0:s1].to(device, non_blocking=True)
         if has_hc:
-            H_all[s0:s1] = H_all[s0:s1] + (mlp_out.unsqueeze(-2) * inj_w_all[s0:s1].unsqueeze(-1)).flatten(-2)
+            h_upd = h_slice + (mlp_out.unsqueeze(-2) * inj_w_all[s0:s1].unsqueeze(-1)).flatten(-2)
         else:
-            H_all[s0:s1] = H_all[s0:s1] + mlp_out
-        del mlp_out
+            h_upd = h_slice + mlp_out
+        H_all[s0:s1].copy_(h_upd, non_blocking=True)
+        del mlp_out, h_slice, h_upd
     del mlp_in_all, inj_w_all
     for h in exp_hooks:
         h.remove()
@@ -1801,7 +1816,7 @@ def _quantize_decoder_layer_streaming(
     for i, slen in enumerate(seq_lens):
         h_seq = H_all[seq_cur : seq_cur + slen].unsqueeze(0)
         seq_cur += slen
-        h_calib[i] = h_seq.clone() if keep_calib_on_device else h_seq.cpu()
+        h_calib[i] = h_seq.to(device).clone() if keep_calib_on_device else h_seq.cpu().clone()
     del H_all
 
     for h in shared_hooks:
@@ -2467,9 +2482,13 @@ def run_quantize_qwen4_exp(args: argparse.Namespace) -> None:
     h_calib: list[torch.Tensor] = []
     pos_emb_list: list[tuple[torch.Tensor, torch.Tensor]] = []
     hc_count = 1 if is_qwen35_moe else cfg.text_config.hc_count
-    keep_calib_on_device = device.type == "cuda" and torch.cuda.get_device_properties(
-        device
-    ).total_memory >= 100 * (1024**3)
+    est_tot_tokens = sum(t.shape[1] for t in calib_ids_list)
+    est_h_bytes = est_tot_tokens * hc_count * cfg.text_config.hidden_size * 2
+    keep_calib_on_device = (
+        device.type == "cuda"
+        and torch.cuda.get_device_properties(device).total_memory >= 100 * (1024**3)
+        and est_h_bytes <= 24 * (1024**3)
+    )
     calib_store_device = device if keep_calib_on_device else torch.device("cpu")
 
     for ids in calib_ids_list:

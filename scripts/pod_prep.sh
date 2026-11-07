@@ -20,7 +20,7 @@ if [[ $# -lt 1 ]]; then
 fi
 
 SSH_TARGET="$1"
-REMOTE_DIR="${2:-/workspace/warp-34-quant-lab}"
+REMOTE_DIR="${2:-/root/warp-34-quant-lab}"
 SSH_PORT="${SSH_PORT:-}"
 SSH_KEY="${SSH_KEY:-}"
 
@@ -61,15 +61,15 @@ if [[ -z "$HF_TOKEN_VAL" && -f "$HOME/.cache/huggingface/token" ]]; then
     HF_TOKEN_VAL="$(tr -d '[:space:]' < "$HOME/.cache/huggingface/token")"
 fi
 if [[ -n "$HF_TOKEN_VAL" ]]; then
-    printf '%s' "$HF_TOKEN_VAL" | rssh "umask 077 && mkdir -p ~/.cache/huggingface && cat > ~/.cache/huggingface/token"
-    echo "HF_TOKEN installed at ~/.cache/huggingface/token (0600)"
+    printf '%s' "$HF_TOKEN_VAL" | rssh "umask 077 && mkdir -p ~/.cache/huggingface /workspace/hf-cache && tee ~/.cache/huggingface/token > /workspace/hf-cache/token"
+    echo "HF_TOKEN installed at ~/.cache/huggingface/token and /workspace/hf-cache/token (0600)"
 else
     echo "WARNING: No local HF_TOKEN found; skipping token upload" >&2
 fi
 
 echo "=== [3/6] Syncing warp-34-quant-lab -> $SSH_TARGET:$REMOTE_DIR ==="
 RSYNC_RSH="ssh ${SSH_OPTS[*]}"
-rsync -az --delete \
+rsync -az --no-owner --no-group --delete \
     -e "$RSYNC_RSH" \
     --exclude='.venv/' \
     --exclude='runs/' \
@@ -80,7 +80,6 @@ rsync -az --delete \
     --exclude='.pytest_cache/' \
     --exclude='.ruff_cache/' \
     --exclude='*.safetensors' \
-    --exclude='data/vision-*-v2/' \
     "$REPO_ROOT/" "$SSH_TARGET:$REMOTE_DIR/"
 
 echo "=== [4/6] Verifying frozen dataset SHA-256 checksums ==="

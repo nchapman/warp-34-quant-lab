@@ -45,7 +45,14 @@ if torch.cuda.is_available():
     )
     if hook not in text:
         raise RuntimeError("Unexpected setup.py structure in causal-conv1d==1.7.0")
-    setup_py.write_text(text.replace(hook, patch, 1))
+    text = (
+        "import torch.utils.cpp_extension as _ce\n"
+        "_ce._check_cuda_version = lambda *a, **kw: None\n"
+        + text.replace(hook, patch, 1).replace(
+            "check_cuda_torch_binary_vs_bare_metal(CUDA_HOME)", "None"
+        )
+    )
+    setup_py.write_text(text)
     print(f"Patched causal-conv1d==1.7.0 setup.py for single target sm_{sm}", flush=True)
 
 subprocess.check_call(
