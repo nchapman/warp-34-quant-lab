@@ -164,7 +164,15 @@ def test_readme_summary_table_matches_published_receipts():
             root / "results/dense-w4a16-hgptq/9b-ornith-g64-h64/probe_results.json",
         ),
         ("Qwen/Qwen3.8-27B", root / "results/dense-w4a16-hgptq/27b-g64-h64/probe.json"),
+        (
+            "ukisai/Swift-1.5-Qwen3.8-27b",
+            root / "results/dense-w4a16-hgptq/27b-swift-g64-h64/probe_results.json",
+        ),
         ("Qwen/Qwen3.6-35B-A3B", root / "results/qwen36-35b-a3b-w4a16-hgptq/probe_results.json"),
+        (
+            "ornith-ai/Ornith-1.5-35B-A3B",
+            root / "results/ornith-15-35b-a3b-w4a16-hgptq/probe_results.json",
+        ),
         ("Qwen/Qwen3.8-Flash-Next", root / "results/qwen38-flash-next-w4a16-hgptq/probe_results.json"),
     ]
     for model_name, probe_path in expected:
