@@ -355,7 +355,13 @@ def _gptq_calibrate_vision(
 
     from warp_quant.data import device_inputs, encode_image_row
 
-    manifest = json.loads((vision_calib_dir / "manifest.json").read_text())
+    manifest_path = vision_calib_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError(
+            f"Vision calibration manifest not found at {manifest_path} "
+            "(materialize with 'mise run build-vision-data' or pass --no-quantize-vision)"
+        )
+    manifest = json.loads(manifest_path.read_text())
     if not manifest.get("calibration", False):
         raise ValueError(
             f"Refusing to calibrate Vision on non-calibration fixture: {vision_calib_dir} (calibration={manifest.get('calibration')})"
@@ -1718,13 +1724,15 @@ def main() -> None:
     q.add_argument("--dampening-frac", type=float, default=0.01)
     q.add_argument(
         "--quantize-mtp",
-        action="store_true",
-        help="Also quantize mtp.layers.0.* projections to W4A16 (+ Hadamard)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Quantize mtp.layers.0.* projections to W4A16 (+ Hadamard) (--no-quantize-mtp to skip)",
     )
     q.add_argument(
         "--quantize-vision",
-        action="store_true",
-        help="Also quantize model.visual.* linear layers to W4A16 (+ Hadamard)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Quantize model.visual.* linear layers to W4A16 (+ Hadamard) (--no-quantize-vision to skip)",
     )
     q.add_argument(
         "--component-quant-mode",
@@ -1734,7 +1742,7 @@ def main() -> None:
     )
     q.add_argument(
         "--vision-calib-dir",
-        default=None,
+        default="data/vision-calib-v2",
         help="Disjoint calibration image fixture dir (with calibration=true in manifest.json)",
     )
     q.add_argument(

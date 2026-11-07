@@ -144,7 +144,8 @@ def normalize_messages(conversation: list[dict[str, Any]]) -> list[dict[str, Any
         if message.get("tool_calls"):
             tool_calls = []
             for call in message["tool_calls"]:
-                call = dict(call.get("function") or {})
+                fn = call.get("function") if isinstance(call.get("function"), dict) else call
+                call = dict(fn or {})
                 args = call.get("arguments", {})
                 if isinstance(args, str):
                     try:
@@ -212,7 +213,12 @@ def get_calibration_dataset(
 def aggregate_weighted_kl(domains: dict[str, dict[str, Any]]) -> float:
     groups: dict[str, list[float]] = defaultdict(list)
     for domain, stats in domains.items():
-        group = "ML" if domain.startswith("belebele") else domain
+        if domain.startswith("belebele"):
+            group = "ML"
+        elif domain == "chat_long":
+            group = "chat"
+        else:
+            group = domain
         if group not in AGG_WEIGHTS:
             continue
         if stats["kl_n"] <= 0:

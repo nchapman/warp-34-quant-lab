@@ -109,3 +109,77 @@ def test_frozen_data_sha256_and_disjointness():
     for i, a in enumerate(files):
         for b in files[i + 1 :]:
             assert not (first_user_by_file[a] & first_user_by_file[b]), f"Prompt overlap between {a} and {b}"
+
+
+def test_normalize_messages_is_idempotent_with_tool_calls():
+    from warp_quant.data import normalize_messages
+
+    raw = [
+        {"role": "user", "content": "Find the weather in Tokyo."},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": '{"city": "Tokyo"}'},
+                }
+            ],
+        },
+    ]
+    once = normalize_messages(raw)
+    twice = normalize_messages(once)
+    assert once == twice
+    assert twice[1]["tool_calls"] == [{"name": "get_weather", "arguments": {"city": "Tokyo"}}]
+
+
+def test_aggregate_weighted_kl_includes_chat_long():
+    from warp_quant.data import aggregate_weighted_kl
+
+    without_chat_long = aggregate_weighted_kl(
+        {"chat": {"kl": 1.0, "kl_n": 100}, "math": {"kl": 2.0, "kl_n": 100}}
+    )
+    with_chat_long = aggregate_weighted_kl(
+        {
+            "chat": {"kl": 1.0, "kl_n": 100},
+            "chat_long": {"kl": 5.0, "kl_n": 100},
+            "math": {"kl": 2.0, "kl_n": 100},
+        }
+    )
+    assert with_chat_long > without_chat_long
+
+
+def test_readme_summary_table_matches_published_receipts():
+    root = Path(__file__).resolve().parents[1]
+    readme_text = (root / "README.md").read_text(encoding="utf-8")
+
+    expected = [
+        ("Qwen/Qwen3.5-2B", root / "results/dense-w4a16-hgptq/g64-h64/probe.json"),
+        ("Qwen/Qwen3.5-9B", root / "results/dense-w4a16-hgptq/9b-g64-h64/probe.json"),
+        ("Qwen/Qwen3.8-27B", root / "results/dense-w4a16-hgptq/27b-g64-h64/probe.json"),
+        ("Qwen/Qwen3.6-35B-A3B", root / "results/qwen36-35b-a3b-w4a16-hgptq/probe_results.json"),
+        ("Qwen/Qwen3.8-Flash-Next", root / "results/qwen38-flash-next-w4a16-hgptq/probe_results.json"),
+    ]
+    for model_name, probe_path in expected:
+        row_line = next(
+            line for line in readme_text.splitlines() if f"`{model_name}`" in line and "|" in line
+        )
+        d = json.loads(probe_path.read_text(encoding="utf-8"))
+        v4 = d["probe-v4"]
+        gd = d["probe-guard"]
+        mtp_iso = d["mtp_fidelity"]["isolated"]
+        vis_iso = d["vision_fidelity"]["isolated"]
+        assert f"{v4['ppl_base']:.4f} → {v4['ppl_quant']:.4f}" in row_line, (
+            f"{model_name} PPL mismatch: {row_line}"
+        )
+        assert f"{v4['weighted_kl']:.6f}" in row_line, f"{model_name} v4 wkl mismatch: {row_line}"
+        assert f"{gd['weighted_kl']:.6f}" in row_line, f"{model_name} guard wkl mismatch: {row_line}"
+        assert f"{mtp_iso['mean_kl']:.6f}" in row_line, f"{model_name} mtp kl mismatch: {row_line}"
+        assert f"{mtp_iso['top1_agreement'] * 100:.2f}%" in row_line, (
+            f"{model_name} mtp top1 mismatch: {row_line}"
+        )
+        assert f"{vis_iso['mean_kl']:.6f}" in row_line, f"{model_name} vis kl mismatch: {row_line}"
+        assert f"{vis_iso['top1_agreement'] * 100:.2f}%" in row_line, (
+            f"{model_name} vis top1 mismatch: {row_line}"
+        )

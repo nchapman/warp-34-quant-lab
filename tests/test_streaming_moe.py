@@ -453,6 +453,82 @@ class TestQwen38FlashNextQuant(unittest.TestCase):
             ).item()
             self.assertGreater(mtp_cos, 0.95)
 
+            # Verify PLE reuse works when grouped PLE files (1 file) < ngram_heads (2 heads)
+            reuse_out_dir = Path(tmp) / "quant_reuse_ple"
+            reuse_out_dir.mkdir(parents=True, exist_ok=True)
+            layer1_reuse = _build_lightweight_decoder_layer(cfg.text_config, 1, device)
+            _load_decoder_layer_weights(layer1_reuse, "model.language_model.layers.1", base_dir, wmap, device)
+            h_calib_reuse = [
+                inp.repeat(1, 1, cfg.text_config.hc_count)
+                for inp in [F.embedding(ids, embed_w) for ids in calib_ids]
+            ]
+            wmap_without_ple = {k: v for k, v in wmap.items() if "ple_embedding" not in k}
+            _, ple_wmap_reused, _, l1_reuse_counts = _quantize_decoder_layer_streaming(
+                layer1_reuse,
+                "model.language_model.layers.1",
+                h_calib_reuse,
+                pos_list,
+                calib_ids,
+                base_dir=base_dir,
+                shard_map=wmap_without_ple,
+                output_dir=reuse_out_dir,
+                layer_idx=1,
+                group_size=32,
+                hadamard_block_size=32,
+                actorder="static",
+                dampening_frac=0.01,
+                ple_group_size=16,
+                ple_cd_passes=1,
+                reuse_ple_dir=quant_dir,
+            )
+            self.assertEqual(l1_reuse_counts["ple_shards"], 2)
+            self.assertTrue((reuse_out_dir / "model-ple-000.safetensors").exists())
+            self.assertGreater(len(ple_wmap_reused), 0)
+
+            # Verify ple_group_size=0 keeps Layer-1 PLE in BF16 without ZeroDivisionError
+            bf16_ple_dir = Path(tmp) / "quant_bf16_ple"
+            bf16_ple_dir.mkdir(parents=True, exist_ok=True)
+            layer1_bf16 = _build_lightweight_decoder_layer(cfg.text_config, 1, device)
+            _load_decoder_layer_weights(layer1_bf16, "model.language_model.layers.1", base_dir, wmap, device)
+            h_calib_bf16 = [
+                inp.repeat(1, 1, cfg.text_config.hc_count)
+                for inp in [F.embedding(ids, embed_w) for ids in calib_ids]
+            ]
+            _, ple_wmap_bf16, _, l1_bf16_counts = _quantize_decoder_layer_streaming(
+                layer1_bf16,
+                "model.language_model.layers.1",
+                h_calib_bf16,
+                pos_list,
+                calib_ids,
+                base_dir=base_dir,
+                shard_map=wmap,
+                output_dir=bf16_ple_dir,
+                layer_idx=1,
+                group_size=32,
+                hadamard_block_size=32,
+                actorder="static",
+                dampening_frac=0.01,
+                ple_group_size=0,
+                ple_cd_passes=1,
+            )
+            self.assertEqual(l1_bf16_counts["ple_shards"], 2)
+            self.assertTrue(any(k.endswith(".weight") for k in ple_wmap_bf16))
+            self.assertFalse(any(k.endswith(".weight_packed") for k in ple_wmap_bf16))
+            _write_qwen4_exp_quant_config(
+                bf16_ple_dir,
+                raw_cfg,
+                group_size=32,
+                actorder="static",
+                hadamard_block_size=32,
+                quantize_mtp=False,
+                quantize_vision=False,
+                vision_fc2_channel=False,
+                ple_group_size=0,
+                ple_cd_passes=1,
+            )
+            bf16_qcfg = json.loads((bf16_ple_dir / "config.json").read_text())
+            self.assertNotIn("ple_quantization", bf16_qcfg["quantization_config"])
+
     def test_config_regexes_and_expert_hadamard_hooks(self):
         import re
 

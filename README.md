@@ -66,13 +66,13 @@ mise run probe -- \
 
 Full receipts and Hugging Face model cards are stored in [`results/`](results/):
 
-| Model | Artifact (`nchapman/*`) | Size | `probe-v4` PPL (BF16 → Quant) | `probe-v4` `weighted_kl` | `probe-guard` `weighted_kl` | MTP Iso `mean_kl` (Top-1) | Vision v2 Iso `mean_kl` (Top-1) | Vision Guard Iso Top-1 |
-|---|---|---:|---|---:|---:|---|---|---:|
-| `Qwen/Qwen3.5-2B` | `Qwen3.5-2B-W4A16-HGPTQ` | `1.88 GiB` | `7.1753 → 7.4561` (`+3.91%`) | `0.160452` | `0.153864` | `0.068341` (`92.71%`) | `0.025859` (`96.81%`) | `98.89%` |
-| `Qwen/Qwen3.5-9B` | `Qwen3.5-9B-W4A16-HGPTQ` | `5.97 GiB` | `5.2587 → 5.3679` (`+2.08%`) | `0.090808` | `0.085686` | `0.032350` (`95.08%`) | `0.015666` (`98.51%`) | `98.52%` |
-| `Qwen/Qwen3.8-27B` | `Qwen3.8-27B-W4A16-HGPTQ` | `15.50 GiB` | `4.4609 → 4.5300` (`+1.55%`) | `0.114987` | `0.072580` | `0.012470` (`96.51%`) | `0.014807` (`98.30%`) | `99.63%` |
-| `Qwen/Qwen3.6-35B-A3B` | [`Qwen3.6-35B-A3B-W4A16-HGPTQ`](results/qwen36-35b-a3b-w4a16-hgptq/README.md) | `19.24 GiB` | `4.6777 → 4.7498` (`+1.54%`) | `0.090070` | `0.057899` | `0.011066` (`95.93%`) | `0.007872` (`98.34%`) | `99.26%` |
-| `Qwen/Qwen3.8-Flash-Next` | [`Qwen3.8-Flash-Next-W4A16-HGPTQ`](results/qwen38-flash-next-w4a16-hgptq/README.md) | `93.42 GiB` | `3.6085 → 3.6264` (`+0.50%`) | `0.053029` | `0.044225` | `0.019397` (`96.17%`) | `0.017803` (`96.38%`) | `99.26%` |
+| Model | Artifact (`nchapman/*`) | Size | `probe-v4` PPL (BF16 → Quant) | `probe-v4` `weighted_kl` | `probe-guard` `weighted_kl` (`mean_kl`) | MTP Iso `mean_kl` (Top-1) | Vision Iso `mean_kl` (Top-1) | Vision Guard Iso Top-1 |
+|---|---|---:|---|---:|---|---:|---:|---:|
+| `Qwen/Qwen3.5-2B` | [`Qwen3.5-2B-W4A16-HGPTQ`](results/dense-w4a16-hgptq/README.md) | `1.84 GiB` | `3.8302 → 3.8942` (`+1.669%`) | `0.072782` | `0.072536` (`0.057225`) | `0.025525` (`91.87%`) | `0.015169` (`97.45%`) | — |
+| `Qwen/Qwen3.5-9B` | [`Qwen3.5-9B-W4A16-HGPTQ`](results/dense-w4a16-hgptq/README.md) | `7.62 GiB` | `3.5754 → 3.6428` (`+1.887%`) | `0.072561` | `0.056641` (`0.039547`) | `0.012801` (`94.80%`) | `0.007640` (`98.09%`) | — |
+| `Qwen/Qwen3.8-27B` | [`Qwen3.8-27B-W4A16-HGPTQ`](results/dense-w4a16-hgptq/README.md) | `17.33 GiB` | `8.5438 → 8.5189` (`-0.292%`) | `0.115968` | `0.081058` (`0.063923`) | `0.010930` (`96.22%`) | `0.015734` (`97.45%`) | — |
+| `Qwen/Qwen3.6-35B-A3B` | [`Qwen3.6-35B-A3B-W4A16-HGPTQ`](results/qwen36-35b-a3b-w4a16-hgptq/README.md) | `19.24 GiB` | `4.0208 → 3.9020` (`-2.956%`) | `0.090070` | `0.057899` (`0.048598`) | `0.011066` (`95.93%`) | `0.007872` (`98.34%`) | `99.26%` |
+| `Qwen/Qwen3.8-Flash-Next` | [`Qwen3.8-Flash-Next-W4A16-HGPTQ`](results/qwen38-flash-next-w4a16-hgptq/README.md) | `93.42 GiB` | `3.6085 → 3.6264` (`+0.496%`) | `0.053029` | `0.153487` (`0.105409`) | `0.019397` (`94.15%`) | `0.017803` (`96.36%`) | `99.26%` |
 
 ---
 
@@ -99,14 +99,14 @@ The Qwen3-VL vision tower has `intermediate_size = 4304` ($4304 = 16 \times 269$
 - Calibrating Vision Hessians on `data/vision-calib-v2` (120 images across 12 domains) with length-equalized token weighting (`token_exp=0.25`, scaling activations by $(1024 / N_{\text{tok}})^{0.25}$) prevents high-resolution document images from drowning out chart/UI images and improves VisionKL by **33%–36%** over weight-only RTN.
 
 ### 5. Layer-1 PLE (`Qwen3.8-Flash-Next`): 4-Bit `Custom-LUT4` `W_kv`-HGPTQ + 4 KiB Page-Slotted Layout
-`Qwen3.8-Flash-Next` includes a `33.55B`-parameter (`62.50 GiB` BF16) Per-Layer Embedding (PLE) table at Layer 1 (`128` shard files, `26,214,400` rows × `1280` dims = `8` N-gram heads × `160` dim/head) feeding downstream `key_proj` and `value_proj`:
-- **Why uniform INT4 fails on PLE:** PLE rows are super-Gaussian ($\kappa \approx 4.6$); uniform INT4 wastes outer levels or clips tails. A fixed symmetric 16-entry non-uniform lookup table (`PLE_CUSTOM_LUT4`, storing only the 8 positive FP16 centroids) aligned to the empirical PLE distribution cuts reconstruction error by **>2×**.
-- **Analytical `W_kv`-HGPTQ + 1-Pass Coordinate Descent:** Because PLE rows are sparsely indexed by N-grams, activation sampling misses the tail of the 26.2M-row table. Instead, the exact downstream linear map is known analytically:
+`Qwen3.8-Flash-Next` includes a `51.2B`-parameter (`102.4 GB` / `95.37 GiB` BF16) Per-Layer Embedding (PLE) table at Layer 1 (`128` N-gram shards across `8` files `model-ple-000..007.safetensors`, `320,000,456` head-rows × `160` dim/head across `16` N-gram heads, `ple_embed_dim = 2560`) feeding downstream `key_proj` and `value_proj`:
+- **Why uniform INT4 fails on PLE:** PLE rows are super-Gaussian ($\kappa \approx 4.6$); uniform INT4 wastes outer levels or clips tails. A fixed 16-entry non-uniform lookup table (`PLE_CUSTOM_LUT4`, 16 FP32 centroids in `[-1, 1]`) aligned to the empirical PLE distribution cuts reconstruction error by **>2×**.
+- **Analytical `W_kv`-HGPTQ + 1-Pass Coordinate Descent:** Because PLE rows are sparsely indexed by N-grams, activation sampling misses the tail of the 320M-row table. Instead, the exact downstream linear map is known analytically:
   $$H_h = W_{k,h}^\top W_{k,h} + W_{v,h}^\top W_{v,h} + \lambda \operatorname{diag}(\dots) \in \mathbb{R}^{160 \times 160}$$
-  Solving Cholesky GPTQ against $H_h$ per head (`group_size=32`) followed by 1 pass of per-group coordinate-descent scale refinement (`ple_cd_passes=1`) compresses PLE `3.56×` (`62.50 GiB` → `17.58 GiB`) in under 60 seconds with near-zero perplexity impact.
-- **4 KiB Page-Slotted NVMe Layout (`weight_pages_4k`):** Each shard also stores a `[4552, 4096] uint8` page-slotted tensor packing `45` PLE head-rows (`80 B` nibbles + `10 B` FP16 scales = `90 B/row`) into each `4096 B` OS/NVMe page (`98.9%` density, zero page-boundary straddling) for `O_DIRECT` GDS/pread paging.
+  Solving Cholesky GPTQ against $H_h$ per head (`group_size=32`) followed by 1 pass of per-group coordinate-descent scale refinement (`ple_cd_passes=1`) compresses PLE `3.56×` (`102.4 GB` / `95.37 GiB` → `26.822 GiB`, `90 B/row`: `80 B` packed 4-bit nibbles + `10 B` FP16 scales) with near-zero perplexity impact.
+- **4 KiB Page-Slotted NVMe Layout (`pack_ple_page_slotted_4k`):** `pack_ple_page_slotted_4k` / `unpack_ple_page_slotted_4k` packs `45` PLE head-rows (`80 B` nibbles + `10 B` FP16 scales = `90 B/row`) into each `4096 B` OS/NVMe page (`98.9%` density, zero page-boundary straddling) for single-page-fault `mmap` / `io_uring` / `O_DIRECT` lookup.
 
 ### 6. Static Hot Expert Cache Rankings (`runtime/static_hot_cache_rankings.json`)
-During streaming MoE quantization (`src/warp_quant/streaming_moe.py`), exact top-$k$ router hits and routing probability mass are accumulated across all $L$ MoE layers on the calibration corpus (`2,005,401` tokens for `flash-next`, `3,489,808` tokens for `35b`) and exported to:
-- `runtime/static_hot_cache_rankings.json` — per-layer `expert_ids_by_rank`, `token_hits_by_rank`, `routing_weight_sum_by_rank`, and `cumulative_hit_recall_at_k` (`k=16..256`), enabling zero-warmup static hot-expert pinning in VRAM at server startup.
-- `runtime/expert_routing_profile.json` — per-expert activation counts and routing entropy diagnostics.
+During streaming MoE quantization and probing (`src/warp_quant/streaming_moe.py`), exact top-$k$ router hits and routing probability mass are accumulated across all $L$ MoE layers and Native MTP (`9,804,460` expert assignments/layer for `flash-next`, `6,979,616` for `35b`) and exported to:
+- `runtime/static_hot_cache_rankings.json` (and root `static_hot_cache_rankings.json`) — maps target layer indices (`"0".."39"` or `"0".."47"`) to global expert IDs ordered hottest-first (`active_ranked_expert_ids`), enabling zero-warmup static hot-expert pinning in VRAM at server startup (`VLLM_WNA16_STATIC_HOT_CACHE_FILE` / `HostExpertStore`).
+- `runtime/expert_routing_profile.json` — full per-layer `ranked_expert_ids`, `active_ranked_expert_ids`, `hit_counts`, `weight_sums`, and `top_k_coverage` (`top_8..top_256`), including `"mtp.0"`.

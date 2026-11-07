@@ -24,7 +24,7 @@ Full-model **W4A16 Cholesky GPTQ (`group_size=64`, `actorder="static"`) + online
   - `73,728` routed MoE expert projections (`48` layers $\times$ `512` experts $\times$ `3` projections: `mlp.experts.0..511.{gate_proj,up_proj,down_proj}`) quantized with **online block-Hadamard input rotation (`head_dim=64` on both $K_{\text{in}}=2560$ and $K_{\text{down}}=640$) + Cholesky GPTQ (`group_size=64`, `actorder="static"`)**.
 - **Layer-1 N-Gram Per-Layer Embedding (`51.2B` parameters / `102.4 GB` BF16 $\to$ `26.822 GiB` across `8` shards `model-ple-000..007.safetensors`):**
   - All `128` n-gram embedding shards (`320,000,456` rows $\times$ `160` dim) quantized to **4-bit non-uniform `Custom-LUT4` (`group_size=32`, `90 B/row`: `80 B` packed 4-bit nibbles + `10 B` FP16 scales)** using **exact downstream `W_kv`-HGPTQ error feedback (`H = W_k^T W_k + W_v^T W_v`) + 1-pass Coordinate Descent** so quantization error is orthogonal to the downstream `layers.1.ple.{key_proj,value_proj}` cross-attention subspaces.
-  - Each shard stores both linear tables (`weight_packed`, `weight_scale`, `lut`) and a **`4 KiB` OS-page-slotted table (`weight_pages_4k`, `45` rows/page with `80 B` nibbles + `10 B` scales co-located inside a single `4096 B` page)** for single-page-fault `mmap` / `io_uring` lookup.
+  - Each shard stores linear tables (`weight_packed`, `weight_scale`, `weight_lut`, `weight_shape`), and `pack_ple_page_slotted_4k` packs `45` rows/page (`80 B` nibbles + `10 B` scales co-located inside a single `4096 B` OS page) for single-page-fault `mmap` / `io_uring` lookup.
 - **Native MTP (`1,543` linears, `1.340 GiB` in `model-mtp.safetensors`):**
   - `4` rotated `self_attn` projections (`head_dim=64`) + `3` rotated `mlp.shared_expert` projections (`head_dim=64`) + `1,536` rotated `group_size=64` routed MoE expert projections (`512` experts, `head_dim=64`), calibrated on captured Layer-47 pre-mixer hidden states and shifted token embeddings.
 - **Vision Tower (`110` rotated linears, `0.225 GiB` in `model-vision.safetensors`):**
@@ -69,7 +69,7 @@ Full-model **W4A16 Cholesky GPTQ (`group_size=64`, `actorder="static"`) + online
 | Embed + LM Head + Mixer | `model-embed-head.safetensors` | `2.380 GiB` | BF16 | GPU VRAM resident |
 | 48 Target Layers (Attn + Shared MLP + HC + Norms + PLE Proj) | `model-layer-00..47.safetensors` | `~3.85 GiB` | W4A16-HGPTQ (`g64-h64`) + BF16 | GPU VRAM resident |
 | 48 Target Layers Routed Experts (`48 × 512` experts) | `model-layer-00..47.safetensors` | `~58.80 GiB` | W4A16-HGPTQ (`g64-h64`) | Hot cache in GPU VRAM + Cold experts in pinned DDR (`HostExpertStore` / UVA) |
-| Layer-1 PLE N-Gram Table (`128` shards, `51.2B` params) | `model-ple-000..007.safetensors` | `26.822 GiB` | 4-bit `Custom-LUT4` (`g32`) + `weight_pages_4k` | Linux page cache (`mmap`) / CPU offload |
+| Layer-1 PLE N-Gram Table (`128` shards, `51.2B` params) | `model-ple-000..007.safetensors` | `26.822 GiB` | 4-bit `Custom-LUT4` (`g32`, `90 B/row`) | Linux page cache (`mmap`) / CPU offload |
 | Native MTP Layer (`512` experts + Shared MLP + QSA Attn) | `model-mtp.safetensors` | `1.340 GiB` | W4A16-HGPTQ (`g64-h64`) | Hot cache in GPU VRAM + Cold experts in pinned DDR |
 | Vision Tower (`27` blocks + merger) | `model-vision.safetensors` | `0.225 GiB` | W4A16-HGPTQ (`g64-h64` / `channel-h16`) | GPU VRAM resident (when multimodal enabled) |
 

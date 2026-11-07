@@ -443,14 +443,19 @@ def stream_quantize_ple_shards(
     ngram_heads = ple_emb.ngram_heads
     eos_token_id = ple_emb.eos_token_id
 
-    h_list, u_list = compute_ple_head_hessians(
-        ple_layer.key_proj.weight,
-        ple_layer.value_proj.weight,
-        num_heads=ngram_heads,
-        dampening_frac=dampening_frac,
-    )
-    lut_tensor = torch.tensor(PLE_CUSTOM_LUT4, device=device, dtype=torch.float32)
-    lut_cpu = lut_tensor.cpu()
+    if ple_group_size > 0:
+        h_list, u_list = compute_ple_head_hessians(
+            ple_layer.key_proj.weight,
+            ple_layer.value_proj.weight,
+            num_heads=ngram_heads,
+            dampening_frac=dampening_frac,
+        )
+        lut_tensor = torch.tensor(PLE_CUSTOM_LUT4, device=device, dtype=torch.float32)
+        lut_cpu = lut_tensor.cpu()
+    else:
+        h_list, u_list = [], []
+        lut_tensor = torch.empty(0, device=device, dtype=torch.float32)
+        lut_cpu = lut_tensor.cpu()
 
     # Precompute ngram_ids [1, S_i, ngram_heads] for every calibration sequence and flatten for O(1) vectorized gather
     head_dim = ple_layer.key_proj.weight.shape[1] // ngram_heads
@@ -505,57 +510,66 @@ def stream_quantize_ple_shards(
             row_end = row_start + n_rows
             global_row_cursor = row_end
 
-            eff_group_size = min(ple_group_size, d_h)
-            num_groups = d_h // eff_group_size
-            packed_shard = torch.empty((n_rows, d_h // 2), dtype=torch.uint8)
-            scales_shard = torch.empty((n_rows, num_groups), dtype=torch.float16)
-
-            segments = _ple_head_segments_for_shard(
-                row_start, row_end, ple_emb.ngram_heads_offsets, ple_emb.ngram_heads_vocab_sizes
-            )
-
-            for seg_r0, seg_r1, head_m in segments:
-                h_m = h_list[head_m]
-                u_m = u_list[head_m]
-                for b0 in range(seg_r0, seg_r1, batch_rows):
-                    b1 = min(b0 + batch_rows, seg_r1)
-                    w_batch = w_shard_cpu[b0:b1].to(device=device, dtype=torch.float32)
-                    q_deq, p_u8, s_fp16 = quantize_ple_batch_gptq_lut4(
-                        w_batch,
-                        h_m,
-                        u_m,
-                        lut=lut_tensor,
-                        group_size=eff_group_size,
-                        cd_passes=cd_passes,
-                    )
-                    packed_shard[b0:b1].copy_(p_u8.cpu())
-                    scales_shard[b0:b1].copy_(s_fp16.cpu())
-                    del w_batch, q_deq, p_u8, s_fp16
-
-            del w_shard_cpu
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-
-            hit_mask = (all_ngram_ids >= row_start) & (all_ngram_ids < row_end)
-            if hit_mask.any():
-                local_rows = (all_ngram_ids[hit_mask] - row_start).long()
-                all_quant_embeds[hit_mask] = dequantize_ple_rows_lut4(
-                    packed_shard[local_rows],
-                    scales_shard[local_rows],
-                    lut_cpu,
-                    group_size=eff_group_size,
-                    out_dtype=torch.bfloat16,
-                )
-
             out_prefix = (
                 f"model.language_model.layers.{layer_idx}.ple.ple_embedding.ngram_embedding.shard_{shard_id}"
             )
-            shard_tensors = {
-                f"{out_prefix}.weight_packed": packed_shard,
-                f"{out_prefix}.weight_scale": scales_shard,
-                f"{out_prefix}.weight_lut": lut_cpu.clone(),
-                f"{out_prefix}.weight_shape": torch.tensor([n_rows, d_h], dtype=torch.int64),
-            }
+            hit_mask = (all_ngram_ids >= row_start) & (all_ngram_ids < row_end)
+
+            if ple_group_size <= 0:
+                w_bf16 = w_shard_cpu.to(torch.bfloat16)
+                del w_shard_cpu
+                if hit_mask.any():
+                    local_rows = (all_ngram_ids[hit_mask] - row_start).long()
+                    all_quant_embeds[hit_mask] = w_bf16[local_rows]
+                shard_tensors = {f"{out_prefix}.weight": w_bf16}
+            else:
+                eff_group_size = min(ple_group_size, d_h)
+                num_groups = d_h // eff_group_size
+                packed_shard = torch.empty((n_rows, d_h // 2), dtype=torch.uint8)
+                scales_shard = torch.empty((n_rows, num_groups), dtype=torch.float16)
+
+                segments = _ple_head_segments_for_shard(
+                    row_start, row_end, ple_emb.ngram_heads_offsets, ple_emb.ngram_heads_vocab_sizes
+                )
+
+                for seg_r0, seg_r1, head_m in segments:
+                    h_m = h_list[head_m]
+                    u_m = u_list[head_m]
+                    for b0 in range(seg_r0, seg_r1, batch_rows):
+                        b1 = min(b0 + batch_rows, seg_r1)
+                        w_batch = w_shard_cpu[b0:b1].to(device=device, dtype=torch.float32)
+                        q_deq, p_u8, s_fp16 = quantize_ple_batch_gptq_lut4(
+                            w_batch,
+                            h_m,
+                            u_m,
+                            lut=lut_tensor,
+                            group_size=eff_group_size,
+                            cd_passes=cd_passes,
+                        )
+                        packed_shard[b0:b1].copy_(p_u8.cpu())
+                        scales_shard[b0:b1].copy_(s_fp16.cpu())
+                        del w_batch, q_deq, p_u8, s_fp16
+
+                del w_shard_cpu
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+                if hit_mask.any():
+                    local_rows = (all_ngram_ids[hit_mask] - row_start).long()
+                    all_quant_embeds[hit_mask] = dequantize_ple_rows_lut4(
+                        packed_shard[local_rows],
+                        scales_shard[local_rows],
+                        lut_cpu,
+                        group_size=eff_group_size,
+                        out_dtype=torch.bfloat16,
+                    )
+
+                shard_tensors = {
+                    f"{out_prefix}.weight_packed": packed_shard,
+                    f"{out_prefix}.weight_scale": scales_shard,
+                    f"{out_prefix}.weight_lut": lut_cpu.clone(),
+                    f"{out_prefix}.weight_shape": torch.tensor([n_rows, d_h], dtype=torch.int64),
+                }
             out_shard_fname = f"model-ple-{bucket_idx:03d}.safetensors"
             for tk, tv in shard_tensors.items():
                 current_bucket[tk] = tv
@@ -1343,19 +1357,21 @@ def _quantize_decoder_layer_streaming(
     # ------------------------------------------------------------------
     keep_calib_on_device = h_calib[0].device == device
     if getattr(layer, "ple", None) is not None:
-        n_heads = layer.ple.ple_embedding.ngram_heads
-        can_reuse_ple = (
-            reuse_ple_dir is not None
-            and (reuse_ple_dir / "model.safetensors.index.json").exists()
-            and all((reuse_ple_dir / f"model-ple-{m:03d}.safetensors").exists() for m in range(n_heads))
+        reuse_smap: dict[str, str] = {}
+        reuse_ple_shards: list[tuple[int, str, str]] = []
+        reuse_ple_files: list[str] = []
+        if reuse_ple_dir is not None and (reuse_ple_dir / "model.safetensors.index.json").exists():
+            reuse_smap, _ = _load_shard_map(reuse_ple_dir)
+            reuse_ple_shards = _discover_ple_shards(reuse_smap, reuse_ple_dir, layer_idx)
+            reuse_ple_files = sorted({fname for _sid, _kpref, fname in reuse_ple_shards})
+        can_reuse_ple = bool(reuse_ple_files) and all(
+            (reuse_ple_dir / fname).exists() for fname in reuse_ple_files
         )
         if can_reuse_ple:
             import shutil
 
-            reuse_smap, _ = _load_shard_map(reuse_ple_dir)
             ple_prefix = f"model.language_model.layers.{layer_idx}.ple.ple_embedding.ngram_embedding."
-            for m in range(n_heads):
-                sname = f"model-ple-{m:03d}.safetensors"
+            for sname in reuse_ple_files:
                 src_p = reuse_ple_dir / sname
                 dst_p = output_dir / sname
                 if not dst_p.exists():
@@ -1371,7 +1387,7 @@ def _quantize_decoder_layer_streaming(
             for k, v in reuse_smap.items():
                 if k.startswith(ple_prefix):
                     ple_weight_map[k] = v
-            n_ple_shards = n_heads
+            n_ple_shards = len(reuse_ple_shards)
             quant_ple_embeds = stream_gather_ple_embeds(
                 output_dir,
                 ple_weight_map,
@@ -2164,7 +2180,7 @@ def _write_qwen4_exp_quant_config(
         "transform_config": transform_cfg,
         "version": "0.14.0",
     }
-    if not is_qwen35_moe:
+    if not is_qwen35_moe and ple_group_size > 0:
         qcfg_dict["ple_quantization"] = {
             "cd_passes": ple_cd_passes,
             "format": "lut4-gptq",
@@ -2234,9 +2250,7 @@ def run_quantize_qwen4_exp(args: argparse.Namespace) -> None:
     calib = args.calib or recipe_defaults["calib"]
     num_samples = args.num_samples if args.num_samples is not None else recipe_defaults["num_samples"]
     max_seq_length = (
-        args.max_seq_length
-        if args.max_seq_length is not None
-        else min(recipe_defaults["max_seq_length"], 2048)
+        args.max_seq_length if args.max_seq_length is not None else recipe_defaults["max_seq_length"]
     )
     window = args.window or recipe_defaults["window"]
     actorder = None if args.actorder == "none" else args.actorder
@@ -3721,17 +3735,17 @@ def main() -> None:
     q.add_argument("--hadamard-block-size", type=int, default=64)
     q.add_argument("--actorder", choices=["none", "weight", "static"], default="static")
     q.add_argument("--dampening-frac", type=float, default=0.01)
-    q.add_argument("--ple-group-size", type=int, default=32)
+    q.add_argument("--ple-group-size", type=int, choices=[0, 32, 64, 128], default=32)
     q.add_argument("--ple-cd-passes", type=int, default=1)
-    q.add_argument("--quantize-mtp", action="store_true")
-    q.add_argument("--quantize-vision", action="store_true")
+    q.add_argument("--quantize-mtp", action=argparse.BooleanOptionalAction, default=True)
+    q.add_argument("--quantize-vision", action=argparse.BooleanOptionalAction, default=True)
     q.add_argument("--component-quant-mode", choices=["gptq", "rtn"], default="gptq")
     q.add_argument("--vision-calib-dir", default="data/vision-calib-v2")
     q.add_argument("--vision-calib-samples", type=int, default=None)
     q.add_argument("--component-calib-samples", type=int, default=64)
     q.add_argument("--calib", default=None)
-    q.add_argument("--num-samples", type=int, default=512)
-    q.add_argument("--max-seq-length", type=int, default=2048)
+    q.add_argument("--num-samples", type=int, default=None)
+    q.add_argument("--max-seq-length", type=int, default=None)
     q.add_argument("--window", choices=["head", "tail", "random"], default=None)
     q.add_argument("--seed", type=int, default=0)
     q.add_argument("--sequential-offload-device", choices=["cpu", "cuda"], default="cuda")
