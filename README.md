@@ -72,7 +72,7 @@ Full receipts and Hugging Face model cards are stored in [`results/`](results/):
 | `Qwen/Qwen3.5-9B` | [`Qwen3.5-9B-W4A16-HGPTQ`](results/dense-w4a16-hgptq/9b-g64-h64/README.md) | `7.62 GiB` | `3.5754 → 3.6428` (`+1.887%`) | `0.072561` | `0.056641` (`0.039547`) | `0.012801` (`94.80%`) | `0.007640` (`98.09%`) | — |
 | `Qwen/Qwen3.8-27B` | [`Qwen3.8-27B-W4A16-HGPTQ`](results/dense-w4a16-hgptq/27b-g64-h64/README.md) | `17.33 GiB` | `8.5438 → 8.5189` (`-0.292%`) | `0.115968` | `0.081058` (`0.063923`) | `0.010930` (`96.22%`) | `0.015734` (`97.45%`) | — |
 | `Qwen/Qwen3.6-35B-A3B` | [`Qwen3.6-35B-A3B-W4A16-HGPTQ`](results/qwen36-35b-a3b-w4a16-hgptq/README.md) | `19.24 GiB` | `4.0208 → 4.0078` (`-0.324%`) | `0.086829` | `0.061499` (`0.049570`) | `0.011294` (`95.71%`) | `0.007712` (`98.34%`) | `99.26%` |
-| `Qwen/Qwen3.8-Flash-Next` | [`Qwen3.8-Flash-Next-W4A16-HGPTQ`](results/qwen38-flash-next-w4a16-hgptq/README.md) | `93.42 GiB` | `3.6085 → 3.6264` (`+0.496%`) | `0.053029` | `0.153487` (`0.105409`) | `0.019397` (`94.15%`) | `0.017803` (`96.36%`) | `99.26%` |
+| `Qwen/Qwen3.8-Flash-Next` | [`Qwen3.8-Flash-Next-W4A16-HGPTQ`](results/qwen38-flash-next-w4a16-hgptq/README.md) | `93.42 GiB` | `3.6085 → 3.5963` (`-0.338%`) | `0.050367` | `0.130763` (`0.100696`) | `0.021747` (`95.01%`) | `0.017132` (`96.69%`) | `99.26%` |
 
 ---
 

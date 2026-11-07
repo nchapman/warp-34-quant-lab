@@ -25,12 +25,12 @@ Teacher-forced evaluation comparing this checkpoint directly against the unquant
 | Evaluation | BF16 Base (`Qwen/Qwen3.8-Flash-Next`) | **`Qwen3.8-Flash-Next-W4A16-HGPTQ`** | Notes |
 |---|---:|---:|---|
 | **Safetensors Size** | `335.28 GiB` (`360,000,192,888 B`) | **`93.42 GiB` (`100,306,498,784 B`)** | **`3.59×` compression** (`−241.86 GiB` across `59` shards) |
-| **Text Perplexity** (378 prompts, 852k tokens) ↓ | `3.6085` | **`3.6264` (`+0.50%`)** | Chat, math, science, coding, tool use, multilingual |
-| **Text Divergence vs. BF16** (weighted KL / token mean KL) ↓ | `0.0000` | **`0.0530` / `0.0916`** | Full-vocabulary FP32 KL divergence |
-| **General & Multilingual Holdout Perplexity** (76 prompts, 23k tokens) ↓ | `24.2483` | **`26.8379` (`+10.68%`)** | Token mean KL `0.1054` (English chat holdout KL `0.0693`, PPL `22.31 → 22.93`) |
-| **Native MTP (Speculative Drafter)** (12,339 positions) | `100.0%` Top-1 (`NLL 2.6008`) | **`94.15%` Top-1 (`NLL 2.6120`)** | Isolated MTP KL `0.0194` (end-to-end Top-1 `87.28%`, KL `0.1670`) |
-| **Vision (VQA, Charts, Documents & OCR)** (96 images, 302 tokens) | `1.0000` cos sim · `100.0%` Top-1 | **`0.9870` cos sim · `96.36%` Top-1** | Isolated ViT KL `0.0178` (end-to-end Top-1 `95.03%`, KL `0.0850`) |
-| **Vision (UI / ScreenSpot & Math OCR)** (48 images, 135 tokens) | `1.0000` cos sim · `100.0%` Top-1 | **`0.9903` cos sim · `99.26%` Top-1** | Isolated ViT KL `0.0149` (end-to-end Top-1 `97.78%`, KL `0.0496`) |
+| **Text Perplexity** (378 prompts, 852k tokens) ↓ | `3.6085` | **`3.5963` (`−0.34%`)** | Chat, math, science, coding, tool use, multilingual |
+| **Text Divergence vs. BF16** (weighted KL / token mean KL) ↓ | `0.0000` | **`0.0504` / `0.0920`** | Full-vocabulary FP32 KL divergence |
+| **General & Multilingual Holdout Perplexity** (76 prompts, 23k tokens) ↓ | `24.2483` | **`26.8842` (`+10.87%`)** | Token mean KL `0.1007` (weighted KL `0.1308`, English chat PPL `22.31 → 22.93`) |
+| **Native MTP (Speculative Drafter)** (12,339 positions) | `100.0%` Top-1 (`NLL 2.6008`) | **`95.01%` Top-1 (`NLL 2.6179`)** | Isolated MTP KL `0.0217` (end-to-end Top-1 `87.55%`, KL `0.1689`) |
+| **Vision (VQA, Charts, Documents & OCR)** (96 images, 302 tokens) | `1.0000` cos sim · `100.0%` Top-1 | **`0.9871` cos sim · `96.69%` Top-1** | Isolated ViT KL `0.0171` (end-to-end Top-1 `94.04%`, KL `0.0746`) |
+| **Vision (UI / ScreenSpot & Math OCR)** (48 images, 135 tokens) | `1.0000` cos sim · `100.0%` Top-1 | **`0.9903` cos sim · `99.26%` Top-1** | Isolated ViT KL `0.0098` (end-to-end Top-1 `97.04%`, KL `0.0556`) |
 
 ## What Is Quantized
 
@@ -65,10 +65,10 @@ Both `runtime/static_hot_cache_rankings.json` and root `static_hot_cache_ranking
 
 | Layer | Active Experts | Top-5 Hottest Expert IDs | `top_32` Hit Rate | `top_64` Hit Rate | `top_88` Hit Rate | `top_128` Hit Rate | `top_256` Hit Rate |
 |---|---:|---|---:|---:|---:|---:|---:|
-| Layer `0` | `508 / 512` | `[306, 470, 279, 280, 266]` | `13.93%` | `23.96%` | `30.89%` | `41.40%` | `69.72%` |
-| Layer `1` | `511 / 512` | `[130, 308, 320, 58, 383]` | `14.71%` | `25.45%` | `32.60%` | `43.50%` | `72.18%` |
-| Layer `12` | `512 / 512` | `[34, 272, 139, 63, 166]` | `15.76%` | `27.02%` | `34.47%` | `45.42%` | `73.56%` |
-| Layer `23` | `512 / 512` | `[499, 361, 242, 183, 84]` | `16.81%` | `28.20%` | `35.16%` | `45.27%` | `70.91%` |
-| Layer `35` | `512 / 512` | `[189, 18, 479, 372, 199]` | `21.91%` | `34.77%` | `42.32%` | `52.90%` | `77.92%` |
-| Layer `47` | `511 / 512` | `[242, 398, 157, 110, 55]` | `31.61%` | `45.71%` | `54.12%` | `65.45%` | `88.01%` |
-| `mtp.0` | `512 / 512` | `[439, 433, 257, 410, 451]` | `26.86%` | `39.96%` | `47.72%` | `58.46%` | `81.34%` |
+| Layer `0` | `507 / 512` | `[306, 470, 279, 280, 266]` | `13.92%` | `23.95%` | `30.89%` | `41.41%` | `69.73%` |
+| Layer `1` | `511 / 512` | `[130, 308, 320, 58, 383]` | `14.72%` | `25.46%` | `32.62%` | `43.51%` | `72.17%` |
+| Layer `12` | `512 / 512` | `[34, 272, 139, 63, 166]` | `15.72%` | `26.99%` | `34.46%` | `45.40%` | `73.58%` |
+| Layer `23` | `512 / 512` | `[499, 361, 242, 183, 84]` | `16.75%` | `28.12%` | `35.07%` | `45.19%` | `70.84%` |
+| Layer `35` | `512 / 512` | `[189, 479, 18, 372, 341]` | `21.92%` | `34.77%` | `42.34%` | `52.95%` | `77.96%` |
+| Layer `47` | `511 / 512` | `[242, 398, 157, 110, 55]` | `31.52%` | `45.60%` | `54.00%` | `65.32%` | `87.93%` |
+| `mtp.0` | `512 / 512` | `[439, 433, 410, 257, 451]` | `26.80%` | `39.96%` | `47.72%` | `58.51%` | `81.41%` |
