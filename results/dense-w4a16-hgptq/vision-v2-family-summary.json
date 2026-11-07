@@ -1,0 +1,138 @@
+{
+  "2b": {
+    "v1_calib_time_s": 26.22,
+    "v2_calib_time_s": 42.07,
+    "arms": {
+      "v1_calib_64": {
+        "v1_probe": {
+          "relative_rmse": 0.3293113496270057,
+          "mean_cos_sim": 0.9546319395303726
+        },
+        "v2_probe": {
+          "relative_rmse": 0.3228360516737101,
+          "mean_cos_sim": 0.9513285836825768
+        },
+        "v2_guard": {
+          "relative_rmse": 0.26865050546921065,
+          "mean_cos_sim": 0.9623651752869288
+        }
+      },
+      "v2_calib_120_sqrt": {
+        "v1_probe": {
+          "relative_rmse": 0.33996119123394675,
+          "mean_cos_sim": 0.9516589008271694
+        },
+        "v2_probe": {
+          "relative_rmse": 0.31080383986833005,
+          "mean_cos_sim": 0.9566440942386786
+        },
+        "v2_guard": {
+          "relative_rmse": 0.269612982785559,
+          "mean_cos_sim": 0.9632652377088865
+        }
+      }
+    }
+  },
+  "9b": {
+    "v1_calib_time_s": 30.71,
+    "v2_calib_time_s": 51.58,
+    "arms": {
+      "v1_calib_64": {
+        "v1_probe": {
+          "relative_rmse": 0.20972533385103684,
+          "mean_cos_sim": 0.9825036016603311
+        },
+        "v2_probe": {
+          "relative_rmse": 0.22444211137733044,
+          "mean_cos_sim": 0.9772718194872141
+        },
+        "v2_guard": {
+          "relative_rmse": 0.17859016587316998,
+          "mean_cos_sim": 0.9840601645410061
+        }
+      },
+      "v2_calib_120_sqrt": {
+        "v1_probe": {
+          "relative_rmse": 0.21700940311125524,
+          "mean_cos_sim": 0.9814867414534092
+        },
+        "v2_probe": {
+          "relative_rmse": 0.21739703014844372,
+          "mean_cos_sim": 0.9796683092912039
+        },
+        "v2_guard": {
+          "relative_rmse": 0.17658906256561024,
+          "mean_cos_sim": 0.9849796667695045
+        }
+      }
+    }
+  },
+  "27b": {
+    "v1_calib_time_s": 30.88,
+    "v2_calib_time_s": 52.75,
+    "arms": {
+      "v1_calib_64": {
+        "v1_probe": {
+          "relative_rmse": 0.11427089207559994,
+          "mean_cos_sim": 0.9954920622209708
+        },
+        "v2_probe": {
+          "relative_rmse": 0.13376984987938628,
+          "mean_cos_sim": 0.993875008697311
+        },
+        "v2_guard": {
+          "relative_rmse": 0.10286631349561512,
+          "mean_cos_sim": 0.996475967268149
+        }
+      },
+      "v2_calib_120_sqrt": {
+        "v1_probe": {
+          "relative_rmse": 0.11573559743083157,
+          "mean_cos_sim": 0.9953564579288164
+        },
+        "v2_probe": {
+          "relative_rmse": 0.1256228528761713,
+          "mean_cos_sim": 0.994813671335578
+        },
+        "v2_guard": {
+          "relative_rmse": 0.09965030461414272,
+          "mean_cos_sim": 0.9967091145614783
+        }
+      }
+    }
+  },
+  "35b": {
+    "v1_calib_time_s": 31.04,
+    "v2_calib_time_s": 51.12,
+    "arms": {
+      "v1_calib_64": {
+        "v1_probe": {
+          "relative_rmse": 0.21916109213174756,
+          "mean_cos_sim": 0.9798646296064059
+        },
+        "v2_probe": {
+          "relative_rmse": 0.22189909034678895,
+          "mean_cos_sim": 0.9784359553207954
+        },
+        "v2_guard": {
+          "relative_rmse": 0.17215513123676365,
+          "mean_cos_sim": 0.9841864059368769
+        }
+      },
+      "v2_calib_120_sqrt": {
+        "v1_probe": {
+          "relative_rmse": 0.2227139152068334,
+          "mean_cos_sim": 0.9797650761902332
+        },
+        "v2_probe": {
+          "relative_rmse": 0.21426124004809716,
+          "mean_cos_sim": 0.9803097285330296
+        },
+        "v2_guard": {
+          "relative_rmse": 0.1683252546016912,
+          "mean_cos_sim": 0.9852727179725965
+        }
+      }
+    }
+  }
+}

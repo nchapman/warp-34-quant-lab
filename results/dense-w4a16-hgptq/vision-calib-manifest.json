@@ -1,0 +1,22 @@
+{
+  "calibration": true,
+  "rows": 64,
+  "rows_sha256": "05b705bda00067dc366d12375d38eb7e00e327ff826b09541c6604feb1b3893a",
+  "selection": "hash rank seed vision-calib-1 (disjoint from vision-probe-0); ChartQA 16/category; TextVQA 32/shard0",
+  "sources": [
+    {
+      "domain": "chartqa",
+      "file": "data/test-00000-of-00001-e2cd0b7a0f9eb20d.parquet",
+      "repo": "HuggingFaceM4/ChartQA",
+      "revision": "b605b6e08b57faf4359aeb2fe6a3ca595f99b6c5",
+      "sha256": "efcf31333368c485eb569ec7bd4cc3694bd0e8e1a06c503124b51d27c924491d"
+    },
+    {
+      "domain": "textvqa",
+      "file": "data/validation-00000-of-00003.parquet",
+      "repo": "lmms-lab/TextVQA",
+      "revision": "9c0699cd19768ac5ab97568f6b3cbac4c0062884",
+      "sha256": "491649b5b8add2c5bde13a1e36707002fcd11898699255d65e2e568ac4fbddff"
+    }
+  ]
+}

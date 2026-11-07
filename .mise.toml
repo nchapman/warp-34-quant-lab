@@ -1,0 +1,66 @@
+# mise config: tool versions + task runner for warp-34-quant-lab
+# Usage:
+#   mise run setup          # create/sync .venv with uv
+#   mise run setup-kernels  # compile GPU GDN kernels (causal-conv1d + flash-linear-attention)
+#   mise run check          # lint + format-check + full test suite
+#   mise run quantize -- --model 35b --output-dir ./out/Qwen3.6-35B-A3B-W4A16-HGPTQ
+#   mise run probe -- --model 35b --quant ./out/Qwen3.6-35B-A3B-W4A16-HGPTQ
+
+[tools]
+python = "3.12.12"
+uv = "0.11.23"
+
+[settings]
+python.uv_venv_auto = "create|source"
+
+[env]
+_.file = { path = ".env", ignored_if_missing = true }
+_.python.venv = { path = ".venv", create = true }
+
+[tasks.setup]
+description = "Sync the Python environment (.venv) with uv"
+run = "uv sync --prerelease=allow"
+
+[tasks."setup-kernels"]
+description = "Build and install GPU fast-path GDN kernels (causal-conv1d + flash-linear-attention)"
+run = "bash scripts/install_gpu_kernels.sh"
+
+[tasks.fmt]
+description = "Format Python code with ruff"
+run = "uv run --no-sync ruff format src tests"
+
+[tasks."fmt-check"]
+description = "Verify Python formatting with ruff"
+run = "uv run --no-sync ruff format --check src tests"
+
+[tasks.lint]
+description = "Lint Python code with ruff"
+run = "uv run --no-sync ruff check src tests"
+
+[tasks.test]
+description = "Run the full pytest suite"
+run = "uv run --no-sync pytest"
+
+[tasks.check]
+description = "Run format check, linter, and full test suite"
+depends = ["fmt-check", "lint", "test"]
+
+[tasks."verify-data"]
+description = "Verify SHA-256 checksums of frozen calibration and probe datasets"
+run = "(cd data && sha256sum -c SHA256SUMS)"
+
+[tasks."list-models"]
+description = "List registered Qwen3.5 / 3.6 / 3.8 models and default W4A16-HGPTQ recipes"
+run = "uv run --no-sync warp-quant list-models"
+
+[tasks."build-vision-data"]
+description = "Materialize vision-calib-v2 (120 imgs), vision-probe-v2 (96 imgs), and vision-guard-v2 (48 imgs)"
+run = "uv run --no-sync warp-quant build-vision-data"
+
+[tasks.quantize]
+description = "Run W4A16-HGPTQ quantization (pass CLI args after `--`)"
+run = "uv run --no-sync warp-quant quantize"
+
+[tasks.probe]
+description = "Run W4A16-HGPTQ fidelity probe across text, MTP, and vision suites (pass CLI args after `--`)"
+run = "uv run --no-sync warp-quant probe"

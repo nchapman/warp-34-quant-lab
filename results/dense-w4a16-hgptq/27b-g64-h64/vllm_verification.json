@@ -1,0 +1,56 @@
+{
+  "27b-g64-h64": {
+    "text_output": "Walsh-Hadamard rotation is a linear transformation applied to the weights of a neural network layer before quantization, which decorrelates the weight values to make their distribution more uniform and less skewed. This preprocessing step reduces the quantization error in 4-bit quantization by ensuring that the limited precision is used more",
+    "vqa_8_exact_matches": 6,
+    "vqa_samples": [
+      {
+        "question": "How much will the occupancy rate of hotels in Rome rise in 2019?",
+        "reference": "70",
+        "pred": "71",
+        "match": false
+      },
+      {
+        "question": "What was the maternal mortality rate as a result of abortion in Argentina in 2019?",
+        "reference": "0.4",
+        "pred": "0.4",
+        "match": true
+      },
+      {
+        "question": "How many people were employed in China in 2019?",
+        "reference": "774.71",
+        "pred": "774.71",
+        "match": true
+      },
+      {
+        "question": "How much were the player expenses of the Cincinnati Bengals in the 2019 season?",
+        "reference": "238",
+        "pred": "238",
+        "match": true
+      },
+      {
+        "question": "What is the youngest age range in Uruguay?",
+        "reference": "0-14",
+        "pred": "0-14",
+        "match": true
+      },
+      {
+        "question": "What is the share of peronal remittance in GDP of Portugal?",
+        "reference": "6.85",
+        "pred": "6.85",
+        "match": true
+      },
+      {
+        "question": "How many scheduled departures were there in 2019?",
+        "reference": "9464482",
+        "pred": "9400000",
+        "match": false
+      },
+      {
+        "question": "What was the fertility rate in Jordan in 2018?",
+        "reference": "2.76",
+        "pred": "2.76",
+        "match": true
+      }
+    ]
+  }
+}

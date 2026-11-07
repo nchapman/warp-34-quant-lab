@@ -1,0 +1,22 @@
+{
+  "teacher": "qwen/qwen3.8-flash@openrouter",
+  "sampling": {
+    "temperature": 0.7,
+    "top_p": 0.95,
+    "top_k": 20,
+    "thinking": true
+  },
+  "seed_base": 20261018,
+  "max_tokens": 16384,
+  "source_calib": "data/calib-cascade-v1.jsonl",
+  "source_sha256": "1c7964a0c402691c489626f33030570b8a3b0edbaa7f4daa62543b97e3fda9bf",
+  "generated_utc": "2026-10-18T05:41:57Z",
+  "rows_requested": 555,
+  "rows_done": 555,
+  "rows_failed": 0,
+  "rows_length_capped": 63,
+  "cost_usd_est": 1.41,
+  "tokens_in": 1074713,
+  "tokens_out": 2702354,
+  "note": "contexts byte-identical to source; only final assistant turn regenerated; tool-role msgs sent to API as user (frozen rows unchanged)"
+}

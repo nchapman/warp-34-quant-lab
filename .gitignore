@@ -1,0 +1,22 @@
+# Python / uv environments & build artifacts
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+
+# Local environment overrides
+.env
+
+# Untracked run logs, generated vision image fixtures, and local model checkpoints
+/runs/
+/out/
+/data/vision-calib-v2/
+/data/vision-probe-v2/
+/data/vision-guard-v2/
+/Qwen3*/
+/*.safetensors

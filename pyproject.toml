@@ -1,0 +1,49 @@
+[project]
+name = "warp-quant"
+version = "0.1.0"
+description = "W4A16-HGPTQ (Hadamard-rotated Cholesky GPTQ + 4-bit Custom-LUT4 PLE) quantization and fidelity probing for Qwen3.5 / Qwen3.6 / Qwen3.8."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate==1.15.0",
+    "compressed-tensors==0.19.1a20261003",
+    "datasets==5.1.0",
+    "huggingface-hub>=2.0.0",
+    "llmcompressor>=0.14.1.dev27,<0.14.2",
+    "loguru>=0.7",
+    "numpy>=2.5",
+    "pillow>=11.0",
+    "pyarrow>=15",
+    "safetensors==0.9.0rc1",
+    "torch==2.14.1",
+    "torchvision==0.29.1",
+    "transformers==5.19.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.9",
+]
+
+[project.scripts]
+warp-quant = "warp_quant.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.0,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+prerelease = "allow"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

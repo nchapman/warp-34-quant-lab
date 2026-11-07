@@ -1,0 +1,28 @@
+{
+  "model": "flash-next",
+  "base_snapshot": "7ecef55a2e549814c62143fcf8b5be457695e3b9",
+  "group_size": 64,
+  "hadamard_block_size": 64,
+  "actorder": "static",
+  "dampening_frac": 0.01,
+  "ple_group_size": 32,
+  "ple_cd_passes": 1,
+  "quantize_mtp": true,
+  "quantize_vision": true,
+  "component_quant_mode": "gptq",
+  "shard_counts": {
+    "stripped_transform_weights": 0,
+    "mtp_quantized": 1543,
+    "vision_quantized": 110,
+    "vision_fc2_channel": 27,
+    "ple_shards_quantized": 128,
+    "text_attn_quantized": 156,
+    "text_shared_experts_quantized": 144,
+    "text_experts_quantized": 73728
+  },
+  "calib": "data/calib-cascade-qwenfinals.jsonl",
+  "num_samples": 512,
+  "max_seq_length": 2048,
+  "quant_wall_s": 835.64,
+  "template_sha": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2"
+}
