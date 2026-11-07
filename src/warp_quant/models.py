@@ -184,6 +184,7 @@ MODELS: dict[str, dict[str, Any]] = {
         "vocab_size": 248320,
         "mask_token_id": 248077,
         "vision_tower": True,
+        "mtp_num_hidden_layers": 1,
         "quant_repo": "nchapman/Ornith-1.5-35B-A3B-W4A16-HGPTQ",
     },
     "9b-mimo": {

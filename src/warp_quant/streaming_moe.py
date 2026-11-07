@@ -3326,7 +3326,12 @@ def run_probe_qwen4_exp(args: argparse.Namespace) -> None:
     mtp_ids_list: list[torch.Tensor] = []
     mtp_b_start = 0
     mtp_q_start = 0
-    if args.eval_mtp:
+    has_mtp_for_eval = bool(
+        args.eval_mtp
+        and _has_mtp_weights(base_dir, _load_shard_map(base_dir)[0])
+        and _has_mtp_weights(quant_dir, _load_shard_map(quant_dir)[0])
+    )
+    if has_mtp_for_eval:
         first_eval_path = Path(args.eval_sets[0])
         if not first_eval_path.is_absolute():
             first_eval_path = ROOT / first_eval_path
