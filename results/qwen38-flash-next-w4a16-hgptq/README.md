@@ -50,6 +50,34 @@ Teacher-forced evaluation comparing this checkpoint directly against the unquant
 - **Kept in BF16/FP32**:
   - `embed_tokens`, `lm_head`, `hyper_connection_mixer`, `*.attn_hyper_connection.*`, `*.mlp_hyper_connection.*`, `*.linear_attn.{in_proj_a,in_proj_b,conv1d,A_log,dt_bias,norm}`, `*.self_attn.indexer.*`, `layers.1.ple.{key_proj,value_proj,norm_key,norm_query,norm_conv,conv1d}`, `*.mlp.{gate,shared_expert_gate}`, `mtp.{fc,pre_fc_norm_embedding,pre_fc_norm_hidden,norm,hyper_connection_mixer}`, `visual.patch_embed.proj`, norms, and biases.
 
+## Why 4-Bit `Custom-LUT4` + `W_kv`-HGPTQ for the `51.2B` Layer-1 N-Gram Table
+
+In `Qwen/Qwen3.8-Flash-Next`, Layer 1 (`layers.1.ple`) contains a `51.2B`-parameter (`102.4 GB` / `95.37 GiB` BF16) N-gram hash-lookup table (`320,000,456` rows × `160` columns across `16` hash heads: `8` bigram + `8` trigram). Every token looks up `16` rows (`2560` total features) that feed **only** `layers.1.ple.key_proj` ($W_k$) and `layers.1.ple.value_proj` ($W_v$).
+
+Before choosing `Custom-LUT4 + W_kv-HGPTQ` (`group_size=32`), we evaluated low-rank SVD (`rank 144/160` loses `5.66%` energy / `23.8%` RMSE because the `160`-dim spectrum is flat), orthogonal rotation (row crest factor is already `2.89`, below Gaussian `3.18`), 8-bit `FP8`/`INT8`, and existing 4-bit formats (`NVFP4`, uniform `INT4`, and `IQ4_NL`):
+
+1. **Crossing the 96–128 GB Memory Cliff (`26.82 GiB` vs. `47.68 GiB` FP8):**
+   - Leaving the PLE table in 8-bit `FP8` (`51.20 GB` / `47.68 GiB`) brings total model weights to **`114.3 GiB`** (`66.6 GiB` quantized trunk/MTP/Vision + `47.7 GiB` PLE), which exceeds a `96 GB` GPU (`RTX PRO 6000` / `4× RTX 3090`) and overflows the Linux page cache when `~45 GiB` of cold MoE experts are pinned in host RAM on a 96–128 GB system.
+   - Compressing PLE to **`26.82 GiB` (`4.50 bits/weight`)** brings the entire `180B` model down to **`93.42 GiB`** (fitting inside `96 GB` VRAM or staying 100% resident in OS page cache) and cuts random memory-sector / CPU cache-line reads per lookup by `40%` (`90 B/row` vs. `160 B/row`).
+2. **Non-Uniform Empirical Centroids (`Custom-LUT4`):**
+   - Normalized 32-element PLE groups are super-Gaussian ($\kappa \approx 4.6$). Uniform `INT4` wastes outer quantization bins on sparse tails, while `NVFP4` (`E2M1`) has coarse steps near the core. A 16-entry non-uniform lookup table fitted to the empirical PLE distribution concentrates levels across the high-density core and fits inside a single CUDA warp register (`__shfl_sync`).
+3. **Analytical Downstream `W_kv`-HGPTQ + 1-Pass Coordinate Descent:**
+   - Because any finite calibration set touches `<0.1%` of the `320M` hash rows, activation-based GPTQ cannot calibrate the table. However, SVD of each head's downstream `key_proj` slice $W_{k,h} \in \mathbb{R}^{10240 \times 160}$ reveals a dominant rank-1 singular direction ($\sigma_1 = 5.66\text{–}6.88$ vs. $\sigma_2 \approx 2.2$, a `25×–47×` energy amplification) aligned at `0.9501` cosine similarity with the embedding table's top singular vector.
+   - Because each head $h \in \{0,\dots,15\}$ feeds only $(W_{k,h}, W_{v,h})$, the exact downstream quadratic error has a closed-form, calibration-free $160 \times 160$ Hessian:
+     $$H_h = \frac{1}{2}\left(\frac{W_{k,h}^\top W_{k,h}}{\|W_{k,h}\|_F^2 / 160} + \frac{W_{v,h}^\top W_{v,h}}{\|W_{v,h}\|_F^2 / 160}\right) + \lambda D \in \mathbb{R}^{160 \times 160}$$
+   - Running Cholesky GPTQ (`group_size=32`, static actorder) + 1 pass of coordinate-descent scale refinement against $H_h$ steers quantization noise out of $W_{k,h}$'s amplified singular direction across all `320M` rows, cutting `key_proj` reconstruction error by **`29.6%` vs. `NVFP4 g16`** and **`22.3%` vs. `32 GB` `INT4 g16`**:
+
+| 4-Bit PLE Scheme (`320M × 160`) | Effective `bpw` | Total PLE Size | `E` Rel-RMSE | **`key_proj(E)` Rel-RMSE** ↓ | **`value_proj(E)` Rel-RMSE** ↓ |
+|---|---:|---:|---:|---:|---:|
+| `NVFP4 E2M1` (`group_size=16`, RTN) | `4.50` | `28.80 GB` (`26.82 GiB`) | `9.53%` | `9.45%` | `9.53%` |
+| Uniform `INT4` symmetric (`group_size=32`, RTN) | `4.50` | `28.80 GB` (`26.82 GiB`) | `9.42%` | `9.37%` | `9.42%` |
+| Uniform `INT4` symmetric (`group_size=16`, RTN) | `5.00` | `32.00 GB` (`29.80 GiB`) | `8.67%` | `8.57%` | `8.68%` |
+| Non-uniform `IQ4_NL` (`group_size=32`, RTN) | `4.50` | `28.80 GB` (`26.82 GiB`) | `8.29%` | `7.43%` | `8.29%` |
+| **`Custom-LUT4 + W_kv-HGPTQ + CD` (`group_size=32`, This Checkpoint)** | **`4.50`** | **`28.80 GB` (`26.82 GiB`)** | **`7.99%`** | **`6.66%`** | **`7.93%`** |
+
+4. **Zero Page-Straddle `4 KiB` Slotting (`45 rows/page`):**
+   - Each token performs `16` random row lookups; with unaligned contiguous rows, `39.8%` of tokens at 8-bit (`160 B/row`) and `29.9%` at 4-bit (`90 B/row`) have at least one head straddling two `4,096 B` OS/NVMe pages. At `90 B/row` (`80 B` packed nibbles + `10 B` FP16 scales), packing `45` complete rows into each `4,096 B` page uses `4,050 / 4,096 B` (**`98.88%` page density**) with **`0.000%` page-boundary straddles**.
+
 ## Shard Layout & Memory Tiering (`93.418 GiB` total)
 
 | Component | Shards | Size | Format | Recommended Placement (`1x / 2x RTX 3090`) |
