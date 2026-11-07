@@ -1407,14 +1407,17 @@ def _quantize_decoder_layer_streaming(
     layer_tensors: dict[str, torch.Tensor] = {}
 
     # Pack all calibration sequences into a single contiguous device tensor H_all [N_tot, hc_dim]
-    # so B.1, B.2, B.3, C.1, C.2, and C.3 run in HBM3e VRAM with zero CPU-GPU syncs.
+    # slice-by-slice while freeing per-sequence buffers so 999x4096 never doubles H_all VRAM.
     seq_lens = [h.shape[1] for h in h_calib]
-    H_all = torch.cat([h.squeeze(0).to(device) for h in h_calib], dim=0)
-    if keep_calib_on_device:
-        # Release old per-sequence references while H_all owns the buffer during this layer
-        for i in range(n_seqs):
+    n_tot = sum(seq_lens)
+    sample_h = h_calib[0].squeeze(0)
+    H_all = torch.empty((n_tot, *sample_h.shape[1:]), dtype=sample_h.dtype, device=device)
+    cur_off = 0
+    for i, slen in enumerate(seq_lens):
+        H_all[cur_off : cur_off + slen].copy_(h_calib[i].squeeze(0), non_blocking=True)
+        if keep_calib_on_device:
             h_calib[i] = torch.empty(0, device=device, dtype=H_all.dtype)
-    n_tot = H_all.shape[0]
+        cur_off += slen
     has_hc = hasattr(layer, "attn_hyper_connection")
     hc_count = layer.attn_hyper_connection.hc_count if has_hc else 1
     tok_step = 65536

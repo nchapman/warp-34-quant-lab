@@ -126,13 +126,6 @@ MODELS: dict[str, dict[str, Any]] = {
         "mask_token_id": 248077,
         "vision_tower": True,
         "mtp_num_hidden_layers": 1,
-        "quant_recipe": {
-            "calib": "data/calib-cascade-qwenfinals.jsonl",
-            "num_samples": 512,
-            "max_seq_length": 2048,
-            "group_size": 64,
-            "hadamard_block_size": 64,
-        },
         "quant_repo": "nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ",
     },
     "flash-next": {
@@ -154,12 +147,8 @@ MODELS: dict[str, dict[str, Any]] = {
         "vision_tower": True,
         "mtp_num_hidden_layers": 1,
         "quant_recipe": {
-            "calib": "data/calib-cascade-qwenfinals.jsonl",
-            "num_samples": 512,
-            "max_seq_length": 2048,
-            "group_size": 64,
-            "hadamard_block_size": 64,
             "ple_group_size": 32,
+            "ple_cd_passes": 1,
         },
         "quant_repo": "nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ",
     },
@@ -195,13 +184,6 @@ MODELS: dict[str, dict[str, Any]] = {
         "vocab_size": 248320,
         "mask_token_id": 248077,
         "vision_tower": True,
-        "quant_recipe": {
-            "calib": "data/calib-cascade-qwenfinals.jsonl",
-            "num_samples": 512,
-            "max_seq_length": 2048,
-            "group_size": 64,
-            "hadamard_block_size": 64,
-        },
         "quant_repo": "nchapman/Ornith-1.5-35B-A3B-W4A16-HGPTQ",
     },
     "9b-mimo": {
@@ -350,13 +332,6 @@ MODELS: dict[str, dict[str, Any]] = {
         "mask_token_id": 248077,
         "vision_tower": True,
         "mtp_num_hidden_layers": 1,
-        "quant_recipe": {
-            "calib": "data/calib-cascade-qwenfinals.jsonl",
-            "num_samples": 512,
-            "max_seq_length": 2048,
-            "group_size": 64,
-            "hadamard_block_size": 64,
-        },
         "quant_repo": "nchapman/Huihui-Qwen3.6-35B-A3B-abliterated-W4A16-HGPTQ",
     },
 }
