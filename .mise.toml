@@ -25,6 +25,10 @@ run = "uv sync --prerelease=allow"
 description = "Build and install GPU fast-path GDN kernels (causal-conv1d + flash-linear-attention)"
 run = "bash scripts/install_gpu_kernels.sh"
 
+[tasks."pod-prep"]
+description = "Prepare a remote RunPod GPU pod (pass <ssh_target> [remote_dir] after `--`)"
+run = "bash scripts/pod_prep.sh"
+
 [tasks.fmt]
 description = "Format Python code with ruff"
 run = "uv run --no-sync ruff format src tests"

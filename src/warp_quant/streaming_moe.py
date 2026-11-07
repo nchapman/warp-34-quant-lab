@@ -2325,30 +2325,48 @@ def run_quantize_qwen4_exp(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     vis_raw = _load_top_level_module_tensors(base_dir, shard_map, "model.visual.")
     if vis_raw:
-        can_reuse_vis = (
-            not is_qwen35_moe
-            and reuse_ple_vision_dir is not None
-            and (reuse_ple_vision_dir / "model-vision.safetensors").exists()
+        reused_qwen35_vis: dict[str, torch.Tensor] = {}
+        if is_qwen35_moe and reuse_ple_vision_dir is not None and reuse_ple_vision_dir.exists():
+            reuse_vis_smap, _ = _load_shard_map(reuse_ple_vision_dir)
+            reused_qwen35_vis = _load_top_level_module_tensors(
+                reuse_ple_vision_dir, reuse_vis_smap, "model.visual."
+            )
+        can_reuse_vis = reuse_ple_vision_dir is not None and (
+            (not is_qwen35_moe and (reuse_ple_vision_dir / "model-vision.safetensors").exists())
+            or (
+                is_qwen35_moe
+                and bool(reused_qwen35_vis)
+                and (not args.quantize_vision or any(k.endswith(".weight_packed") for k in reused_qwen35_vis))
+            )
         )
         if can_reuse_vis:
-            import shutil
-
-            vis_shard_name = "model-vision.safetensors"
-            src_vis = reuse_ple_vision_dir / vis_shard_name
-            dst_vis = output_dir / vis_shard_name
-            try:
-                os.link(src_vis, dst_vis)
-            except OSError:
-                shutil.copy2(src_vis, dst_vis)
-            with safe_open(str(dst_vis), framework="pt", device="cpu") as sf:
-                for tk in sf.keys():
-                    tv = sf.get_tensor(tk)
-                    new_weight_map[tk] = vis_shard_name
-                    total_bytes += tv.numel() * tv.element_size()
+            if is_qwen35_moe:
+                for tk, tv in reused_qwen35_vis.items():
+                    qwen35_shard1_tensors[tk] = tv.contiguous()
                     if tk.endswith(".weight_packed"):
                         shard_counts["vision_quantized"] += 1
                     elif tk.endswith(".weight_scale") and tv.ndim == 2 and tv.shape[1] == 1:
                         shard_counts["vision_fc2_channel"] += 1
+                del reused_qwen35_vis
+            else:
+                import shutil
+
+                vis_shard_name = "model-vision.safetensors"
+                src_vis = reuse_ple_vision_dir / vis_shard_name
+                dst_vis = output_dir / vis_shard_name
+                try:
+                    os.link(src_vis, dst_vis)
+                except OSError:
+                    shutil.copy2(src_vis, dst_vis)
+                with safe_open(str(dst_vis), framework="pt", device="cpu") as sf:
+                    for tk in sf.keys():
+                        tv = sf.get_tensor(tk)
+                        new_weight_map[tk] = vis_shard_name
+                        total_bytes += tv.numel() * tv.element_size()
+                        if tk.endswith(".weight_packed"):
+                            shard_counts["vision_quantized"] += 1
+                        elif tk.endswith(".weight_scale") and tv.ndim == 2 and tv.shape[1] == 1:
+                            shard_counts["vision_fc2_channel"] += 1
             log_event("QWEN4_EXP_VISION_REUSED", reuse_dir=str(reuse_ple_vision_dir))
             del vis_raw
         else:
