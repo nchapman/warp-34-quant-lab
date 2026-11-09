@@ -1477,6 +1477,20 @@ def evaluate_vision_fidelity(
     }
 
 
+def _available_cuda_bytes(dev: torch.device) -> int:
+    free_b = int(torch.cuda.mem_get_info(dev)[0])
+    if getattr(torch.cuda.get_device_properties(dev), "is_integrated", 0):
+        try:
+            with open("/proc/meminfo", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        avail_kb = int(line.split()[1])
+                        return max(free_b, avail_kb * 1024)
+        except OSError:
+            pass
+    return free_b
+
+
 @torch.no_grad()
 def _run_pair_low_mem(base: nn.Module, quant: nn.Module, batches):
     """Same exact math as quants.probe.run_pair, but offloads base logits to CPU before running quant."""
@@ -1496,7 +1510,7 @@ def _run_pair_low_mem(base: nn.Module, quant: nn.Module, batches):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             lb_out = base(input_ids=ids, use_cache=False).logits[:, :-1]
             logit_bytes = lb_out.numel() * lb_out.element_size()
-            keep_on_gpu = dev.type == "cuda" and torch.cuda.mem_get_info(dev)[0] > max(
+            keep_on_gpu = dev.type == "cuda" and _available_cuda_bytes(dev) > max(
                 8 * (1024**3), logit_bytes * 3
             )
             lb_buf = lb_out if keep_on_gpu else lb_out.cpu()
