@@ -19,6 +19,7 @@ mise run build-vision-data                           # materialize data/vision-{
 mise run quantize -- --model 35b --output-dir ./out/Qwen3.6-35B-A3B-W4A16-HGPTQ
 mise run probe -- --model 35b --quant ./out/Qwen3.6-35B-A3B-W4A16-HGPTQ --eval-mtp \
   --eval-vision data/vision-probe-v2 --eval-vision-guard data/vision-guard-v2
+uv run --no-sync warp-quant rco --model 9b --work-dir ./out/rco-9b-w2w4 --budgets 0.15 0.25
 ```
 
 ## Conventions

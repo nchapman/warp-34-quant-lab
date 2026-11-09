@@ -1,0 +1,214 @@
+{
+  "probe-v4": {
+    "eval_set": "probe-v4.jsonl",
+    "rows": 378,
+    "tokens": 840187,
+    "ppl_base": 3.5727,
+    "ppl_quant": 2.8093,
+    "ppl_delta_pct": -21.368,
+    "mean_kl": 0.531084,
+    "weighted_kl": 0.378813,
+    "weighted_kl_protocol": "cascade90-ml10-language-macro",
+    "p999_kl": 15.2241,
+    "elapsed_s": 709.28,
+    "domains": {
+      "belebele_arb_Arab": {
+        "tokens": 2146,
+        "mean_kl": 0.791541,
+        "ppl_base": 13.8462,
+        "ppl_quant": 18.0318
+      },
+      "belebele_deu_Latn": {
+        "tokens": 2279,
+        "mean_kl": 0.540366,
+        "ppl_base": 11.848,
+        "ppl_quant": 11.7399
+      },
+      "belebele_fra_Latn": {
+        "tokens": 2152,
+        "mean_kl": 0.568677,
+        "ppl_base": 9.6229,
+        "ppl_quant": 10.0618
+      },
+      "belebele_hin_Deva": {
+        "tokens": 3232,
+        "mean_kl": 0.731152,
+        "ppl_base": 6.3644,
+        "ppl_quant": 9.7609
+      },
+      "belebele_ita_Latn": {
+        "tokens": 2341,
+        "mean_kl": 0.484248,
+        "ppl_base": 10.2036,
+        "ppl_quant": 10.1555
+      },
+      "belebele_jpn_Jpan": {
+        "tokens": 1930,
+        "mean_kl": 0.773794,
+        "ppl_base": 14.6478,
+        "ppl_quant": 20.1335
+      },
+      "belebele_rus_Cyrl": {
+        "tokens": 2319,
+        "mean_kl": 0.517014,
+        "ppl_base": 10.3355,
+        "ppl_quant": 10.3483
+      },
+      "belebele_spa_Latn": {
+        "tokens": 2305,
+        "mean_kl": 0.456684,
+        "ppl_base": 11.0468,
+        "ppl_quant": 10.8823
+      },
+      "belebele_zho_Hans": {
+        "tokens": 1757,
+        "mean_kl": 0.602562,
+        "ppl_base": 19.968,
+        "ppl_quant": 17.8469
+      },
+      "chat": {
+        "tokens": 218113,
+        "mean_kl": 0.305837,
+        "ppl_base": 2.8393,
+        "ppl_quant": 3.4533
+      },
+      "conversational_agent": {
+        "tokens": 73096,
+        "mean_kl": 2.249729,
+        "ppl_base": 31.9931,
+        "ppl_quant": 2.3325
+      },
+      "instruction_following": {
+        "tokens": 39769,
+        "mean_kl": 0.254944,
+        "ppl_base": 3.1421,
+        "ppl_quant": 3.3877
+      },
+      "math": {
+        "tokens": 302893,
+        "mean_kl": 0.151688,
+        "ppl_base": 1.872,
+        "ppl_quant": 2.0572
+      },
+      "science": {
+        "tokens": 65124,
+        "mean_kl": 0.232165,
+        "ppl_base": 2.8473,
+        "ppl_quant": 3.0715
+      },
+      "swe": {
+        "tokens": 65520,
+        "mean_kl": 1.163347,
+        "ppl_base": 6.561,
+        "ppl_quant": 4.241
+      },
+      "terminal_agent": {
+        "tokens": 55211,
+        "mean_kl": 0.999365,
+        "ppl_base": 7.7562,
+        "ppl_quant": 2.4524
+      }
+    }
+  },
+  "probe-guard": {
+    "eval_set": "probe-guard.jsonl",
+    "rows": 76,
+    "tokens": 19534,
+    "ppl_base": 10.5641,
+    "ppl_quant": 11.3191,
+    "ppl_delta_pct": 7.147,
+    "mean_kl": 0.473739,
+    "weighted_kl": 0.609145,
+    "weighted_kl_protocol": "cascade90-ml10-language-macro",
+    "p999_kl": 7.5079,
+    "elapsed_s": 22.27,
+    "domains": {
+      "belebele_arb_Arab": {
+        "tokens": 820,
+        "mean_kl": 0.775009,
+        "ppl_base": 17.7561,
+        "ppl_quant": 23.1226
+      },
+      "belebele_deu_Latn": {
+        "tokens": 897,
+        "mean_kl": 0.58954,
+        "ppl_base": 10.7206,
+        "ppl_quant": 11.2035
+      },
+      "belebele_fra_Latn": {
+        "tokens": 985,
+        "mean_kl": 0.615371,
+        "ppl_base": 9.0913,
+        "ppl_quant": 11.0883
+      },
+      "belebele_hin_Deva": {
+        "tokens": 1514,
+        "mean_kl": 0.684836,
+        "ppl_base": 7.0055,
+        "ppl_quant": 9.52
+      },
+      "belebele_ita_Latn": {
+        "tokens": 813,
+        "mean_kl": 0.450759,
+        "ppl_base": 10.4714,
+        "ppl_quant": 10.3407
+      },
+      "belebele_jpn_Jpan": {
+        "tokens": 717,
+        "mean_kl": 0.851993,
+        "ppl_base": 9.9397,
+        "ppl_quant": 15.3565
+      },
+      "belebele_rus_Cyrl": {
+        "tokens": 967,
+        "mean_kl": 0.552479,
+        "ppl_base": 10.6323,
+        "ppl_quant": 11.0876
+      },
+      "belebele_spa_Latn": {
+        "tokens": 788,
+        "mean_kl": 0.422913,
+        "ppl_base": 10.8956,
+        "ppl_quant": 10.1128
+      },
+      "belebele_zho_Hans": {
+        "tokens": 671,
+        "mean_kl": 0.539404,
+        "ppl_base": 26.5064,
+        "ppl_quant": 18.7365
+      },
+      "no_robots": {
+        "tokens": 11362,
+        "mean_kl": 0.373167,
+        "ppl_base": 10.3195,
+        "ppl_quant": 10.6721
+      }
+    }
+  },
+  "mtp_fidelity": {
+    "isolated": {
+      "rows": 32,
+      "tokens": 11583,
+      "mean_kl": 0.01282958365547992,
+      "median_kl": 0.004490421153604984,
+      "p99_kl": 0.10186588406562809,
+      "max_kl": 0.27570652961730957,
+      "mean_tv": 0.04274802550641641,
+      "top1_agreement": 0.9507036173702841,
+      "reference_nll": 2.027555473437635,
+      "candidate_nll": 2.03939330074584
+    },
+    "e2e": {
+      "rows": 32,
+      "tokens": 11583,
+      "mean_kl": 0.4993829878861451,
+      "median_kl": 0.17963016033172607,
+      "p99_kl": 5.065033473968506,
+      "max_kl": 13.706770896911621,
+      "mean_tv": 0.24712768995906714,
+      "top1_agreement": 0.7389277389277389,
+      "reference_nll": 2.027555473437635,
+      "candidate_nll": 2.0795547470860787
+    }
+  }
+}

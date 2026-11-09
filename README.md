@@ -99,6 +99,17 @@ mise run probe -- \
   --eval-vision data/vision-probe-v2 \
   --eval-vision-guard data/vision-guard-v2 \
   --output-json ./out/probe_summary.json
+
+# Sub-3-bit & 4-bit H-RCO (H64 + Cholesky GPTQ + Gauss-Seidel H-CD + E2E Scale/Norm KL QAT + Riemannian RCO)
+uv run --no-sync warp-quant rco \
+  --model 9b \
+  --work-dir ./out/rco-9b-w2w4 \
+  --budgets 0.15 0.25 \
+  --calib-seq-len 1024 \
+  --steps 80 \
+  --gumbel-samples 2 \
+  --lr 0.25 \
+  --assemble all_low 15pct_rco 25pct_rco all_high
 ```
 
 ---
@@ -147,3 +158,12 @@ The Qwen3-VL vision tower has `intermediate_size = 4304` ($4304 = 16 \times 269$
 During streaming MoE quantization and probing (`src/warp_quant/streaming_moe.py`), exact top-$k$ router hits and routing probability mass are accumulated across all $L$ MoE layers and Native MTP (`9,804,460` expert assignments/layer for `flash-next`, `6,979,616` for `35b`) and exported to:
 - `runtime/static_hot_cache_rankings.json` (and root `static_hot_cache_rankings.json`) — maps target layer indices (`"0".."39"` or `"0".."47"`) to global expert IDs ordered hottest-first (`active_ranked_expert_ids`), enabling zero-warmup static hot-expert pinning in VRAM at server startup (`VLLM_WNA16_STATIC_HOT_CACHE_FILE` / `HostExpertStore`).
 - `runtime/expert_routing_profile.json` — full per-layer `ranked_expert_ids`, `active_ranked_expert_ids`, `hit_counts`, `weight_sums`, and `top_k_coverage` (`top_8..top_256`), including `"mtp.0"`.
+
+### 7. Sub-3-Bit & 4-Bit Optimization (`H-CD` + `E2E Scale/Norm KL QAT` + Riemannian `H-RCO`)
+`src/warp_quant/rco/` (`warp-quant rco`) extends `g64-h64` down to `2.00–2.60` bits (`W2`/`W4` mixed precision) and sharpens pure `4.00`-bit `W4A16-HGPTQ` checkpoints without changing the `compressed-tensors` format (`pack_quantized` + `W2A16`/`W4A16` config groups + online $H_{64}$ transforms). Full receipts live in [`results/rco-2b-w2w4/`](results/rco-2b-w2w4/README.md) and [`results/rco-9b-w2w4/`](results/rco-9b-w2w4/README.md):
+- **Gauss–Seidel Hessian Coordinate Descent (`refine_hessian_cd` in `src/warp_quant/rco/options.py`):** Standard GPTQ freezes group scales (`amax / qmax`) before error propagation. Alternating closed-form Hessian-weighted least-squares scale updates $s_g^\star = \sum (R H)_j Q_j / \sum (Q H)_j Q_j$ with exact columnwise Gauss–Seidel integer code updates $\Delta q_j = \operatorname{round}(\dots) - q_j$ reduces layerwise $H$-weighted reconstruction error and cuts 4-bit validation KL by `10.8%` (`0.0415 → 0.0370` on `2B`).
+- **End-to-End Continuous Scale + FP32-Master `RMSNorm`/GDN-Gate KL Tuning (`run_e2e_scale_qat` in `src/warp_quant/rco/scale_qat.py`):** Parameterizes 2-bit `weight_scale` tensors in FP32 as $s = s_0 \cdot \exp(\delta)$ (`train_scales_max_bits=2`, keeping 4-bit `H-CD` scales frozen to avoid BF16 ULP jitter) while maintaining `RMSNorm` and GatedDeltaNet recurrence gates (`in_proj_a`, `in_proj_b`, `A_log`, `dt_bias`) as FP32 master weights with straight-through `bfloat16` rounding. Training against the BF16 teacher's logits cuts pure 2-bit (`2.00b`) `probe-v4` `weighted_kl` by **`46.5%`** on `2B` (`1.1794 → 0.6313`, PPL `+92.0% → +27.1%`) and cuts pure 4-bit (`4.00b`) `probe-v4` `mean_kl` by **`21.0%`** vs. shipped `2B W4A16-HGPTQ` (`0.2543 → 0.2010`, `MTP E2E` KL `-28.7%`).
+- **Riemannian Constrained Optimization (`H-RCO`, `src/warp_quant/rco/search.py`):** Solves discrete per-module `[w2_g64, w4_g64]` allocations under exact byte budgets via Gumbel-Softmax + Straight-Through Estimator + exact Newton-bisection KL projection, followed by a post-search scale/norm polish:
+  - **`Qwen3.5-2B` ([receipts](results/rco-2b-w2w4/README.md)):** `25%` (`2.50b`, `449 MiB` text) and `30%` (`2.60b`, `466 MiB` text, **`-33%` text bytes vs. `W4`**) reach **`+7.81%` / `+6.22%` `probe-v4` PPL** (`4.137` / `4.076` vs. `3.837` BF16) and outperform shipped `W4A16-HGPTQ` on long-context `terminal_agent` (`0.6981` vs. `0.7395`) and `swe` (`1.2384` vs. `1.9242`).
+  - **`Qwen3.5-9B` ([receipts](results/rco-9b-w2w4/README.md)):** Sub-3-bit fidelity scales sharply with model size—at `25%` `H-RCO` (`2.50b`, `2,266 MiB` text, **`-35%` text bytes vs. `W4`**), `math` KL drops in half vs. `2B` (`0.2583 → 0.1320`), held-out `probe-guard` perplexity is within **`+3.45%` of BF16** (`10.929` vs. `10.564`), and `MTP E2E` speculative draft agreement reaches **`75.09%`** (`72.17%` even at pure `2.00`-bit `All-W2`).
+
