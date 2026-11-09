@@ -198,6 +198,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     r.add_argument("--vision-calib-dir", default="data/vision-calib-v2")
     r.add_argument(
+        "--scale-qat",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run end-to-end continuous weight_scale and FP32-master RMSNorm KL tuning before/after RCO search",
+    )
+    r.add_argument(
+        "--scale-qat-samples",
+        type=int,
+        default=512,
+        help="Number of non-overlapping calibration sequences for E2E Scale+Norm KL tuning",
+    )
+    r.add_argument(
         "--assemble",
         nargs="*",
         default=["all"],

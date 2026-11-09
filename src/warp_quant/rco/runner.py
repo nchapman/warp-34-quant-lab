@@ -30,6 +30,7 @@ from warp_quant.rco.bank import (
     load_rco_bank,
 )
 from warp_quant.rco.hidden_teacher import capture_teacher_hidden_states, hidden_kl
+from warp_quant.rco.scale_qat import run_e2e_scale_qat
 from warp_quant.rco.search import SearchModel, build_sensitivity_logits
 
 
@@ -276,6 +277,25 @@ def run_rco_cli(args: argparse.Namespace) -> None:
         seed=args.seed,
     )
 
+    qat_train_rows: list[torch.Tensor] = []
+    if getattr(args, "scale_qat", False):
+        max_qat = int(getattr(args, "scale_qat_samples", 512))
+        if max_qat <= 0:
+            raise ValueError(f"--scale-qat-samples must be > 0, got {max_qat}")
+        qat_indices = list(range(0, args.calib_samples)) + list(
+            range(args.calib_samples + args.search_samples, len(ds))
+        )
+        for idx in qat_indices:
+            if len(qat_train_rows) >= max_qat:
+                break
+            ids = torch.tensor(ds[idx]["input_ids"][: args.search_seq_len], dtype=torch.long)
+            if ids.numel() >= 64:
+                qat_train_rows.append(ids)
+        if not qat_train_rows:
+            raise ValueError(
+                f"No non-search calibration rows of length >= 64 available for --scale-qat (dataset size {len(ds)})"
+            )
+
     cls = model_class(str(base_dir))
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
@@ -369,19 +389,85 @@ def run_rco_cli(args: argparse.Namespace) -> None:
             propagate_option_idx=-1,
             rotate_weights_in_place=True,
         )
-        # Reload fresh base weights for search if needed (SearchModel replaces weights via parametrization anyway)
+        # Reload fresh base weights for subsequent stages
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        model = cls.from_pretrained(str(base_dir), dtype=torch.bfloat16, device_map={"": device})
+        model.eval()
 
-    allocations = run_rco_search_on_bank(
-        model,
-        bank_dir,
-        search_rows,
-        args.budgets,
-        steps=args.steps,
-        gumbel_samples=args.gumbel_samples,
-        lr=args.lr,
-        seed=args.seed,
-        teacher_states=teacher_states,
-    )
+    active_bank_dir = bank_dir
+    if getattr(args, "scale_qat", False):
+        import shutil
+
+        manifest, candidates = load_rco_bank(bank_dir)
+        low_state_file = work_dir / "all_low_scale_qat_state.pt"
+        if low_state_file.is_file():
+            low_qat = torch.load(low_state_file, map_location="cpu", weights_only=True)
+        else:
+            teacher_model = cls.from_pretrained(str(base_dir), dtype=torch.bfloat16, device_map={"": device})
+            low_qat = run_e2e_scale_qat(
+                model,
+                teacher_model,
+                manifest,
+                candidates,
+                [0] * len(manifest["groups"]),
+                train_rows=qat_train_rows,
+                val_rows=search_rows[:32],
+                val_teacher_states=teacher_states[:32],
+                num_epochs=1,
+                batch_size=4,
+                lr=1.2e-4,
+                norm_lr=1.5e-4,
+                anchor_wd=0.03,
+                train_scales_max_bits=2,
+                train_norms=True,
+                train_gdn_gates=True,
+                seed=args.seed,
+            )
+            del teacher_model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            torch.save(low_qat, low_state_file)
+
+        active_bank_dir = work_dir / "bank_opt"
+        if not (active_bank_dir / "manifest.json").is_file():
+            if active_bank_dir.exists():
+                shutil.rmtree(active_bank_dir)
+            shutil.copytree(bank_dir, active_bank_dir)
+            for stale in [
+                active_bank_dir / "allocations.json",
+                *active_bank_dir.glob("history_*.json"),
+            ]:
+                if stale.is_file():
+                    stale.unlink()
+            for layer_pt in sorted((active_bank_dir / "layers").glob("layer_*.pt")):
+                l_data = torch.load(layer_pt, map_location="cpu", weights_only=True)
+                for m_name, cand_list in l_data.items():
+                    if m_name in low_qat["scale_overrides"]:
+                        cand_list[0]["scales"] = low_qat["scale_overrides"][m_name].to(torch.bfloat16).cpu()
+                torch.save(l_data, layer_pt)
+
+        with torch.no_grad():
+            for full_k, new_w in low_qat["bf16_overrides"].items():
+                if full_k.endswith(".weight"):
+                    mod = model.get_submodule(full_k[:-7])
+                    mod.weight.copy_(new_w.to(device=mod.weight.device, dtype=mod.weight.dtype))
+
+    if (active_bank_dir / "allocations.json").is_file():
+        allocations = json.loads((active_bank_dir / "allocations.json").read_text())
+    else:
+        allocations = run_rco_search_on_bank(
+            model,
+            active_bank_dir,
+            search_rows,
+            args.budgets,
+            steps=args.steps,
+            gumbel_samples=args.gumbel_samples,
+            lr=args.lr,
+            seed=args.seed,
+            teacher_states=teacher_states,
+        )
 
     del model
     if torch.cuda.is_available():
@@ -389,6 +475,7 @@ def run_rco_cli(args: argparse.Namespace) -> None:
 
     if args.assemble:
         to_assemble = args.assemble if "all" not in args.assemble else list(allocations.keys())
+        manifest, opt_candidates = load_rco_bank(active_bank_dir)
         for name in to_assemble:
             if name not in allocations:
                 raise ValueError(f"Unknown allocation '{name}'; available: {sorted(allocations)}")
@@ -396,16 +483,70 @@ def run_rco_cli(args: argparse.Namespace) -> None:
             if out_ckpt.exists():
                 print(f"[skip] {out_ckpt} already exists")
                 continue
+
+            scale_overrides = None
+            bf16_overrides = None
+            if getattr(args, "scale_qat", False) and not name.endswith("_sensitivity"):
+                state_file = work_dir / f"{name}_scale_qat_state.pt"
+                if state_file.is_file():
+                    st = torch.load(state_file, map_location="cpu", weights_only=True)
+                else:
+                    student_m = cls.from_pretrained(
+                        str(base_dir), dtype=torch.bfloat16, device_map={"": device}
+                    )
+                    is_all_high = name == "all_high"
+                    if not is_all_high and (work_dir / "all_low_scale_qat_state.pt").is_file():
+                        low_st = torch.load(
+                            work_dir / "all_low_scale_qat_state.pt", map_location="cpu", weights_only=True
+                        )
+                        with torch.no_grad():
+                            for full_k, new_w in low_st["bf16_overrides"].items():
+                                if full_k.endswith(".weight"):
+                                    mod = student_m.get_submodule(full_k[:-7])
+                                    mod.weight.copy_(
+                                        new_w.to(device=mod.weight.device, dtype=mod.weight.dtype)
+                                    )
+                    teacher_m = cls.from_pretrained(
+                        str(base_dir), dtype=torch.bfloat16, device_map={"": device}
+                    )
+                    st = run_e2e_scale_qat(
+                        student_m,
+                        teacher_m,
+                        manifest,
+                        opt_candidates,
+                        allocations[name]["choices"],
+                        train_rows=qat_train_rows[: (512 if is_all_high else 384)],
+                        val_rows=search_rows[:32],
+                        val_teacher_states=teacher_states[:32],
+                        num_epochs=1,
+                        batch_size=4,
+                        lr=0.0 if is_all_high else 8e-5,
+                        norm_lr=1.2e-4,
+                        anchor_wd=0.04,
+                        train_scales_max_bits=2,
+                        train_norms=True,
+                        train_gdn_gates=not is_all_high,
+                        seed=args.seed,
+                    )
+                    del student_m, teacher_m
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    torch.save(st, state_file)
+                scale_overrides = st["scale_overrides"]
+                bf16_overrides = st["bf16_overrides"]
+
             log_event("RCO_ASSEMBLE", allocation=name, out=str(out_ckpt))
             assemble_rco_checkpoint(
                 base_dir=base_dir,
-                bank_dir=bank_dir,
+                bank_dir=active_bank_dir,
                 choices=allocations[name]["choices"],
                 output_dir=out_ckpt,
                 model_key=args.model,
                 allocation_name=name,
                 mtp_packed=mtp_packed,
                 vision_packed=vision_packed,
+                scale_overrides=scale_overrides,
+                bf16_overrides=bf16_overrides,
                 component_group_size=64,
             )
             print(f"[ok] assembled {out_ckpt}")
