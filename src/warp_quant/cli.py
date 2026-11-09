@@ -151,6 +151,59 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dump-rows-dir", default=None)
     p.add_argument("--output-json", default=None)
 
+    r = sub.add_parser(
+        "rco",
+        help="Build a multi-option HGPTQ candidate bank, run Riemannian Constrained Optimization (H-RCO), and assemble checkpoints",
+    )
+    r.add_argument("--model", default="2b", help="Model key from `warp-quant list-models` or HF repo/path")
+    r.add_argument(
+        "--work-dir",
+        required=True,
+        help="Working directory for bank, teacher cache, and assembled checkpoints",
+    )
+    r.add_argument(
+        "--options",
+        nargs="+",
+        default=["w2_g64", "w4_g64"],
+        help="Ordered QuantOption names (e.g. w2_g64 w4_g64 or w2_g128 w4_g64 w8_g64)",
+    )
+    r.add_argument(
+        "--budgets",
+        nargs="+",
+        type=float,
+        default=[0.15, 0.25, 0.30],
+        help="Upgrade budget fractions in (0, 1) between all_low and all_high",
+    )
+    r.add_argument("--hadamard-block-size", type=int, default=64)
+    r.add_argument("--dampening-frac", type=float, default=0.01)
+    r.add_argument("--calib-samples", type=int, default=128)
+    r.add_argument("--search-samples", type=int, default=64)
+    r.add_argument("--calib-seq-len", type=int, default=2048)
+    r.add_argument("--search-seq-len", type=int, default=1024)
+    r.add_argument("--steps", type=int, default=120)
+    r.add_argument("--gumbel-samples", type=int, default=4)
+    r.add_argument("--lr", type=float, default=0.1)
+    r.add_argument("--seed", type=int, default=42)
+    r.add_argument(
+        "--quantize-mtp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Calibrate and include W4A16-HGPTQ Native MTP in assembled checkpoints",
+    )
+    r.add_argument(
+        "--quantize-vision",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Calibrate and include W4A16-HGPTQ Vision in assembled checkpoints",
+    )
+    r.add_argument("--vision-calib-dir", default="data/vision-calib-v2")
+    r.add_argument(
+        "--assemble",
+        nargs="*",
+        default=["all"],
+        help="Allocation names to assemble into checkpoints (or 'all' for all solved allocations)",
+    )
+
     return parser
 
 
@@ -166,6 +219,10 @@ def main(argv: list[str] | None = None) -> None:
             run_quantize(args)
         elif args.cmd == "probe":
             run_probe(args)
+        elif args.cmd == "rco":
+            from warp_quant.rco.runner import run_rco_cli
+
+            run_rco_cli(args)
     except BaseException as exc:
         run_fail(error=str(exc))
         raise

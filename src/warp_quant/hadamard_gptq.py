@@ -1494,15 +1494,31 @@ def _run_pair_low_mem(base: nn.Module, quant: nn.Module, batches):
     for i, (domain, ids) in enumerate(batches):
         ids = ids.to(dev)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            lb_cpu = base(input_ids=ids, use_cache=False).logits[:, :-1].cpu()
-            lq = quant(input_ids=ids, use_cache=False).logits[:, :-1]
+            lb_out = base(input_ids=ids, use_cache=False).logits[:, :-1]
+            logit_bytes = lb_out.numel() * lb_out.element_size()
+            keep_on_gpu = dev.type == "cuda" and torch.cuda.mem_get_info(dev)[0] > max(
+                8 * (1024**3), logit_bytes * 3
+            )
+            lb_buf = lb_out if keep_on_gpu else lb_out.cpu()
+            del lb_out
+            try:
+                lq = quant(input_ids=ids, use_cache=False).logits[:, :-1]
+            except torch.cuda.OutOfMemoryError:
+                if keep_on_gpu:
+                    lb_buf = lb_buf.cpu()
+                    keep_on_gpu = False
+                    torch.cuda.empty_cache()
+                    lq = quant(input_ids=ids, use_cache=False).logits[:, :-1]
+                else:
+                    raise
         targets = ids[:, 1:]
         d = dom[domain]
         row_nll = {"base": 0.0, "quant": 0.0}
         row_kl_sum, row_kl_n = 0.0, 0
         for s in range(0, lq.shape[1], CHUNK):
             sl = slice(s, min(s + CHUNK, lq.shape[1]))
-            lbs = F.log_softmax(lb_cpu[:, sl].to(dev, non_blocking=True).float(), dim=-1)
+            lb_sl = lb_buf[:, sl] if keep_on_gpu else lb_buf[:, sl].to(dev, non_blocking=True)
+            lbs = F.log_softmax(lb_sl.float(), dim=-1)
             lqs = F.log_softmax(lq[:, sl].float(), dim=-1)
             tgt_sl = targets[:, sl]
             for name, ls in (("base", lbs), ("quant", lqs)):
@@ -1520,7 +1536,7 @@ def _run_pair_low_mem(base: nn.Module, quant: nn.Module, batches):
             row_kl_sum += kl.sum().item()
             row_kl_n += n_tok
             del lbs, lqs, kl
-        del lb_cpu, lq
+        del lb_buf, lq
         row_dump.append(
             {
                 "row": i,
