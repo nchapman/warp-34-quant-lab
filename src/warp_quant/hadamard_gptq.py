@@ -197,24 +197,27 @@ def _gptq_pack_tensor(
     group_size: int | None,
     actorder: str | None,
     dampening_frac: float,
+    *,
+    cd_passes: int = 2,
 ) -> dict[str, torch.Tensor]:
-    """Quantize a 2D BF16 weight tensor using Cholesky GPTQ with its accumulated Hessian and pack to INT4."""
-    from compressed_tensors.compressors import PackedQuantizationCompressor
-    from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
+    """Quantize a 2D BF16 weight tensor using MSE-init Cholesky GPTQ + H-CD and pack losslessly to INT4."""
+    from compressed_tensors.quantization import QuantizationArgs
     from llmcompressor.modifiers.gptq.gptq_quantize import quantize_weight
+
+    from warp_quant.rco.options import find_mse_scale, pack_candidate, refine_hessian_cd
 
     w_f32 = weight.detach().float()
     n_out, k_in = w_f32.shape
     if strategy == "group":
         if group_size is None or k_in % group_size != 0:
             raise ValueError(f"Invalid group_size={group_size} for in_features={k_in}")
-        grouped = w_f32.view(n_out, k_in // group_size, group_size)
-        scale = (grouped.abs().amax(dim=-1) / 7.0).clamp(min=1e-7).to(torch.bfloat16)
+        eff_gs = group_size
     elif strategy == "channel":
-        scale = (w_f32.abs().amax(dim=-1, keepdim=True) / 7.0).clamp(min=1e-7).to(torch.bfloat16)
+        eff_gs = k_in
     else:
         raise ValueError(f"Unsupported strategy: {strategy}")
 
+    scale = find_mse_scale(w_f32, 4, eff_gs)
     qargs = QuantizationArgs(
         num_bits=4,
         type="int",
@@ -223,13 +226,12 @@ def _gptq_pack_tensor(
         group_size=group_size if strategy == "group" else None,
         actorder=actorder if strategy == "group" else None,
     )
-    scheme = QuantizationScheme(targets=["Linear"], weights=qargs)
     zp = torch.zeros_like(scale, dtype=torch.int32)
-    norm_h = (hessian / num_samples.clamp(min=1).to(hessian.device)).to(torch.float32)
+    norm_h = (hessian / num_samples.clamp(min=1).to(hessian.device)).to(torch.float32).contiguous()
 
     q_w_batch, _losses, used_rtn = quantize_weight(
-        weights=w_f32.unsqueeze(0),
-        hessians=norm_h.unsqueeze(0),
+        weights=w_f32.clone().unsqueeze(0),
+        hessians=norm_h.clone().unsqueeze(0),
         scale=scale.unsqueeze(0),
         zero_point=zp.unsqueeze(0),
         global_scale=None,
@@ -239,12 +241,21 @@ def _gptq_pack_tensor(
     )
     if used_rtn[0].item():
         raise RuntimeError("GPTQ fell back to RTN during component quantization")
-    q_w = q_w_batch[0].to(weight.dtype)
-    compressed = PackedQuantizationCompressor.compress(
-        {"weight": q_w, "weight_scale": scale},
-        scheme,
-    )
-    return {k: v.contiguous().cpu() for k, v in compressed.items()}
+    q_w = q_w_batch[0]
+    scale_exp = scale.float().repeat_interleave(eff_gs, dim=1)
+    codes = torch.clamp(torch.round(q_w.float() / scale_exp), -8, 7).to(torch.int8)
+    if cd_passes > 0:
+        codes, scale = refine_hessian_cd(
+            w_f32,
+            norm_h,
+            codes,
+            scale,
+            4,
+            eff_gs,
+            passes=cd_passes,
+            dampening_frac=dampening_frac,
+        )
+    return {k: v.contiguous().cpu() for k, v in pack_candidate(codes, scale, 4).items()}
 
 
 @torch.no_grad()
@@ -856,7 +867,94 @@ def run_quantize(args: argparse.Namespace) -> None:
             actorder=actorder,
         ),
     )
-    gptq_mod = GPTQModifier(
+
+    class _HCDGPTQModifier(GPTQModifier):
+        """GPTQModifier subclass adding MSE scale initialization + 2-pass Gauss-Seidel H-CD."""
+
+        def compress_module_list(self, module_list):
+            import contextlib
+
+            from compressed_tensors.offload import disable_offloading
+            from compressed_tensors.utils import getattr_chain
+            from llmcompressor.modifiers.gptq.base import (
+                CompressionLogger,
+                assign_batches,
+                prepare_batch,
+                update_batch_qparams,
+            )
+            from llmcompressor.modifiers.gptq.gptq_quantize import quantize_weight
+
+            from warp_quant.rco.options import decode_candidate, find_mse_scale, refine_hessian_cd_3d
+
+            for batch in assign_batches(module_list, self.batched_quantization, self.block_size):
+                quant_args = getattr_chain(batch[0], "quantization_scheme.weights")
+                batch_qparams = [module.weight_observer.get_qparams() for module in batch]
+                names = [self._module_names[module] for module in batch]
+
+                with (
+                    torch.no_grad(),
+                    disable_offloading(),
+                    contextlib.ExitStack() as ctx_stack,
+                ):
+                    weights, hessians, scales, zero_points, global_scales = prepare_batch(
+                        batch, batch_qparams, self._hessians, self._num_samples
+                    )
+                    bsz, n_out_b, k_in_b = weights.shape
+                    eff_gs = int(quant_args.group_size) if quant_args.group_size else k_in_b
+                    num_bits = int(quant_args.num_bits)
+                    if quant_args.symmetric and global_scales is None:
+                        mse_s = find_mse_scale(
+                            weights.float().reshape(bsz * n_out_b, k_in_b), num_bits, eff_gs
+                        ).view_as(scales)
+                        scales = mse_s.to(dtype=scales.dtype)
+
+                    orig_weights = weights.float().clone()
+                    orig_hessians = hessians.float().clone()
+                    comp_loggers = [ctx_stack.enter_context(CompressionLogger(m)) for m in batch]
+                    quantized, losses, used_rtn_fallback = quantize_weight(
+                        weights=weights,
+                        hessians=hessians,
+                        scale=scales,
+                        zero_point=zero_points,
+                        global_scale=global_scales,
+                        quant_args=quant_args,
+                        blocksize=self.block_size,
+                        percdamp=self.dampening_frac,
+                    )
+                    if quant_args.symmetric and global_scales is None and not used_rtn_fallback.any().item():
+                        qmin = -(1 << (num_bits - 1))
+                        qmax = (1 << (num_bits - 1)) - 1
+                        s_exp = scales.float().repeat_interleave(eff_gs, dim=-1)
+                        codes_3d = torch.clamp(torch.round(quantized.float() / s_exp), qmin, qmax).to(
+                            torch.int8
+                        )
+                        codes_3d, new_scales = refine_hessian_cd_3d(
+                            orig_weights,
+                            orig_hessians,
+                            codes_3d,
+                            scales,
+                            num_bits,
+                            eff_gs,
+                            passes=2,
+                            dampening_frac=self.dampening_frac,
+                        )
+                        scales = new_scales.to(dtype=scales.dtype)
+                        for b_idx in range(bsz):
+                            quantized[b_idx] = decode_candidate(
+                                codes_3d[b_idx], new_scales[b_idx], eff_gs, dtype=quantized.dtype
+                            )
+                    del orig_weights, orig_hessians
+
+                    for index, comp_logger in enumerate(comp_loggers):
+                        comp_logger.set_results(name="GPTQ", loss=losses[index].item())
+                        if used_rtn_fallback[index].item():
+                            self._rtn_fallback_module_names.append(names[index])
+
+                    ctx_stack.close()
+                    update_batch_qparams(batch, quantized, scales, zero_points, global_scales, quant_args)
+                    self._num_compressed_modules += len(batch)
+
+    gptq_mod = _HCDGPTQModifier(
         config_groups={"group_0": scheme},
         actorder=actorder,
         ignore=list(BASE_IGNORE),
@@ -1147,6 +1245,8 @@ def load_quant_model_with_transforms(path: str | Path, device: str = "cuda:0") -
         if hasattr(model, "hf_quantizer") and hasattr(model.hf_quantizer, "compressor"):
             model.hf_quantizer.compressor.decompress_model(model)
 
+    _apply_rco_code_offsets(model, path)
+
     tcfg_dict = raw_cfg.get("quantization_config", {}).get("transform_config")
     if tcfg_dict and tcfg_dict.get("config_groups"):
         full_tcfg = TransformConfig.model_validate(tcfg_dict)
@@ -1176,6 +1276,82 @@ def load_quant_model_with_transforms(path: str | Path, device: str = "cuda:0") -
                             min(had_dim, exp.intermediate_dim & -exp.intermediate_dim),
                         )
     return model
+
+
+def _apply_rco_code_offsets(model: nn.Module, path: Path) -> None:
+    """Apply half-integer code offsets recorded in rco_manifest.json after CT weight decompression."""
+    rco_manifest_path = path / "rco_manifest.json"
+    if not rco_manifest_path.is_file():
+        return
+    rco_meta = json.loads(rco_manifest_path.read_text())
+    if not isinstance(rco_meta, dict):
+        raise ValueError(f"Expected dict in {rco_manifest_path}")
+    code_offsets = rco_meta.get("code_offsets")
+    if not code_offsets:
+        return
+    if not isinstance(code_offsets, dict):
+        raise ValueError(f"Expected dict for code_offsets in {rco_manifest_path}")
+
+    shard_map, _ = _load_shard_map(path)
+    shard_by_name = {sp.name: sp for sp in sorted(path.glob("*.safetensors"))}
+
+    for prefix, spec in code_offsets.items():
+        if not isinstance(spec, dict) or "code_offset" not in spec or "group_size" not in spec:
+            raise ValueError(f"Malformed code_offset spec for '{prefix}' in {rco_manifest_path}")
+        try:
+            c_off = float(spec["code_offset"])
+            gs = int(spec["group_size"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Non-numeric code_offset spec for '{prefix}' in {rco_manifest_path}") from exc
+        if not math.isfinite(c_off) or not (-1.0 <= c_off <= 1.0):
+            raise ValueError(f"Invalid code_offset={c_off} for '{prefix}' (must be in [-1.0, 1.0])")
+        if gs <= 0 or (gs & (gs - 1)) != 0:
+            raise ValueError(f"Invalid group_size={gs} for '{prefix}' (must be a positive power of 2)")
+        if c_off == 0.0:
+            continue
+
+        try:
+            mod = model.get_submodule(prefix)
+        except AttributeError as exc:
+            raise ValueError(f"Unknown module prefix '{prefix}' in {rco_manifest_path}") from exc
+        weight = getattr(mod, "weight", None)
+        if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
+            raise ValueError(f"Module '{prefix}' does not have a 2D weight tensor")
+        n_out, k_in = weight.shape
+        if k_in % gs != 0:
+            raise ValueError(f"Weight shape {(n_out, k_in)} for '{prefix}' not divisible by group_size={gs}")
+
+        w_scale = getattr(mod, "weight_scale", None)
+        if w_scale is None:
+            scale_key = f"{prefix}.weight_scale"
+            mapped_name = shard_map.get(scale_key)
+            if mapped_name is not None:
+                if mapped_name not in shard_by_name:
+                    raise ValueError(
+                        f"Shard '{mapped_name}' for '{scale_key}' is not a local safetensors file in {path}"
+                    )
+                with safe_open(str(shard_by_name[mapped_name]), framework="pt", device="cpu") as sf:
+                    if scale_key in sf.keys():
+                        w_scale = sf.get_tensor(scale_key)
+            else:
+                for sp in shard_by_name.values():
+                    with safe_open(str(sp), framework="pt", device="cpu") as sf:
+                        if scale_key in sf.keys():
+                            w_scale = sf.get_tensor(scale_key)
+                            break
+        if w_scale is None:
+            raise ValueError(f"Missing '{prefix}.weight_scale' for code_offset fixup in {path}")
+        expected_shape = (n_out, k_in // gs)
+        if tuple(w_scale.shape) != expected_shape:
+            raise ValueError(
+                f"Scale shape {tuple(w_scale.shape)} != expected {expected_shape} for '{prefix}'"
+            )
+
+        s_dev = w_scale.to(device=mod.weight.device, dtype=torch.float32)
+        w_adj = mod.weight.data.float() + (
+            c_off * s_dev.unsqueeze(-1).expand(n_out, k_in // gs, gs).reshape(n_out, k_in)
+        )
+        mod.weight.data.copy_(w_adj.to(mod.weight.dtype))
 
 
 def _build_mtp_module(text_config) -> nn.Module:

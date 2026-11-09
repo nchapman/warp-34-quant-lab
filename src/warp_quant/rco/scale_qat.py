@@ -25,6 +25,7 @@ class _TrainableScaleLinear(nn.Module):
         device: torch.device,
         *,
         trainable: bool = True,
+        code_offset: float = 0.0,
     ) -> None:
         super().__init__()
         n_out, k_in = codes.shape
@@ -32,7 +33,10 @@ class _TrainableScaleLinear(nn.Module):
         self.k_in = k_in
         self.group_size = group_size
         self.trainable = trainable
-        self.register_buffer("codes_bf16", codes.detach().to(device=device, dtype=torch.bfloat16))
+        eff_codes = codes.detach().to(device=device, dtype=torch.float32)
+        if code_offset != 0.0:
+            eff_codes = eff_codes + code_offset
+        self.register_buffer("codes_bf16", eff_codes.to(torch.bfloat16))
         self.register_buffer("init_scales", scales.detach().to(device=device, dtype=torch.float32))
         if trainable:
             self.scales = nn.Parameter(scales.detach().to(device=device, dtype=torch.float32).clone())
@@ -113,6 +117,7 @@ def run_e2e_scale_qat(
                 int(cand["group_size"]),
                 mod.weight.device,
                 trainable=is_trainable,
+                code_offset=float(cand.get("code_offset", 0.0)),
             )
             parametrize.register_parametrization(mod, "weight", ts)
             scale_modules[m_name] = (mod, ts)

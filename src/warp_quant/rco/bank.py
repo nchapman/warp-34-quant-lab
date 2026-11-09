@@ -271,6 +271,7 @@ def build_rco_bank(
                                     "option": opt.name,
                                     "num_bits": opt.num_bits,
                                     "group_size": opt.group_size,
+                                    "code_offset": float(opt.code_offset),
                                     "bytes": int(cand["bytes"]),
                                     "hessian_loss": float(cand["hessian_loss"]),
                                     "gptq_loss": float(cand["gptq_loss"]),
@@ -288,6 +289,7 @@ def build_rco_bank(
                                 prop_cand["scales"].to(device),
                                 int(prop_cand["group_size"]),
                                 dtype=mod.weight.dtype,
+                                code_offset=float(prop_cand.get("code_offset", 0.0)),
                             )
                         )
                         del h_rot, n_smp
@@ -329,6 +331,7 @@ def build_rco_bank(
                 "name": o.name,
                 "num_bits": o.num_bits,
                 "group_size": o.group_size,
+                "code_offset": float(o.code_offset),
                 "mse_scale": o.mse_scale,
                 "actorder": o.actorder,
                 "bpw": o.bpw,

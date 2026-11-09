@@ -205,3 +205,108 @@ def test_refine_hessian_cd_monotonically_decreases_objective() -> None:
     assert float(res_cd["hessian_loss"]) <= float(res_no_cd["hessian_loss"]) + 1e-6
     q_cd = decode_candidate(res_cd["codes"], res_cd["scales"], 64)
     assert q_cd.shape == (64, 64)
+
+
+def test_w2_sym_half_integer_option_beats_asymmetric_int2_on_gaussian() -> None:
+    from warp_quant.rco.options import decode_candidate, quantize_candidate, resolve_option
+
+    torch.manual_seed(19)
+    w = torch.randn(64, 128, dtype=torch.bfloat16)
+    x = torch.randn(256, 128, dtype=torch.float32)
+    h = x.T @ x
+
+    opt_int2 = resolve_option("w2_g64")
+    opt_sym2 = resolve_option("w2_g64_sym")
+    assert opt_sym2.code_offset == 0.5
+
+    res_int2 = quantize_candidate(w, h, 256, opt_int2)
+    res_sym2 = quantize_candidate(w, h, 256, opt_sym2)
+    assert float(res_sym2["hessian_loss"]) < float(res_int2["hessian_loss"])
+
+    dec = decode_candidate(res_sym2["codes"], res_sym2["scales"], 64, code_offset=0.5)
+    assert dec.shape == (64, 128)
+
+
+def test_apply_rco_code_offsets_from_shard_and_validation(tmp_path) -> None:
+    import json
+
+    import pytest
+    import torch.nn as nn
+    from safetensors.torch import save_file
+
+    from warp_quant.hadamard_gptq import _apply_rco_code_offsets
+
+    class _TinyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lin = nn.Linear(64, 16, bias=False, dtype=torch.bfloat16)
+
+    m = _TinyModel()
+    torch.nn.init.zeros_(m.lin.weight)
+    scales = torch.full((16, 1), 0.25, dtype=torch.bfloat16)
+    save_file({"lin.weight_scale": scales}, str(tmp_path / "model-00001-of-00001.safetensors"))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"lin.weight_scale": "model-00001-of-00001.safetensors"}})
+    )
+    (tmp_path / "rco_manifest.json").write_text(
+        json.dumps({"code_offsets": {"lin": {"code_offset": 0.5, "group_size": 64}}})
+    )
+
+    _apply_rco_code_offsets(m, tmp_path)
+    assert torch.allclose(m.lin.weight, torch.full_like(m.lin.weight, 0.125))
+
+    # Reject out-of-range / NaN code_offset or invalid group_size
+    (tmp_path / "rco_manifest.json").write_text(
+        json.dumps({"code_offsets": {"lin": {"code_offset": 99.0, "group_size": 64}}})
+    )
+    with pytest.raises(ValueError, match="Invalid code_offset"):
+        _apply_rco_code_offsets(m, tmp_path)
+
+
+def test_refine_hessian_cd_3d_matches_2d_and_pack_tensor_channel() -> None:
+    from warp_quant.hadamard_gptq import _gptq_pack_tensor
+    from warp_quant.rco.options import refine_hessian_cd, refine_hessian_cd_3d
+    from warp_quant.streaming_moe import _gptq_quantize_and_pack_3d_experts
+
+    torch.manual_seed(23)
+    w_3d = torch.randn(3, 32, 64, dtype=torch.float32)
+    x_3d = torch.randn(3, 96, 64, dtype=torch.float32)
+    h_3d = torch.bmm(x_3d.transpose(1, 2), x_3d) / 96.0
+    codes_3d = torch.randint(-8, 8, (3, 32, 64), dtype=torch.int8)
+    scales_3d = (w_3d.abs().amax(dim=-1, keepdim=True) / 7.0).to(torch.bfloat16)
+
+    c_batched, s_batched = refine_hessian_cd_3d(w_3d, h_3d, codes_3d, scales_3d, 4, 64, passes=2)
+    for e in range(3):
+        c_e, s_e = refine_hessian_cd(w_3d[e], h_3d[e], codes_3d[e], scales_3d[e], 4, 64, passes=2)
+        assert torch.equal(c_batched[e], c_e)
+        assert torch.equal(s_batched[e], s_e)
+
+    # 3D MoE expert packer (shared H and per-expert H)
+    q_shared, p_shared, s_shared, shp = _gptq_quantize_and_pack_3d_experts(
+        w_3d.to(torch.bfloat16), h_3d[:1], group_size=64, actorder="static", dampening_frac=0.01
+    )
+    assert q_shared.shape == (3, 32, 64)
+    assert p_shared.shape == (3, 32, 8)
+    assert s_shared.shape == (3, 32, 1)
+    assert shp.tolist() == [32, 64]
+
+    q_per_exp, p_per_exp, _, _ = _gptq_quantize_and_pack_3d_experts(
+        w_3d.to(torch.bfloat16), h_3d, group_size=64, actorder="static", dampening_frac=0.01
+    )
+    assert q_per_exp.shape == (3, 32, 64)
+    assert p_per_exp.shape == (3, 32, 8)
+
+    # Per-channel Vision fc2 (non-power-of-2 K=80 = 16 * 5)
+    w_fc2 = torch.randn(32, 80, dtype=torch.bfloat16)
+    x_fc2 = torch.randn(128, 80, dtype=torch.float32)
+    packed_fc2 = _gptq_pack_tensor(
+        w_fc2,
+        x_fc2.T @ x_fc2,
+        torch.tensor(128),
+        strategy="channel",
+        group_size=None,
+        actorder=None,
+        dampening_frac=0.01,
+    )
+    assert packed_fc2["weight_packed"].shape == (32, 10)
+    assert packed_fc2["weight_scale"].shape == (32, 1)

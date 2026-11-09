@@ -300,6 +300,7 @@ def _assemble_rco_checkpoint_into(
     has_index = index_path.is_file()
     index_data = json.loads(index_path.read_text()) if has_index else None
     new_weight_map: dict[str, str] = {}
+    code_offsets: dict[str, dict[str, float | int]] = {}
     total_bytes = 0
     packed_count = 0
 
@@ -312,6 +313,12 @@ def _assemble_rco_checkpoint_into(
                     prefix = key[:-7]
                     c_idx = member_to_choice[prefix]
                     cand = candidates[prefix][c_idx]
+                    c_off = float(cand.get("code_offset", 0.0))
+                    if c_off != 0.0:
+                        code_offsets[prefix] = {
+                            "code_offset": c_off,
+                            "group_size": int(cand["group_size"]),
+                        }
                     scales_to_pack = (
                         scale_overrides[prefix]
                         if (scale_overrides is not None and prefix in scale_overrides)
@@ -405,5 +412,7 @@ def _assemble_rco_checkpoint_into(
         "eligible_text_bytes": eligible_bytes,
         "total_safetensors_bytes": total_bytes,
     }
+    if code_offsets:
+        receipt["code_offsets"] = code_offsets
     (output_dir / "rco_manifest.json").write_text(json.dumps(receipt, indent=2) + "\n")
     return receipt

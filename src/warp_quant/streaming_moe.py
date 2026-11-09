@@ -1049,17 +1049,23 @@ def _gptq_quantize_and_pack_2d(
     group_size: int,
     actorder: str | None,
     dampening_frac: float,
+    cd_passes: int = 2,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Run Cholesky GPTQ on a 2D weight tensor [N, K], returning (dequantized_bf16_on_device, cpu_packed_dict)."""
-    from compressed_tensors.compressors import PackedQuantizationCompressor
-    from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
-    from compressed_tensors.quantization.utils import calculate_qparams
+    """Run MSE-init Cholesky GPTQ + H-CD on a 2D weight tensor [N, K], returning (dequantized_bf16, cpu_packed_dict)."""
+    from compressed_tensors.quantization import QuantizationArgs
     from llmcompressor.modifiers.gptq.gptq_quantize import quantize_weight
+
+    from warp_quant.rco.options import (
+        decode_candidate,
+        find_mse_scale,
+        pack_candidate,
+        refine_hessian_cd,
+    )
 
     w_f32 = weight.detach().float()
     n_out, k_in = w_f32.shape
     eff_group_size = min(group_size, k_in)
-    norm_h = (hessian / max(num_samples, 1)).to(torch.float32)
+    norm_h = (hessian / max(num_samples, 1)).to(torch.float32).contiguous()
 
     qargs = QuantizationArgs(
         num_bits=4,
@@ -1069,14 +1075,12 @@ def _gptq_quantize_and_pack_2d(
         group_size=eff_group_size,
         actorder=actorder,
     )
-    scheme = QuantizationScheme(targets=["Linear"], weights=qargs)
-    grouped = weight.detach().view(n_out, k_in // eff_group_size, eff_group_size)
-    scale, zp = calculate_qparams(grouped.amin(dim=-1), grouped.amax(dim=-1), qargs)
-    scale = scale.to(weight.dtype)
+    scale = find_mse_scale(w_f32, 4, eff_group_size)
+    zp = torch.zeros_like(scale, dtype=torch.int32)
 
     q_w_batch, _losses, used_rtn = quantize_weight(
-        weights=w_f32.unsqueeze(0),
-        hessians=norm_h.unsqueeze(0).clone(),
+        weights=w_f32.clone().unsqueeze(0),
+        hessians=norm_h.clone().unsqueeze(0),
         scale=scale.unsqueeze(0),
         zero_point=zp.unsqueeze(0),
         global_scale=None,
@@ -1086,13 +1090,23 @@ def _gptq_quantize_and_pack_2d(
     )
     if used_rtn[0].item():
         raise RuntimeError("GPTQ fell back to RTN on 2D linear module")
-    q_w = q_w_batch[0].to(weight.dtype)
-    compressed = PackedQuantizationCompressor.compress(
-        {"weight": q_w, "weight_scale": scale},
-        scheme,
-    )
-    packed_cpu = {k: v.contiguous().cpu() for k, v in compressed.items()}
-    return q_w, packed_cpu
+    q_w = q_w_batch[0]
+    scale_exp = scale.float().repeat_interleave(eff_group_size, dim=1)
+    codes = torch.clamp(torch.round(q_w.float() / scale_exp), -8, 7).to(torch.int8)
+    if cd_passes > 0:
+        codes, scale = refine_hessian_cd(
+            w_f32,
+            norm_h,
+            codes,
+            scale,
+            4,
+            eff_group_size,
+            passes=cd_passes,
+            dampening_frac=dampening_frac,
+        )
+    q_w_bf16 = decode_candidate(codes, scale, eff_group_size, dtype=weight.dtype).to(weight.device)
+    packed_cpu = {k: v.contiguous().cpu() for k, v in pack_candidate(codes, scale, 4).items()}
+    return q_w_bf16, packed_cpu
 
 
 @torch.no_grad()
@@ -1104,8 +1118,9 @@ def _gptq_quantize_and_pack_3d_experts(
     actorder: str | None,
     dampening_frac: float,
     expert_chunk: int = 512,
+    cd_passes: int = 2,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Batch-GPTQ and batch-pack a 3D expert tensor [E, N_out, K_in].
+    """Batch MSE-init Cholesky GPTQ + H-CD and batch-pack a 3D expert tensor [E, N_out, K_in].
 
     hessians can be either [1, K_in, K_in] (shared across all experts, e.g. gate_proj / up_proj)
     or [E, K_in, K_in] (per-expert, e.g. down_proj).
@@ -1115,10 +1130,16 @@ def _gptq_quantize_and_pack_3d_experts(
       scales_3d_cpu: [E, N_out, K_in // group_size] bfloat16 on CPU
       shape_tensor_cpu: [2] int64 ([N_out, K_in])
     """
-    from compressed_tensors.compressors import PackedQuantizationCompressor
-    from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
-    from compressed_tensors.quantization.utils import calculate_qparams
+    from compressed_tensors.quantization import QuantizationArgs
     from llmcompressor.modifiers.gptq.gptq_quantize import quantize_weight
+
+    from warp_quant.rco.options import (
+        decode_candidate,
+        find_mse_scale,
+        pack_candidate,
+        refine_hessian_cd,
+        refine_hessian_cd_3d,
+    )
 
     num_exp, n_out, k_in = weights_3d.shape
     eff_group_size = min(group_size, k_in)
@@ -1132,31 +1153,30 @@ def _gptq_quantize_and_pack_3d_experts(
         group_size=eff_group_size,
         actorder=actorder,
     )
-    scheme = QuantizationScheme(targets=["Linear"], weights=qargs)
 
     q_w_3d = torch.empty_like(weights_3d)
-    all_grouped = weights_3d.detach().view(num_exp, n_out, num_groups, eff_group_size)
-    all_scale_3d, all_zp_3d = calculate_qparams(
-        all_grouped.amin(dim=-1),
-        all_grouped.amax(dim=-1),
-        qargs,
-    )
-    all_scale_3d = all_scale_3d.to(weights_3d.dtype)
+    codes_3d = torch.empty((num_exp, n_out, k_in), dtype=torch.int8, device=weights_3d.device)
+    all_scale_3d = find_mse_scale(
+        weights_3d.detach().float().reshape(num_exp * n_out, k_in),
+        4,
+        eff_group_size,
+    ).view(num_exp, n_out, num_groups)
+    all_zp_3d = torch.zeros_like(all_scale_3d, dtype=torch.int32)
     shared_h = hessians.shape[0] == 1
 
     if shared_h:
-        # Stack expert_chunk experts along N_out so Cholesky is computed only once per chunk
+        h_shared_2d = hessians[0].float().contiguous()
         for e0 in range(0, num_exp, expert_chunk):
             e1 = min(e0 + expert_chunk, num_exp)
             cur_e = e1 - e0
-            w_chunk = weights_3d[e0:e1].reshape(1, cur_e * n_out, k_in).float()
-            scale_chunk = all_scale_3d[e0:e1].reshape(1, cur_e * n_out, num_groups)
-            zp_chunk = all_zp_3d[e0:e1].reshape(1, cur_e * n_out, num_groups)
+            w_2d = weights_3d[e0:e1].reshape(cur_e * n_out, k_in).float()
+            s_2d = all_scale_3d[e0:e1].reshape(cur_e * n_out, num_groups)
+            zp_2d = all_zp_3d[e0:e1].reshape(cur_e * n_out, num_groups)
             q_chunk, _losses, used_rtn = quantize_weight(
-                weights=w_chunk,
-                hessians=hessians.float().clone(),
-                scale=scale_chunk,
-                zero_point=zp_chunk,
+                weights=w_2d.clone().unsqueeze(0),
+                hessians=h_shared_2d.clone().unsqueeze(0),
+                scale=s_2d.unsqueeze(0),
+                zero_point=zp_2d.unsqueeze(0),
                 global_scale=None,
                 quant_args=qargs,
                 blocksize=128,
@@ -1164,17 +1184,34 @@ def _gptq_quantize_and_pack_3d_experts(
             )
             if used_rtn.any().item():
                 raise RuntimeError(f"GPTQ fell back to RTN on shared-H experts [{e0}:{e1}]")
-            q_w_3d[e0:e1].copy_(q_chunk[0].view(cur_e, n_out, k_in).to(weights_3d.dtype))
-            del w_chunk, scale_chunk, zp_chunk, q_chunk
+            s_exp_2d = s_2d.float().repeat_interleave(eff_group_size, dim=1)
+            c_2d = torch.clamp(torch.round(q_chunk[0].float() / s_exp_2d), -8, 7).to(torch.int8)
+            if cd_passes > 0:
+                c_2d, s_2d = refine_hessian_cd(
+                    w_2d,
+                    h_shared_2d,
+                    c_2d,
+                    s_2d,
+                    4,
+                    eff_group_size,
+                    passes=cd_passes,
+                    dampening_frac=dampening_frac,
+                )
+            dec_2d = decode_candidate(c_2d, s_2d, eff_group_size, dtype=weights_3d.dtype)
+            q_w_3d[e0:e1].copy_(dec_2d.view(cur_e, n_out, k_in))
+            codes_3d[e0:e1].copy_(c_2d.view(cur_e, n_out, k_in))
+            all_scale_3d[e0:e1].copy_(s_2d.view(cur_e, n_out, num_groups))
+            del w_2d, s_2d, zp_2d, q_chunk, c_2d, dec_2d
     else:
         for e0 in range(0, num_exp, expert_chunk):
             e1 = min(e0 + expert_chunk, num_exp)
             w_chunk = weights_3d[e0:e1].float()
+            h_chunk = hessians[e0:e1].float().contiguous()
             scale_chunk = all_scale_3d[e0:e1]
             zp_chunk = all_zp_3d[e0:e1]
             q_chunk, _losses, used_rtn = quantize_weight(
-                weights=w_chunk,
-                hessians=hessians[e0:e1].float().clone(),
+                weights=w_chunk.clone(),
+                hessians=h_chunk.clone(),
                 scale=scale_chunk,
                 zero_point=zp_chunk,
                 global_scale=None,
@@ -1184,17 +1221,36 @@ def _gptq_quantize_and_pack_3d_experts(
             )
             if used_rtn.any().item():
                 raise RuntimeError(f"GPTQ fell back to RTN on per-expert H [{e0}:{e1}]")
-            q_w_3d[e0:e1].copy_(q_chunk.to(weights_3d.dtype))
-            del w_chunk, scale_chunk, zp_chunk, q_chunk
+            s_exp_3d = scale_chunk.float().repeat_interleave(eff_group_size, dim=-1)
+            c_chunk = torch.clamp(torch.round(q_chunk.float() / s_exp_3d), -8, 7).to(torch.int8)
+            if cd_passes > 0:
+                c_chunk, scale_chunk = refine_hessian_cd_3d(
+                    w_chunk,
+                    h_chunk,
+                    c_chunk,
+                    scale_chunk,
+                    4,
+                    eff_group_size,
+                    passes=cd_passes,
+                    dampening_frac=dampening_frac,
+                )
+            dec_3d = (
+                c_chunk.float().view(e1 - e0, n_out, num_groups, eff_group_size)
+                * scale_chunk.float().unsqueeze(-1)
+            ).view(e1 - e0, n_out, k_in)
+            q_w_3d[e0:e1].copy_(dec_3d.to(weights_3d.dtype))
+            codes_3d[e0:e1].copy_(c_chunk)
+            all_scale_3d[e0:e1].copy_(scale_chunk)
+            del w_chunk, h_chunk, scale_chunk, zp_chunk, q_chunk, c_chunk, dec_3d
 
-    # Batch-pack all experts in one call using the exact observer scales
-    all_scale_2d = all_scale_3d.reshape(num_exp * n_out, num_groups)
-    comp = PackedQuantizationCompressor.compress(
-        {"weight": q_w_3d.view(num_exp * n_out, k_in), "weight_scale": all_scale_2d},
-        scheme,
+    # Losslessly pack exact int8 codes into int32 words without float roundtrip drift
+    comp_2d = pack_candidate(
+        codes_3d.reshape(num_exp * n_out, k_in),
+        all_scale_3d.reshape(num_exp * n_out, num_groups),
+        4,
     )
-    packed_3d_cpu = comp["weight_packed"].view(num_exp, n_out, -1).contiguous().cpu()
-    scales_3d_cpu = all_scale_3d.contiguous().cpu()
+    packed_3d_cpu = comp_2d["weight_packed"].view(num_exp, n_out, -1).contiguous().cpu()
+    scales_3d_cpu = comp_2d["weight_scale"].view(num_exp, n_out, num_groups).contiguous().cpu()
     shape_tensor_cpu = torch.tensor([n_out, k_in], dtype=torch.int64)
     return q_w_3d, packed_3d_cpu, scales_3d_cpu, shape_tensor_cpu
 

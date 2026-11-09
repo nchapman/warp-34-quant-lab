@@ -18,6 +18,8 @@ from warp_quant.rco.options import (
     pack_candidate,
     packed_byte_cost,
     quantize_candidate,
+    refine_hessian_cd,
+    refine_hessian_cd_3d,
     resolve_option,
     resolve_options,
 )
@@ -44,6 +46,8 @@ __all__ = [
     "packed_byte_cost",
     "quantize_candidate",
     "random_control",
+    "refine_hessian_cd",
+    "refine_hessian_cd_3d",
     "resolve_option",
     "resolve_options",
     "run_rco_cli",

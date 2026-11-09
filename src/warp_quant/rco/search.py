@@ -31,6 +31,7 @@ class _Weight(nn.Module):
         is_compact_input = isinstance(options_list[0], dict) and "codes" in options_list[0]
         self._is_compact = is_compact_input and not cache_decoded
         self._group_sizes: list[int] = []
+        self._code_offsets: list[float] = []
         if is_compact_input and cache_decoded:
             for k, item in enumerate(options_list):
                 dec = decode_candidate(
@@ -38,6 +39,7 @@ class _Weight(nn.Module):
                     item["scales"].detach().to(device=device),
                     int(item["group_size"]),
                     dtype=torch.bfloat16,
+                    code_offset=float(item.get("code_offset", 0.0)),
                 )
                 self.register_buffer(f"dense_{k}", dec)
         elif self._is_compact:
@@ -47,6 +49,7 @@ class _Weight(nn.Module):
                     f"scales_{k}", item["scales"].detach().to(device=device, dtype=torch.bfloat16)
                 )
                 self._group_sizes.append(int(item["group_size"]))
+                self._code_offsets.append(float(item.get("code_offset", 0.0)))
         else:
             for k, tensor in enumerate(options_list):
                 self.register_buffer(f"dense_{k}", tensor.detach().to(device=device, dtype=torch.bfloat16))
@@ -55,7 +58,13 @@ class _Weight(nn.Module):
         if self._is_compact:
             codes = getattr(self, f"codes_{k}")
             scales = getattr(self, f"scales_{k}")
-            return decode_candidate(codes, scales, self._group_sizes[k], dtype=torch.bfloat16)
+            return decode_candidate(
+                codes,
+                scales,
+                self._group_sizes[k],
+                dtype=torch.bfloat16,
+                code_offset=self._code_offsets[k],
+            )
         return getattr(self, f"dense_{k}")
 
     def forward(self, original: torch.Tensor) -> torch.Tensor:
