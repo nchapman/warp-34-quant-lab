@@ -14,7 +14,11 @@ tags:
 
 # Qwen3.5-4B-W4A16-HGPTQ
 
-4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ + Hessian Coordinate Descent + FP32-Master Norm QAT (`HGPTQ`)** quantization of [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) across **Text (`200` linears in `W4`), Native MTP (`7` transformer linears in `W4` + `mtp.fc` in `W8_g64`), and Vision (`98` linears in `W4`)**, reducing the checkpoint payload from `8.68 GiB` in BF16 to **`3.19 GiB` (`2.72×` smaller, saving `5.49 GiB` of VRAM)** so it runs easily on 6–8 GB GPUs. Tracks the BF16 base model closely on text (`-1.89%` perplexity delta, `0.0811` weighted KL divergence, `0.0533` holdout mean KL) and preserves near-lossless vision accuracy (`99.34%` top-1 match on VQA/OCR and `99.26%` on UI/math) alongside `94.26%` speculative drafter agreement.
+4-bit Hadamard + GPTQ (`W4A16`, group size 64) quantization of [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) across Text, Vision, and the Native MTP speculative drafter. It compresses the 8.68 GiB BF16 model down to **3.19 GiB** (2.72× smaller), running easily on **6–8 GB GPUs** with plenty of headroom for context and vision tokens.
+
+- **VRAM & footprint:** 3.19 GiB total (saving 5.49 GiB vs. BF16) across all 200 text linears, 98 vision linears, and 8 Native MTP linears (`mtp.fc` in `W8_g64`, tied `lm_head` in BF16).
+- **Quantization recipe:** 64×64 Walsh–Hadamard input rotation + MSE-initialized Cholesky GPTQ + 2-pass Hessian Coordinate Descent (`H-CD`) + end-to-end FP32-master `RMSNorm` KL tuning.
+- **Fidelity vs. BF16:** 0.0811 weighted KL (0.0681 mean KL, −1.89% PPL) on `probe-v4`, 0.0533 mean KL (+1.66% PPL) on the `probe-guard` holdout, 94.26% / 85.15% isolated/E2E MTP top-1 agreement, and 99.34% / 97.35% isolated/E2E vision top-1 agreement.
 
 ## Quality vs. BF16 Base Model (`Qwen/Qwen3.5-4B`)
 

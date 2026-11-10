@@ -14,7 +14,11 @@ tags:
 
 # Swift-1.5-Qwen3.8-27b-W4A16-HGPTQ
 
-4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ + Hessian Coordinate Descent + FP32-Master Norm QAT (`HGPTQ`)** quantization of [ukisai/Swift-1.5-Qwen3.8-27b](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b) across **Text (`400` backbone linears in `W4` + `lm_head` in `W8_g64`), Native MTP (`7` transformer linears in `W4` + `mtp.fc` in `W8_g64`), and Vision (`110` linears in `W4`)**, reducing the checkpoint payload from `51.75 GiB` in BF16 to **`16.14 GiB` (`3.21×` smaller, saving `35.61 GiB` of VRAM)** to fit comfortably on a **single 24 GB GPU**. Tracks the BF16 fine-tune closely across text (`0.1074` weighted KL divergence, `0.0555` holdout mean KL), speculative drafting (`96.43%` top-1 agreement), and vision (`98.01%–99.26%` top-1 agreement).
+4-bit Hadamard + GPTQ (`W4A16`, group size 64) quantization of [ukisai/Swift-1.5-Qwen3.8-27b](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b) across Text, Vision, and the Native MTP speculative drafter. It compresses the 51.8 GiB BF16 fine-tune down to **16.14 GiB** (3.21× smaller), fitting comfortably on a single **24 GB GPU** (RTX 3090 / 4090 / 5090).
+
+- **VRAM & GPU fit:** 16.14 GiB total (saving 35.61 GiB vs. BF16), leaving ~7.8 GiB on a 24 GB card for KV cache, vision tokens, MTP drafting, and CUDA graphs.
+- **Quantization recipe:** 64×64 Walsh–Hadamard input rotation + MSE-initialized Cholesky GPTQ + 2-pass Hessian Coordinate Descent (`H-CD`) + end-to-end FP32-master `RMSNorm` KL tuning, with `lm_head` and `mtp.fc` in 8-bit (`W8_g64`).
+- **Fidelity vs. BF16:** 0.1074 weighted KL (0.0725 mean KL) on `probe-v4`, 0.0555 mean KL (+1.70% PPL) on the `probe-guard` holdout, 96.43% / 88.78% isolated/E2E MTP top-1 agreement, and 98.01% / 93.05% isolated/E2E vision top-1 agreement.
 
 ## Quality vs. BF16 Base Model (`ukisai/Swift-1.5-Qwen3.8-27b`)
 

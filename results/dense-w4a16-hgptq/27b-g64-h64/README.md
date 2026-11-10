@@ -14,7 +14,11 @@ tags:
 
 # Qwen3.8-27B-W4A16-HGPTQ
 
-4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ + Hessian Coordinate Descent + FP32-Master Norm QAT (`HGPTQ`)** quantization of [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) across **Text (`400` backbone linears in `W4` + `lm_head` in `W8_g64`), Native MTP (`7` transformer linears in `W4` + `mtp.fc` in `W8_g64`), and Vision (`110` linears in `W4`)**, reducing the checkpoint payload from `51.75 GiB` in BF16 to **`16.14 GiB` (`3.21×` smaller, saving `35.61 GiB` of VRAM)** so it fits on a **single 24 GB GPU (RTX 3090 / 4090 / 5090)** with `~7.8 GiB` left for KV cache, Vision, Native MTP speculative decoding, and CUDA graphs. Combining MSE-initialized Cholesky GPTQ + 2-pass Gauss–Seidel Hessian Coordinate Descent (`H-CD`) + end-to-end FP32-master `RMSNorm` KL tuning + `W8_g64` untied head cuts `probe-v4` weighted KL to **`0.1002`** (`−13.6%` vs. standard `HGPTQ`), holdout KL to **`0.0530`** (`−17.1%`), and lifts E2E speculative drafter (`89.16%`) and Vision (`92.05%`) Top-1 agreement while saving an extra `1.20 GiB`.
+4-bit Hadamard + GPTQ (`W4A16`, group size 64) quantization of [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) across Text, Vision, and the Native MTP speculative drafter. It shrinks the 51.8 GiB BF16 model down to **16.14 GiB** (3.21× smaller) so the full multimodal model and speculative drafter fit comfortably on a single **24 GB GPU** (RTX 3090 / 4090 / 5090).
+
+- **VRAM & GPU fit:** 16.14 GiB total (15.67 GiB language + MTP, 0.47 GiB vision), leaving ~7.8 GiB on a 24 GB card for KV cache, vision tokens, MTP drafting, and CUDA graphs.
+- **Quantization recipe:** 64×64 Walsh–Hadamard input rotation + MSE-initialized Cholesky GPTQ + 2-pass Hessian Coordinate Descent (`H-CD`) + end-to-end FP32-master `RMSNorm` KL tuning, with `lm_head` and `mtp.fc` in 8-bit (`W8_g64`).
+- **Fidelity vs. BF16:** 0.1002 weighted KL (0.0685 mean KL) on `probe-v4`, 0.0530 mean KL (+1.66% PPL) on the `probe-guard` holdout, 96.49% / 89.16% isolated/E2E MTP top-1 agreement, and 99.34% / 92.05% isolated/E2E vision top-1 agreement.
 
 ## Quality vs. BF16 Base Model (`Qwen/Qwen3.8-27B`)
 

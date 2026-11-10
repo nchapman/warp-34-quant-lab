@@ -14,7 +14,11 @@ tags:
 
 # Qwen3.5-9B-W4A16-HGPTQ
 
-4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ + Hessian Coordinate Descent + FP32-Master Norm QAT (`HGPTQ`)** quantization of [Qwen/Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B) across **Text (`200` backbone linears in `W4` + `lm_head` in `W8_g64`), Native MTP (`7` transformer linears in `W4` + `mtp.fc` in `W8_g64`), and Vision (`110` linears in `W4`)**, reducing the checkpoint payload from `17.98 GiB` in BF16 to **`6.67 GiB` (`2.70×` smaller, saving `11.31 GiB` of VRAM)**—fitting cleanly on **10–12 GB GPUs** with `3–5 GiB` of KV-cache headroom (or on an **8 GB GPU** for shorter contexts; for long-context 8 GB serving, see [`Qwen3.5-9B-W2.6A16-HGPTQ-RCO`](https://huggingface.co/nchapman/Qwen3.5-9B-W2.6A16-HGPTQ-RCO) at `5.54 GiB`). Combining MSE-initialized Cholesky GPTQ + 2-pass Gauss–Seidel Hessian Coordinate Descent (`H-CD`) + end-to-end FP32-master `RMSNorm` KL tuning + `W8_g64` untied head cuts `probe-v4` weighted KL to **`0.0638`** (`−12.1%` vs. standard `HGPTQ`), holdout perplexity delta to **`+0.78%`**, Vision isolated Top-1 to **`99.34%`** (`97.35%` E2E), and speculative drafter Top-1 to **`94.86%`** (`87.79%` E2E) while saving an extra `0.95 GiB`.
+4-bit Hadamard + GPTQ (`W4A16`, group size 64) quantization of [Qwen/Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B) across Text, Vision, and the Native MTP speculative drafter. It shrinks the 18.0 GiB BF16 model down to **6.67 GiB** (2.70× smaller), fitting cleanly on **10–12 GB GPUs** with 3–5 GiB of KV-cache headroom (or on an 8 GB GPU for shorter contexts; for long-context 8 GB serving, see [`Qwen3.5-9B-W2.6A16-HGPTQ-RCO`](https://huggingface.co/nchapman/Qwen3.5-9B-W2.6A16-HGPTQ-RCO) at 5.54 GiB).
+
+- **VRAM & GPU fit:** 6.67 GiB total (saving 11.31 GiB vs. BF16) across 200 text backbone linears, 110 vision linears, and 8 Native MTP linears, with `lm_head` and `mtp.fc` in 8-bit (`W8_g64`).
+- **Quantization recipe:** 64×64 Walsh–Hadamard input rotation + MSE-initialized Cholesky GPTQ + 2-pass Hessian Coordinate Descent (`H-CD`) + end-to-end FP32-master `RMSNorm` KL tuning.
+- **Fidelity vs. BF16:** 0.0638 weighted KL (0.0488 mean KL, −0.77% PPL) on `probe-v4`, 0.0419 mean KL (+0.78% PPL) on the `probe-guard` holdout, 94.86% / 87.79% isolated/E2E MTP top-1 agreement, and 99.34% / 97.35% isolated/E2E vision top-1 agreement.
 
 ## Quality vs. BF16 Base Model (`Qwen/Qwen3.5-9B`)
 

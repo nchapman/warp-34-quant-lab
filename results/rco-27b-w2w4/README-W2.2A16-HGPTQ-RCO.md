@@ -15,7 +15,11 @@ tags:
 
 # Qwen3.8-27B-W2.2A16-HGPTQ-RCO
 
-2.20-bit (`W2`/`W4` mixed backbone + `W8_g64` head, group size 64) **Hadamard + Cholesky GPTQ with Riemannian Co-design (`HGPTQ-RCO`)** quantization of [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) across **Text (`400` backbone linears + `lm_head`), Native MTP (`8` linears), and Vision (`110` linears)**, reducing the checkpoint payload from `51.75 GiB` in BF16 to **`11.04 GiB` (`4.69×` smaller; `10.58 GiB` text-only, saving `40.71 GiB` of VRAM)**. Upgrading the top `10%` (`+580 MiB`) most sensitive fused `vLLM` linear groups (`13/32` Full-Attention, `20/96` GDN Linear-Attention, `14/128` MLP) via Riemannian Co-design + end-to-end Scale/Norm QAT captures **45% of the entire `0%→30%` `probe-v4` KL reduction** (`0.3477 → 0.3137`). Use this checkpoint for **ultra-long-context `16 GB` serving** or **headless `12 GB` text-only serving** (`--language-model-only`); for general `16 GB` multimodal + MTP serving, prefer [`Qwen3.8-27B-W2.6A16-HGPTQ-RCO`](https://huggingface.co/nchapman/Qwen3.8-27B-W2.6A16-HGPTQ-RCO) (`12.18 GiB`).
+Ultra-compact mixed 2-bit / 4-bit Hadamard + GPTQ (`W2.2A16`, group size 64) quantization of [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) built with Riemannian Co-design (`HGPTQ-RCO`). It compresses the 51.8 GiB BF16 model down to **11.04 GiB** (4.69× smaller; 10.58 GiB text-only) for ultra-long-context **16 GB GPU** serving or headless **12 GB GPU** text-only serving (`--language-model-only`).
+
+- **VRAM & GPU fit:** 11.04 GiB full VLM+MTP (10.58 GiB text-only, saving 40.71 GiB vs. BF16); for general 16 GB multimodal + MTP serving, prefer [`Qwen3.8-27B-W2.6A16-HGPTQ-RCO`](https://huggingface.co/nchapman/Qwen3.8-27B-W2.6A16-HGPTQ-RCO) at 12.18 GiB.
+- **Quantization recipe:** Upgrades the top 10% (+580 MiB) most sensitive fused `vLLM` backbone groups (13/32 Full-Attention, 20/96 GDN Linear-Attention, 14/128 MLP) to `W4_g64`, keeps Vision and Native MTP transformer blocks in `W4_g64` (`lm_head` and `mtp.fc` in `W8_g64`), and polishes `W2_g64` scales + FP32-master `RMSNorm`/GDN gates end-to-end.
+- **Fidelity vs. BF16:** Captures 45% of the 0%→30% `probe-v4` KL reduction (0.3137 weighted KL, 0.3822 mean KL), 0.4221 holdout mean KL, 96.49% / 68.55% isolated/E2E MTP top-1 agreement, and 99.34% / 85.10% isolated/E2E vision top-1 agreement.
 
 | Variant | Avg Backbone Bits | Full VLM+MTP Size | Text-Only Size | Target GPU Tier |
 |---|---:|---:|---:|---|

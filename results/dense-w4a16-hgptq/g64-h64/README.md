@@ -14,7 +14,11 @@ tags:
 
 # Qwen3.5-2B-W4A16-HGPTQ
 
-4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ + Hessian Coordinate Descent + FP32-Master Norm QAT (`HGPTQ`)** quantization of [Qwen/Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B) across **Text (`150` linears in `W4`), Native MTP (`7` transformer linears in `W4` + `mtp.fc` in `W8_g64`), and Vision (`98` linears in `W4`)**, reducing the checkpoint payload from `4.24 GiB` in BF16 to **`1.83 GiB` (`2.31×` smaller)** to fit comfortably in 2–4 GB memory budgets with minimal quality loss (`+0.72%` holdout perplexity delta, `0.0591` weighted KL divergence). Combining MSE-initialized Cholesky GPTQ + 2-pass Gauss–Seidel Hessian Coordinate Descent (`H-CD`) + end-to-end FP32-master `RMSNorm` KL tuning cuts `probe-v4` weighted KL by `−18.8%` (`0.0728 → 0.0591`), holdout perplexity delta from `+1.64%` to **`+0.72%`**, Vision isolated Top-1 to **`97.35%`** (`95.56%` E2E on `vision-guard-v2`), and speculative drafter Top-1 to **`92.78%`** (`81.64%` E2E).
+4-bit Hadamard + GPTQ (`W4A16`, group size 64) quantization of [Qwen/Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B) across Text, Vision, and the Native MTP speculative drafter. It compresses the 4.24 GiB BF16 model down to **1.83 GiB** (2.31× smaller), fitting comfortably in 2–4 GB memory budgets with minimal quality loss.
+
+- **VRAM & footprint:** 1.83 GiB total across all 150 text linears, 98 vision linears, and 8 Native MTP linears (`mtp.fc` in `W8_g64`, tied `lm_head` in BF16).
+- **Quantization recipe:** 64×64 Walsh–Hadamard input rotation + MSE-initialized Cholesky GPTQ + 2-pass Hessian Coordinate Descent (`H-CD`) + end-to-end FP32-master `RMSNorm` KL tuning.
+- **Fidelity vs. BF16:** 0.0591 weighted KL (0.1173 mean KL) on `probe-v4`, 0.0739 weighted KL (+0.72% PPL) on the `probe-guard` holdout, 92.78% / 81.64% isolated/E2E MTP top-1 agreement, and 97.35% / 94.04% isolated/E2E vision top-1 agreement (95.56% E2E on `vision-guard-v2`).
 
 ## Quality vs. BF16 Base Model (`Qwen/Qwen3.5-2B`)
 

@@ -15,7 +15,11 @@ tags:
 
 # Ornith-1.5-35B-A3B-W4A16-HGPTQ
 
-4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ + Hessian Coordinate Descent + FP32-Master Norm/GDN QAT (`HGPTQ`)** quantization of [ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B) across **Text (`30,970` W4A16 linears + `lm_head` in `W8_g64`), Native MTP (`775` W4A16 linears + `mtp.fc` in `W8_g64`), and Vision (`110` W4A16 linears)**, reducing the checkpoint payload from `66.97 GiB` in BF16 to **`18.78 GiB` (`3.57×` smaller, saving `48.19 GiB` of VRAM)** to fit within a **24 GB GPU** budget. Main-suite text tracking (`0.1139` weighted KL, `0.1647` holdout mean KL) and vision (`96.36%–97.04%` top-1 agreement) are solid, with two caveats inherited from the sharp fine-tune: out-of-distribution holdout prompts show higher divergence (`0.2289` weighted KL), and speculative drafter agreement is lower (`91.44%` vs. `95.80%` on base `Qwen3.6-35B-A3B`) because the upstream fine-tune shifted the backbone away from its un-updated MTP head.
+4-bit Hadamard + GPTQ (`W4A16`, group size 64) quantization of [ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B) across all 256 routed experts, shared experts, Attention/GDN layers, Vision, and the Native MTP speculative drafter. It compresses the 67.0 GiB BF16 MoE fine-tune down to **18.78 GiB** (3.57× smaller) so it fits within a single **24 GB GPU**.
+
+- **VRAM & GPU fit:** 18.78 GiB total (saving 48.19 GiB vs. BF16) across 30,970 text linears, 775 MTP linears, and 110 vision linears, with `lm_head` and `mtp.fc` in 8-bit (`W8_g64`).
+- **Quantization recipe:** 64×64 Walsh–Hadamard input rotation + MSE-initialized Cholesky GPTQ + 2-pass Hessian Coordinate Descent (`H-CD`) + end-to-end FP32-master `RMSNorm`/GDN KL tuning.
+- **Fidelity vs. BF16:** 0.1139 weighted KL (0.1150 mean KL) on `probe-v4`, 0.1647 mean KL (0.2289 weighted KL) on the `probe-guard` holdout, 91.44% / 82.19% isolated/E2E MTP top-1 agreement, and 96.36% / 93.38% isolated/E2E vision top-1 agreement.
 
 ## Quality vs. BF16 Base Model (`ornith-ai/Ornith-1.5-35B-A3B`)
 

@@ -15,7 +15,11 @@ tags:
 
 # Qwen3.8-27B-W2.6A16-HGPTQ-RCO
 
-2.60-bit (`W2`/`W4` mixed backbone + `W8_g64` head, group size 64) **Hadamard + Cholesky GPTQ with Riemannian Co-design (`HGPTQ-RCO`)** quantization of [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) across **Text (`400` backbone linears + `lm_head`), Native MTP (`8` linears), and Vision (`110` linears)**, reducing the checkpoint payload from `51.75 GiB` in BF16 to **`12.18 GiB` (`4.25×` smaller, saving `39.57 GiB` of VRAM)** so it fits on a **single 16 GB GPU (RTX 4060 Ti 16GB / 4070 Ti Super / 4080 / 5060 Ti 16GB / 5070 Ti)** with `~3.8 GiB` left for KV cache, Vision, Native MTP speculative decoding, and CUDA graphs. Riemannian Co-design upgrades the `30%` most sensitive fused `vLLM` linear groups (`21/32` Full-Attention, `38/96` GDN Linear-Attention, `39/128` MLP) from `W2` to `W4` and polishes 2-bit scales + FP32-master `RMSNorm`/GDN gates end-to-end (`probe-v4` weighted KL `0.2717`, holdout KL `0.3272`, E2E MTP top-1 `74.47%`, E2E Vision top-1 `88.74%`).
+Mixed 2-bit / 4-bit Hadamard + GPTQ (`W2.6A16`, group size 64) quantization of [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) built with Riemannian Co-design (`HGPTQ-RCO`). It compresses the 51.8 GiB BF16 model down to **12.18 GiB** (4.25× smaller; 11.71 GiB text-only) so the full multimodal model and Native MTP drafter fit on a single **16 GB GPU** (RTX 4060 Ti 16GB / 4070 Ti Super / 4080 / 5060 Ti 16GB / 5070 Ti).
+
+- **VRAM & GPU fit:** 12.18 GiB full VLM+MTP (11.71 GiB text-only), leaving ~3.8 GiB on a 16 GB card for KV cache, vision tokens, speculative decoding, and CUDA graphs.
+- **Quantization recipe:** Upgrades the top 30% most sensitive fused `vLLM` backbone groups (21/32 Full-Attention, 38/96 GDN Linear-Attention, 39/128 MLP) to `W4_g64`, keeps Vision and Native MTP transformer blocks in `W4_g64` (`lm_head` and `mtp.fc` in `W8_g64`), and polishes the remaining `W2_g64` scales + FP32-master `RMSNorm`/GDN gates end-to-end.
+- **Fidelity vs. BF16:** 0.2717 weighted KL (0.3037 mean KL) on `probe-v4`, 0.3272 mean KL (+17.45% PPL) on the `probe-guard` holdout, 96.49% / 74.47% isolated/E2E MTP top-1 agreement, and 99.34% / 88.74% isolated/E2E vision top-1 agreement.
 
 | Variant | Avg Backbone Bits | Full VLM+MTP Size | Text-Only Size | Target GPU Tier |
 |---|---:|---:|---:|---|

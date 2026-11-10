@@ -14,7 +14,11 @@ tags:
 
 # Ornith-1.5-9B-W4A16-HGPTQ
 
-4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ + Hessian Coordinate Descent + FP32-Master Norm QAT (`HGPTQ`)** quantization of [ornith-ai/Ornith-1.5-9B](https://huggingface.co/ornith-ai/Ornith-1.5-9B) across **Text (`200` backbone linears in `W4` + `lm_head` in `W8_g64`), Native MTP (`7` transformer linears in `W4` + `mtp.fc` in `W8_g64`), and Vision (`110` linears in `W4`)**, reducing the checkpoint payload from `17.98 GiB` in BF16 to **`6.67 GiB` (`2.70×` smaller, saving `11.31 GiB` of VRAM)** to fit on 8–10 GB GPUs. Preserves `97.02%–97.04%` vision top-1 agreement and `94.68%` speculative drafter agreement (`-15.34%` text perplexity delta, `0.1440` weighted KL divergence, `0.0965` holdout mean KL).
+4-bit Hadamard + GPTQ (`W4A16`, group size 64) quantization of [ornith-ai/Ornith-1.5-9B](https://huggingface.co/ornith-ai/Ornith-1.5-9B) across Text, Vision, and the Native MTP speculative drafter. It shrinks the 18.0 GiB BF16 fine-tune down to **6.67 GiB** (2.70× smaller), fitting comfortably on **10–12 GB GPUs** (or 8 GB GPUs at shorter contexts).
+
+- **VRAM & GPU fit:** 6.67 GiB total (saving 11.31 GiB vs. BF16) across 200 text backbone linears, 110 vision linears, and 8 Native MTP linears, with `lm_head` and `mtp.fc` in 8-bit (`W8_g64`).
+- **Quantization recipe:** 64×64 Walsh–Hadamard input rotation + MSE-initialized Cholesky GPTQ + 2-pass Hessian Coordinate Descent (`H-CD`) + end-to-end FP32-master `RMSNorm` KL tuning.
+- **Fidelity vs. BF16:** 0.1440 weighted KL (0.1235 mean KL) on `probe-v4`, 0.0965 mean KL on the `probe-guard` holdout, 94.68% / 86.45% isolated/E2E MTP top-1 agreement, and 97.02% / 96.69% isolated/E2E vision top-1 agreement.
 
 ## Quality vs. BF16 Base Model (`ornith-ai/Ornith-1.5-9B`)
 

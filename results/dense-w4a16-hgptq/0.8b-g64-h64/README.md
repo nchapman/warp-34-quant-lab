@@ -14,7 +14,11 @@ tags:
 
 # Qwen3.5-0.8B-W4A16-HGPTQ
 
-4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ + Hessian Coordinate Descent + FP32-Master Norm QAT (`HGPTQ`)** quantization of [Qwen/Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B) across **Text (`150` linears in `W4`), Native MTP (`7` transformer linears in `W4` + `mtp.fc` in `W8_g64`), and Vision (`50` linears in `W4`)**, reducing the checkpoint payload from `1.63 GiB` in BF16 to **`0.79 GiB` (`2.07×` smaller)** so the entire multimodal model, vision encoder, and speculative drafter fit in under `850 MiB` of memory. Combining MSE-initialized Cholesky GPTQ + 2-pass Gauss–Seidel Hessian Coordinate Descent (`H-CD`) + end-to-end FP32-master `RMSNorm` KL tuning cuts `probe-v4` weighted KL by `−18.4%` (`0.0901 → 0.0735`), `probe-guard` weighted KL by `−38.7%` (`0.1446 → 0.0887`), text perplexity delta from `+4.55%` to **`+3.17%`**, Vision isolated Top-1 to **`94.04%`** (`94.81%` E2E on `vision-guard-v2`), and speculative drafting Top-1 to **`90.24%`** (`78.36%` E2E).
+4-bit Hadamard + GPTQ (`W4A16`, group size 64) quantization of [Qwen/Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B) across Text, Vision, and the Native MTP speculative drafter. It cuts the 1.63 GiB BF16 checkpoint in half to **0.79 GiB** (2.07× smaller), fitting the entire multimodal model and speculative drafter in under 850 MiB of memory.
+
+- **VRAM & footprint:** 0.79 GiB total across all 150 text linears, 50 vision linears, and 8 Native MTP linears (`mtp.fc` in `W8_g64`, tied `lm_head` in BF16).
+- **Quantization recipe:** 64×64 Walsh–Hadamard input rotation + MSE-initialized Cholesky GPTQ + 2-pass Hessian Coordinate Descent (`H-CD`) + end-to-end FP32-master `RMSNorm` KL tuning.
+- **Fidelity vs. BF16:** 0.0735 weighted KL (0.1816 mean KL) on `probe-v4`, 0.0887 weighted KL (+3.17% PPL) on the `probe-guard` holdout, 90.24% / 78.36% isolated/E2E MTP top-1 agreement, and 94.04% / 88.74% isolated/E2E vision top-1 agreement (94.81% E2E on `vision-guard-v2`).
 
 ## Quality vs. BF16 Base Model (`Qwen/Qwen3.5-0.8B`)
 

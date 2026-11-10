@@ -16,7 +16,11 @@ tags:
 
 # Qwen3.8-Flash-Next-W4A16-HGPTQ
 
-4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ (`HGPTQ`) + 4-bit `Custom-LUT4` Layer-1 PLE** quantization of [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) across **Text (`74,028` linears), Layer-1 Per-Layer Embedding (`51.2B` params), Native MTP (`1,543` linears), and Vision (`110` linears)**, reducing the checkpoint payload from `335.28 GiB` (`360 GB`) in BF16 to **`93.42 GiB` (`3.59×` smaller)** across `59` safetensors shards (`62.7 GiB` text + `26.8 GiB` 4-bit LUT PLE + `1.3 GiB` MTP + `0.2 GiB` vision). Achieves the tightest BF16 tracking in the entire lineup (`0.050` KL divergence, `-0.34%` perplexity delta, `95.0%` speculative drafter agreement, and `96.7%–99.3%` vision agreement), though rare out-of-distribution multilingual/formatting prompts see slightly higher variance (`+10.9%` holdout perplexity, `0.101` token KL) when hitting cold experts and N-gram rows.
+4-bit Hadamard + GPTQ (`W4A16`, group size 64) and 4-bit `Custom-LUT4` Layer-1 PLE quantization of [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) across Text, Layer-1 Per-Layer Embeddings, Vision, and the Native MTP speculative drafter. It compresses the 335.3 GiB (360 GB) BF16 checkpoint down to **93.42 GiB** (3.59× smaller) across 59 safetensors shards.
+
+- **VRAM & shard breakdown:** 93.42 GiB total (62.7 GiB text MoE + 26.8 GiB 4-bit LUT Layer-1 PLE + 1.3 GiB Native MTP + 0.2 GiB vision) across 74,028 text linears, 1,543 MTP linears, and 110 vision linears.
+- **Quantization recipe:** 64×64 Walsh–Hadamard input rotation + Cholesky GPTQ (`group_size=64`) on all 512 routed experts, shared experts, Attention/GDN, MTP, and Vision, plus KV-projected HGPTQ + 4-bit Lloyd–Max `Custom-LUT4` on the 51.2B-parameter Layer-1 PLE table.
+- **Fidelity vs. BF16:** 0.0499 weighted KL (0.0563 mean KL, −0.34% PPL) on `probe-v4`, 0.1008 mean KL on the `probe-guard` holdout, 95.01% isolated MTP top-1 agreement, and 96.69%–99.26% vision top-1 agreement.
 
 ## Quality vs. BF16 Base Model (`Qwen/Qwen3.8-Flash-Next`)
 
