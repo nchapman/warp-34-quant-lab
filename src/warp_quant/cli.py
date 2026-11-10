@@ -132,10 +132,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p = sub.add_parser(
-        "probe", help="Evaluate text KL + Native MTP + Vision fidelity on a W4A16-HGPTQ checkpoint"
+        "probe", help="Evaluate text KL + Native MTP + Vision fidelity on one or more quantized checkpoints"
     )
     p.add_argument("--model", default="35b")
-    p.add_argument("--quant", required=True)
+    p.add_argument("--quant", nargs="+", required=True, help="One or more quantized checkpoint directories")
     p.add_argument("--eval-sets", nargs="+", default=["data/probe-v4.jsonl", "data/probe-guard.jsonl"])
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--eval-mtp", action="store_true")
@@ -150,6 +150,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--dump-rows-dir", default=None)
     p.add_argument("--output-json", default=None)
+    p.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory to write probe_<ckpt_name>.json when probing multiple --quant checkpoints",
+    )
 
     r = sub.add_parser(
         "rco",

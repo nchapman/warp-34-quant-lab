@@ -1668,8 +1668,14 @@ def _available_cuda_bytes(dev: torch.device) -> int:
 
 
 @torch.no_grad()
-def _run_pair_low_mem(base: nn.Module, quant: nn.Module, batches):
-    """Same exact math as quants.probe.run_pair, but offloads base logits to CPU before running quant."""
+def _run_pair_low_mem(
+    base: nn.Module,
+    quant: nn.Module,
+    batches,
+    *,
+    base_hidden_cache: list[torch.Tensor] | None = None,
+):
+    """Same exact math as quants.probe.run_pair, with optional cached base hidden states and sync-free chunking."""
     from collections import defaultdict
 
     from warp_quant.data import CHUNK
@@ -1680,11 +1686,19 @@ def _run_pair_low_mem(base: nn.Module, quant: nn.Module, batches):
     row_dump = []
     dom = defaultdict(lambda: {"base": 0.0, "quant": 0.0, "count": 0, "kl": 0.0, "kl_n": 0})
     dev = next(base.parameters()).device
+    high_vram = dev.type == "cuda" and _available_cuda_bytes(dev) > 36 * (1024**3)
+    eff_chunk = 2048 if high_vram else CHUNK
+    base_lm_head = base.get_output_embeddings()
 
     for i, (domain, ids) in enumerate(batches):
         ids = ids.to(dev)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            lb_out = base(input_ids=ids, use_cache=False).logits[:, :-1]
+            if base_hidden_cache is not None:
+                h_b = base_hidden_cache[i].to(dev, non_blocking=True)
+                lb_out = base_lm_head(h_b)[:, :-1]
+                del h_b
+            else:
+                lb_out = base(input_ids=ids, use_cache=False).logits[:, :-1]
             logit_bytes = lb_out.numel() * lb_out.element_size()
             keep_on_gpu = dev.type == "cuda" and _available_cuda_bytes(dev) > max(
                 8 * (1024**3), logit_bytes * 3
@@ -1703,38 +1717,46 @@ def _run_pair_low_mem(base: nn.Module, quant: nn.Module, batches):
                     raise
         targets = ids[:, 1:]
         d = dom[domain]
-        row_nll = {"base": 0.0, "quant": 0.0}
-        row_kl_sum, row_kl_n = 0.0, 0
-        for s in range(0, lq.shape[1], CHUNK):
-            sl = slice(s, min(s + CHUNK, lq.shape[1]))
+        row_base_gpu = torch.zeros((), device=dev, dtype=torch.float64)
+        row_quant_gpu = torch.zeros((), device=dev, dtype=torch.float64)
+        row_kl_chunks = []
+        for s in range(0, lq.shape[1], eff_chunk):
+            sl = slice(s, min(s + eff_chunk, lq.shape[1]))
             lb_sl = lb_buf[:, sl] if keep_on_gpu else lb_buf[:, sl].to(dev, non_blocking=True)
             lbs = F.log_softmax(lb_sl.float(), dim=-1)
             lqs = F.log_softmax(lq[:, sl].float(), dim=-1)
-            tgt_sl = targets[:, sl]
-            for name, ls in (("base", lbs), ("quant", lqs)):
-                loss = -ls.gather(-1, tgt_sl.unsqueeze(-1)).sum().item()
-                nll[name] += loss
-                d[name] += loss
-                row_nll[name] += loss
+            tgt_sl = targets[:, sl].unsqueeze(-1)
+            row_base_gpu.add_(-lbs.gather(-1, tgt_sl).sum(dtype=torch.float64))
+            row_quant_gpu.add_(-lqs.gather(-1, tgt_sl).sum(dtype=torch.float64))
             kl = F.kl_div(lqs, lbs, log_target=True, reduction="none").sum(-1).flatten()
-            n_tok = kl.numel()
-            count += n_tok
-            d["count"] += n_tok
-            tok_kls.append(kl.cpu())
-            d["kl"] += kl.sum().item()
-            d["kl_n"] += n_tok
-            row_kl_sum += kl.sum().item()
-            row_kl_n += n_tok
+            row_kl_chunks.append(kl)
             del lbs, lqs, kl
         del lb_buf, lq
+
+        row_kl_vec = torch.cat(row_kl_chunks) if len(row_kl_chunks) > 1 else row_kl_chunks[0]
+        row_kl_n = int(row_kl_vec.numel())
+        row_kl_sum = float(row_kl_vec.sum(dtype=torch.float64).item())
+        row_base_val = float(row_base_gpu.item())
+        row_quant_val = float(row_quant_gpu.item())
+
+        tok_kls.append(row_kl_vec.cpu())
+        del row_kl_chunks, row_kl_vec
+        count += row_kl_n
+        nll["base"] += row_base_val
+        nll["quant"] += row_quant_val
+        d["base"] += row_base_val
+        d["quant"] += row_quant_val
+        d["count"] += row_kl_n
+        d["kl"] += row_kl_sum
+        d["kl_n"] += row_kl_n
         row_dump.append(
             {
                 "row": i,
                 "domain": domain,
                 "tokens": row_kl_n,
                 "mean_kl": row_kl_sum / max(row_kl_n, 1),
-                "base_nll": row_nll["base"],
-                "quant_nll": row_nll["quant"],
+                "base_nll": row_base_val,
+                "quant_nll": row_quant_val,
             }
         )
 
@@ -1747,6 +1769,18 @@ def run_probe(args: argparse.Namespace) -> None:
         aggregate_weighted_kl,
         load_batches,
     )
+    from warp_quant.rco.hidden_teacher import capture_teacher_hidden_states
+
+    quant_arg = args.quant
+    quant_dirs = (
+        [Path(quant_arg).resolve()]
+        if isinstance(quant_arg, str | Path)
+        else [Path(q).resolve() for q in quant_arg]
+    )
+    if len(quant_dirs) > 1 and args.output_json and not getattr(args, "output_dir", None):
+        raise ValueError(
+            "Pass --output-dir instead of --output-json when probing multiple --quant checkpoints"
+        )
 
     hub_id, info = resolve(args.model)
     base_dir = (
@@ -1758,145 +1792,174 @@ def run_probe(args: argparse.Namespace) -> None:
     if cls_name.startswith("Qwen4Exp") or cls_name == "Qwen3_5MoeForConditionalGeneration":
         from warp_quant.streaming_moe import run_probe_qwen4_exp
 
-        return run_probe_qwen4_exp(args)
-
-    quant_dir = Path(args.quant).resolve()
-
-    log_event(
-        "ROT_PROBE_START",
-        model=args.model,
-        base=str(base_dir),
-        quant=str(quant_dir),
-        eval_sets=args.eval_sets,
-        eval_mtp=args.eval_mtp,
-    )
+        for qd in quant_dirs:
+            sub_args = copy.copy(args)
+            sub_args.quant = str(qd)
+            if getattr(args, "output_dir", None):
+                out_d = Path(args.output_dir)
+                out_d.mkdir(parents=True, exist_ok=True)
+                sub_args.output_json = str(out_d / f"probe_{qd.name}.json")
+            run_probe_qwen4_exp(sub_args)
+        return
 
     processor = AutoProcessor.from_pretrained(str(base_dir))
-    quant_model = load_quant_model_with_transforms(quant_dir, device="cuda:0")
-    torch.cuda.empty_cache()
     base_model = model_class(str(base_dir)).from_pretrained(str(base_dir), dtype="auto", device_map={"": 0})
     base_model.eval()
     torch.cuda.empty_cache()
 
-    results: dict[str, dict] = {}
-    first_batches = None
-
+    eval_batches_by_set: list[tuple[Path, list[tuple[str, torch.Tensor]], list[torch.Tensor] | None]] = []
+    cache_base_hidden = len(quant_dirs) > 1
     for eval_path_str in args.eval_sets:
         eval_path = Path(eval_path_str)
         if not eval_path.is_absolute():
             eval_path = ROOT / eval_path
         batches = load_batches(processor, str(eval_path), limit=args.limit)
-        if first_batches is None:
-            first_batches = batches
+        b_hidden = None
+        if cache_base_hidden:
+            log_event("ROT_PROBE_BASE_CACHE", eval_set=eval_path.name, rows=len(batches))
+            b_hidden = [
+                t
+                for t in capture_teacher_hidden_states(base_model, [ids for _, ids in batches])
+                if isinstance(t, torch.Tensor)
+            ]
+        eval_batches_by_set.append((eval_path, batches, b_hidden))
 
-        t0 = time.time()
-        nll, count, kls, dom, row_dump = _run_pair_low_mem(base_model, quant_model, batches)
-        elapsed_s = round(time.time() - t0, 2)
+    for quant_dir in quant_dirs:
+        log_event(
+            "ROT_PROBE_START",
+            model=args.model,
+            base=str(base_dir),
+            quant=str(quant_dir),
+            eval_sets=args.eval_sets,
+            eval_mtp=args.eval_mtp,
+        )
+        quant_model = load_quant_model_with_transforms(quant_dir, device="cuda:0")
+        torch.cuda.empty_cache()
+        results: dict[str, dict] = {}
 
-        ppl_base = math.exp(nll["base"] / count)
-        ppl_quant = math.exp(nll["quant"] / count)
-        mean_kl = kls.mean().item()
-        p999_kl = torch.quantile(kls.double(), 0.999).item()
         try:
-            weighted_kl = aggregate_weighted_kl(dom)
-        except ValueError:
-            weighted_kl = None
+            for eval_path, batches, b_hidden in eval_batches_by_set:
+                t0 = time.time()
+                nll, count, kls, dom, row_dump = _run_pair_low_mem(
+                    base_model, quant_model, batches, base_hidden_cache=b_hidden
+                )
+                elapsed_s = round(time.time() - t0, 2)
 
-        domains_summary = {
-            k: {
-                "tokens": v["kl_n"],
-                "mean_kl": round(v["kl"] / max(v["kl_n"], 1), 6),
-                "ppl_base": round(math.exp(v["base"] / max(v["count"], 1)), 4),
-                "ppl_quant": round(math.exp(v["quant"] / max(v["count"], 1)), 4),
-            }
-            for k, v in sorted(dom.items())
-        }
-        summary = {
-            "eval_set": eval_path.name,
-            "rows": len(batches),
-            "tokens": count,
-            "ppl_base": round(ppl_base, 4),
-            "ppl_quant": round(ppl_quant, 4),
-            "ppl_delta_pct": round((ppl_quant - ppl_base) / ppl_base * 100, 3),
-            "mean_kl": round(mean_kl, 6),
-            "weighted_kl": round(weighted_kl, 6) if weighted_kl is not None else None,
-            "weighted_kl_protocol": WEIGHTED_KL_PROTOCOL if weighted_kl is not None else None,
-            "p999_kl": round(p999_kl, 4),
-            "elapsed_s": elapsed_s,
-            "domains": domains_summary,
-        }
-        results[eval_path.stem] = summary
-        log_event("ROT_PROBE_SET", **summary)
-        print(json.dumps(summary, indent=2))
+                ppl_base = math.exp(nll["base"] / count)
+                ppl_quant = math.exp(nll["quant"] / count)
+                mean_kl = kls.mean().item()
+                p999_kl = torch.quantile(kls.double(), 0.999).item()
+                try:
+                    weighted_kl = aggregate_weighted_kl(dom)
+                except ValueError:
+                    weighted_kl = None
 
-        if args.dump_rows_dir:
-            dump_dir = Path(args.dump_rows_dir)
-            dump_dir.mkdir(parents=True, exist_ok=True)
-            out_rows = dump_dir / f"{eval_path.stem}_rows.jsonl"
-            with out_rows.open("w") as f:
-                for r in row_dump:
-                    f.write(json.dumps(r) + "\n")
+                domains_summary = {
+                    k: {
+                        "tokens": v["kl_n"],
+                        "mean_kl": round(v["kl"] / max(v["kl_n"], 1), 6),
+                        "ppl_base": round(math.exp(v["base"] / max(v["count"], 1)), 4),
+                        "ppl_quant": round(math.exp(v["quant"] / max(v["count"], 1)), 4),
+                    }
+                    for k, v in sorted(dom.items())
+                }
+                summary = {
+                    "eval_set": eval_path.name,
+                    "rows": len(batches),
+                    "tokens": count,
+                    "ppl_base": round(ppl_base, 4),
+                    "ppl_quant": round(ppl_quant, 4),
+                    "ppl_delta_pct": round((ppl_quant - ppl_base) / ppl_base * 100, 3),
+                    "mean_kl": round(mean_kl, 6),
+                    "weighted_kl": round(weighted_kl, 6) if weighted_kl is not None else None,
+                    "weighted_kl_protocol": WEIGHTED_KL_PROTOCOL if weighted_kl is not None else None,
+                    "p999_kl": round(p999_kl, 4),
+                    "elapsed_s": elapsed_s,
+                    "domains": domains_summary,
+                }
+                results[eval_path.stem] = summary
+                log_event("ROT_PROBE_SET", quant=quant_dir.name, **summary)
+                print(json.dumps(summary, indent=2))
 
-    if args.eval_mtp:
-        first_eval_path = Path(args.eval_sets[0])
-        if not first_eval_path.is_absolute():
-            first_eval_path = ROOT / first_eval_path
-        mtp_summary = evaluate_mtp_fidelity(
-            base_model,
-            quant_model,
-            processor,
-            base_dir,
-            quant_dir,
-            first_eval_path,
-            per_domain=args.mtp_per_domain,
-        )
-        results["mtp_fidelity"] = mtp_summary
-        log_event(
-            "ROT_PROBE_MTP",
-            isolated_mean_kl=mtp_summary["isolated"]["mean_kl"],
-            e2e_mean_kl=mtp_summary["e2e"]["mean_kl"],
-        )
-        print(json.dumps({"mtp_fidelity": mtp_summary}, indent=2))
+                if args.dump_rows_dir:
+                    base_dump = Path(args.dump_rows_dir)
+                    dump_dir = base_dump / quant_dir.name if len(quant_dirs) > 1 else base_dump
+                    dump_dir.mkdir(parents=True, exist_ok=True)
+                    out_rows = dump_dir / f"{eval_path.stem}_rows.jsonl"
+                    with out_rows.open("w") as f:
+                        for r in row_dump:
+                            f.write(json.dumps(r) + "\n")
 
-    if args.eval_vision:
-        vis_dir = Path(args.eval_vision)
-        if not vis_dir.is_absolute():
-            vis_dir = ROOT / vis_dir
-        vis_summary = evaluate_vision_fidelity(base_model, quant_model, vis_dir)
-        results["vision_fidelity"] = vis_summary
-        log_event(
-            "ROT_PROBE_VISION",
-            encoder_relative_rmse=vis_summary["encoder"]["relative_rmse"],
-            isolated_mean_kl=vis_summary["isolated"]["mean_kl"],
-            e2e_mean_kl=vis_summary["e2e"]["mean_kl"],
-        )
-        print(json.dumps({"vision_fidelity": vis_summary}, indent=2))
+            if args.eval_mtp:
+                first_eval_path = Path(args.eval_sets[0])
+                if not first_eval_path.is_absolute():
+                    first_eval_path = ROOT / first_eval_path
+                mtp_summary = evaluate_mtp_fidelity(
+                    base_model,
+                    quant_model,
+                    processor,
+                    base_dir,
+                    quant_dir,
+                    first_eval_path,
+                    per_domain=args.mtp_per_domain,
+                )
+                results["mtp_fidelity"] = mtp_summary
+                log_event(
+                    "ROT_PROBE_MTP",
+                    quant=quant_dir.name,
+                    isolated_mean_kl=mtp_summary["isolated"]["mean_kl"],
+                    e2e_mean_kl=mtp_summary["e2e"]["mean_kl"],
+                )
+                print(json.dumps({"mtp_fidelity": mtp_summary}, indent=2))
 
-    if getattr(args, "eval_vision_guard", None):
-        guard_dir = Path(args.eval_vision_guard)
-        if not guard_dir.is_absolute():
-            guard_dir = ROOT / guard_dir
-        guard_manifest = json.loads((guard_dir / "manifest.json").read_text())
-        if not guard_manifest.get("guard", False):
-            raise ValueError(
-                f"Refusing to run Vision guard on non-guard fixture: {guard_dir} (guard={guard_manifest.get('guard')})"
-            )
-        guard_summary = evaluate_vision_fidelity(base_model, quant_model, guard_dir)
-        results["vision_guard_fidelity"] = guard_summary
-        log_event(
-            "ROT_PROBE_VISION_GUARD",
-            encoder_relative_rmse=guard_summary["encoder"]["relative_rmse"],
-            isolated_mean_kl=guard_summary["isolated"]["mean_kl"],
-            e2e_mean_kl=guard_summary["e2e"]["mean_kl"],
-        )
-        print(json.dumps({"vision_guard_fidelity": guard_summary}, indent=2))
+            if args.eval_vision:
+                vis_dir = Path(args.eval_vision)
+                if not vis_dir.is_absolute():
+                    vis_dir = ROOT / vis_dir
+                vis_summary = evaluate_vision_fidelity(base_model, quant_model, vis_dir)
+                results["vision_fidelity"] = vis_summary
+                log_event(
+                    "ROT_PROBE_VISION",
+                    quant=quant_dir.name,
+                    encoder_relative_rmse=vis_summary["encoder"]["relative_rmse"],
+                    isolated_mean_kl=vis_summary["isolated"]["mean_kl"],
+                    e2e_mean_kl=vis_summary["e2e"]["mean_kl"],
+                )
+                print(json.dumps({"vision_fidelity": vis_summary}, indent=2))
 
-    if args.output_json:
-        out_p = Path(args.output_json)
-        out_p.parent.mkdir(parents=True, exist_ok=True)
-        out_p.write_text(json.dumps(results, indent=2) + "\n")
+            if getattr(args, "eval_vision_guard", None):
+                guard_dir = Path(args.eval_vision_guard)
+                if not guard_dir.is_absolute():
+                    guard_dir = ROOT / guard_dir
+                guard_manifest = json.loads((guard_dir / "manifest.json").read_text())
+                if not guard_manifest.get("guard", False):
+                    raise ValueError(
+                        f"Refusing to run Vision guard on non-guard fixture: {guard_dir} (guard={guard_manifest.get('guard')})"
+                    )
+                guard_summary = evaluate_vision_fidelity(base_model, quant_model, guard_dir)
+                results["vision_guard_fidelity"] = guard_summary
+                log_event(
+                    "ROT_PROBE_VISION_GUARD",
+                    quant=quant_dir.name,
+                    encoder_relative_rmse=guard_summary["encoder"]["relative_rmse"],
+                    isolated_mean_kl=guard_summary["isolated"]["mean_kl"],
+                    e2e_mean_kl=guard_summary["e2e"]["mean_kl"],
+                )
+                print(json.dumps({"vision_guard_fidelity": guard_summary}, indent=2))
 
-    run_done(quant=str(quant_dir))
+            if getattr(args, "output_dir", None):
+                out_d = Path(args.output_dir)
+                out_d.mkdir(parents=True, exist_ok=True)
+                (out_d / f"probe_{quant_dir.name}.json").write_text(json.dumps(results, indent=2) + "\n")
+            elif args.output_json:
+                out_p = Path(args.output_json)
+                out_p.parent.mkdir(parents=True, exist_ok=True)
+                out_p.write_text(json.dumps(results, indent=2) + "\n")
+
+            run_done(quant=str(quant_dir))
+        finally:
+            del quant_model
+            torch.cuda.empty_cache()
 
 
 def main() -> None:

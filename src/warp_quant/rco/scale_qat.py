@@ -68,7 +68,7 @@ class _FP32MasterBF16Weight(nn.Module):
 
 def run_e2e_scale_qat(
     student_model: nn.Module,
-    teacher_model: nn.Module,
+    teacher_model: nn.Module | None,
     manifest: dict,
     candidates: dict[str, list[dict]],
     choices: list[int] | tuple[int, ...],
@@ -76,6 +76,7 @@ def run_e2e_scale_qat(
     val_rows: list[torch.Tensor],
     val_teacher_states: list[torch.Tensor],
     *,
+    train_teacher_states: list[torch.Tensor] | None = None,
     num_epochs: int = 2,
     batch_size: int = 4,
     lr: float = 1.5e-4,
@@ -89,14 +90,25 @@ def run_e2e_scale_qat(
     """Tune continuous BF16 weight_scale (for <= train_scales_max_bits) and FP32-master RMSNorm/GDN-gate tensors."""
     if not train_rows:
         raise ValueError("train_rows must be non-empty")
+    if teacher_model is None and train_teacher_states is None:
+        raise ValueError("Either teacher_model or train_teacher_states must be provided")
+    if train_teacher_states is not None and len(train_teacher_states) < len(train_rows):
+        raise ValueError(
+            f"train_teacher_states length {len(train_teacher_states)} < train_rows length {len(train_rows)}"
+        )
     device = next(student_model.parameters()).device
     student_model.eval()
     student_model.requires_grad_(False)
-    teacher_model.eval()
-    teacher_model.requires_grad_(False)
+    if teacher_model is not None:
+        teacher_model.eval()
+        teacher_model.requires_grad_(False)
 
     s_text, _ = get_text_model(student_model)
-    t_text, _ = get_text_model(teacher_model)
+    t_text = get_text_model(teacher_model)[0] if teacher_model is not None else None
+    high_vram = device.type == "cuda" and torch.cuda.mem_get_info(device)[0] > 40 * (1024**3)
+    kl_chunk_size = 512 if high_vram else 128
+    # Always checkpoint hidden_kl chunks during backward: vocab=248,320 would otherwise retain ~24 GiB per 2k seq
+    kl_checkpointed = True
     groups = manifest["groups"]
     had_block_size = int(manifest.get("hadamard_block_size", 64))
     had_hooks = attach_online_hadamard_hooks(student_model, groups, had_block_size)
@@ -154,13 +166,42 @@ def run_e2e_scale_qat(
 
     @torch.no_grad()
     def eval_val_kl() -> float:
+        n_val = min(len(val_rows), len(val_teacher_states))
+        if n_val == 0:
+            return 0.0
         kls = []
-        for idx in range(min(len(val_rows), len(val_teacher_states))):
-            inp = val_rows[idx].to(device=device, dtype=torch.long).unsqueeze(0)
-            h_s = s_text(input_ids=inp, use_cache=False, return_dict=True).last_hidden_state
-            kl = hidden_kl(h_s, val_teacher_states[idx], student_model.lm_head, checkpointed=False)
-            kls.append(float(kl.item()))
-        return sum(kls) / max(len(kls), 1)
+        val_bsz = 8 if high_vram else 1
+        for b0 in range(0, n_val, val_bsz):
+            b_idxs = list(range(b0, min(b0 + val_bsz, n_val)))
+            if len(b_idxs) == 1:
+                i0 = b_idxs[0]
+                inp = val_rows[i0].to(device=device, dtype=torch.long).unsqueeze(0)
+                h_s = s_text(input_ids=inp, use_cache=False, return_dict=True).last_hidden_state
+                kl = hidden_kl(
+                    h_s,
+                    val_teacher_states[i0],
+                    student_model.lm_head,
+                    token_chunk_size=kl_chunk_size,
+                    checkpointed=False,
+                )
+                kls.append(float(kl.item()))
+            else:
+                lens = [int(val_rows[i].numel()) for i in b_idxs]
+                s_max = max(lens)
+                inp = torch.zeros((len(b_idxs), s_max), dtype=torch.long, device=device)
+                for loc_i, r_i in enumerate(b_idxs):
+                    inp[loc_i, : lens[loc_i]] = val_rows[r_i].to(device=device, dtype=torch.long)
+                h_batch = s_text(input_ids=inp, use_cache=False, return_dict=True).last_hidden_state
+                for loc_i, r_i in enumerate(b_idxs):
+                    kl = hidden_kl(
+                        h_batch[loc_i : loc_i + 1, : lens[loc_i]],
+                        val_teacher_states[r_i],
+                        student_model.lm_head,
+                        token_chunk_size=kl_chunk_size,
+                        checkpointed=False,
+                    )
+                    kls.append(float(kl.item()))
+        return sum(kls) / len(kls)
 
     try:
         init_val_kl = eval_val_kl()
@@ -217,17 +258,71 @@ def run_e2e_scale_qat(
                     pg["lr"] = pg["base_lr"] * lr_mult
 
                 optimizer.zero_grad()
-                b_loss = 0.0
-                for idx in batch_indices:
-                    inp = train_rows[idx].to(device=device, dtype=torch.long).unsqueeze(0)
-                    with torch.no_grad():
-                        h_t = t_text(
-                            input_ids=inp, use_cache=False, return_dict=True
-                        ).last_hidden_state.detach()
-                    h_s = s_text(input_ids=inp, use_cache=False, return_dict=True).last_hidden_state
-                    loss = hidden_kl(h_s, h_t, student_model.lm_head, checkpointed=True) / len(batch_indices)
-                    loss.backward()
-                    b_loss += float(loss.item())
+                if high_vram and len(batch_indices) > 1:
+                    b_loss = 0.0
+                    micro_bsz = 2
+                    for m0 in range(0, len(batch_indices), micro_bsz):
+                        m_indices = batch_indices[m0 : m0 + micro_bsz]
+                        lens = [int(train_rows[idx].numel()) for idx in m_indices]
+                        s_max = max(lens)
+                        inp_batch = torch.zeros((len(m_indices), s_max), dtype=torch.long, device=device)
+                        for loc_i, idx in enumerate(m_indices):
+                            inp_batch[loc_i, : lens[loc_i]] = train_rows[idx].to(
+                                device=device, dtype=torch.long
+                            )
+                        if train_teacher_states is None:
+                            assert t_text is not None
+                            with torch.no_grad():
+                                h_t_batch = t_text(
+                                    input_ids=inp_batch, use_cache=False, return_dict=True
+                                ).last_hidden_state.detach()
+                        else:
+                            h_t_batch = None
+                        h_s_batch = s_text(
+                            input_ids=inp_batch, use_cache=False, return_dict=True
+                        ).last_hidden_state
+                        micro_losses = []
+                        for loc_i, idx in enumerate(m_indices):
+                            rl = lens[loc_i]
+                            h_t_i = (
+                                train_teacher_states[idx]
+                                if train_teacher_states is not None
+                                else h_t_batch[loc_i : loc_i + 1, :rl]
+                            )
+                            micro_losses.append(
+                                hidden_kl(
+                                    h_s_batch[loc_i : loc_i + 1, :rl],
+                                    h_t_i,
+                                    student_model.lm_head,
+                                    token_chunk_size=kl_chunk_size,
+                                    checkpointed=kl_checkpointed,
+                                )
+                            )
+                        micro_loss = torch.stack(micro_losses).sum() / len(batch_indices)
+                        micro_loss.backward()
+                        b_loss += float(micro_loss.item())
+                else:
+                    b_loss = 0.0
+                    for idx in batch_indices:
+                        inp = train_rows[idx].to(device=device, dtype=torch.long).unsqueeze(0)
+                        if train_teacher_states is not None:
+                            h_t = train_teacher_states[idx]
+                        else:
+                            assert t_text is not None
+                            with torch.no_grad():
+                                h_t = t_text(
+                                    input_ids=inp, use_cache=False, return_dict=True
+                                ).last_hidden_state.detach()
+                        h_s = s_text(input_ids=inp, use_cache=False, return_dict=True).last_hidden_state
+                        loss = hidden_kl(
+                            h_s,
+                            h_t,
+                            student_model.lm_head,
+                            token_chunk_size=kl_chunk_size,
+                            checkpointed=kl_checkpointed,
+                        ) / len(batch_indices)
+                        loss.backward()
+                        b_loss += float(loss.item())
 
                 torch.nn.utils.clip_grad_norm_(scale_params + bf16_params, 1.0)
                 optimizer.step()

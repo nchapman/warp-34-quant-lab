@@ -67,8 +67,10 @@ def capture_teacher_hidden_states(
     model: nn.Module,
     search_rows: list[torch.Tensor],
     cache_dir: Path | None = None,
+    *,
+    max_batch_tokens: int = 16384,
 ) -> list[torch.Tensor | Path]:
-    """Capture post-final-norm BF16 hidden states [1, S, hidden] for search_rows."""
+    """Capture post-final-norm BF16 hidden states [1, S, hidden] for search_rows, batching equal-length rows."""
     if model.training:
         raise ValueError("teacher capture requires eval mode")
     device = next(model.parameters()).device
@@ -80,23 +82,56 @@ def capture_teacher_hidden_states(
     if cache_dir is not None:
         cache_dir = Path(cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
-    saved: list[torch.Tensor | Path] = []
+
+    norm_rows: list[torch.Tensor] = []
     for idx, ids in enumerate(search_rows):
-        inp = ids.to(device=device, dtype=torch.long)
-        if inp.ndim == 1:
-            inp = inp.unsqueeze(0)
-        hidden = (
+        row = ids.squeeze(0) if ids.ndim == 2 and ids.shape[0] == 1 else ids
+        if row.ndim != 1:
+            raise ValueError(f"Expected 1D or [1, S] token tensor on row {idx}, got {tuple(ids.shape)}")
+        norm_rows.append(row)
+
+    saved: list[torch.Tensor | Path | None] = [None] * len(search_rows)
+    can_batch = device.type == "cuda" and torch.cuda.mem_get_info(device)[0] > 32 * (1024**3)
+    order = sorted(range(len(norm_rows)), key=lambda i: int(norm_rows[i].numel()))
+
+    pos = 0
+    while pos < len(order):
+        if not can_batch:
+            chunk_idxs = [order[pos]]
+            pos += 1
+        else:
+            chunk_idxs = []
+            max_len_in_chunk = 0
+            while pos < len(order):
+                cand_len = int(norm_rows[order[pos]].numel())
+                new_max = max(max_len_in_chunk, cand_len)
+                if chunk_idxs and (len(chunk_idxs) + 1) * new_max > max_batch_tokens:
+                    break
+                chunk_idxs.append(order[pos])
+                max_len_in_chunk = new_max
+                pos += 1
+
+        s_max = max(int(norm_rows[i].numel()) for i in chunk_idxs)
+        inp = torch.zeros((len(chunk_idxs), s_max), dtype=torch.long, device=device)
+        for local_i, orig_idx in enumerate(chunk_idxs):
+            r = norm_rows[orig_idx]
+            inp[local_i, : r.numel()] = r.to(device=device, dtype=torch.long)
+
+        h_batch = (
             lm(input_ids=inp, use_cache=False, return_dict=True)
             .last_hidden_state.detach()
             .to(torch.bfloat16)
             .cpu()
         )
-        if not torch.isfinite(hidden).all():
-            raise ValueError(f"Non-finite teacher hidden state on search row {idx}")
-        if cache_dir is not None:
-            p = cache_dir / f"row_{idx:04d}.pt"
-            torch.save(hidden, p)
-            saved.append(p)
-        else:
-            saved.append(hidden)
-    return saved
+        for local_i, orig_idx in enumerate(chunk_idxs):
+            r_len = int(norm_rows[orig_idx].numel())
+            hidden = h_batch[local_i : local_i + 1, :r_len].contiguous()
+            if not torch.isfinite(hidden).all():
+                raise ValueError(f"Non-finite teacher hidden state on search row {orig_idx}")
+            if cache_dir is not None:
+                p = cache_dir / f"row_{orig_idx:04d}.pt"
+                torch.save(hidden, p)
+                saved[orig_idx] = p
+            else:
+                saved[orig_idx] = hidden
+    return [x for x in saved if x is not None]

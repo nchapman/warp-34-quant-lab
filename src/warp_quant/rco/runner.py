@@ -103,6 +103,7 @@ def run_rco_search_on_bank(
     lr: float = 0.1,
     seed: int = 42,
     teacher_states: list[torch.Tensor] | None = None,
+    kl_chunk_size: int = 128,
 ) -> dict:
     """Run Riemannian KL search for each budget fraction in `budgets` against `bank_dir`."""
     if not search_rows:
@@ -145,8 +146,10 @@ def run_rco_search_on_bank(
     }
 
     had_hooks = attach_online_hadamard_hooks(model, groups, hadamard_block_size)
-    # Only wrap decoder layers in activation checkpointing on large models (>14B) where activations need it
-    use_layer_ckpt = int(manifest["all_high_bytes"]) > 6 * (1024**3)
+    # Only wrap decoder layers in activation checkpointing when VRAM is tight; always checkpoint hidden_kl vocab chunks
+    high_vram = device.type == "cuda" and torch.cuda.mem_get_info(device)[0] > 48 * (1024**3)
+    use_layer_ckpt = (not high_vram) and int(manifest["all_high_bytes"]) > 6 * (1024**3)
+    kl_ckpt = True
     restore_ckpt = _enable_eval_layer_checkpointing(text_model) if use_layer_ckpt else (lambda: None)
     try:
         with SearchModel(model, group_members, candidates, costs) as search:
@@ -154,13 +157,29 @@ def run_rco_search_on_bank(
             @torch.no_grad()
             def eval_allocation_kl(choices: tuple[int, ...] | list[int], max_eval_rows: int = 32) -> float:
                 search.set_assignment(choices, soft=None)
+                n_ev = min(len(search_rows), max_eval_rows)
+                if n_ev == 0:
+                    return 0.0
                 kls = []
-                for idx in range(min(len(search_rows), max_eval_rows)):
-                    inp = search_rows[idx].to(device=device, dtype=torch.long).unsqueeze(0)
-                    student_h = text_model(input_ids=inp, use_cache=False, return_dict=True).last_hidden_state
-                    kl_val = hidden_kl(student_h, teacher_states[idx], model.lm_head, checkpointed=False)
-                    kls.append(float(kl_val.item()))
-                return sum(kls) / max(len(kls), 1)
+                ev_bsz = 8 if high_vram else 1
+                for b0 in range(0, n_ev, ev_bsz):
+                    b_idxs = list(range(b0, min(b0 + ev_bsz, n_ev)))
+                    lens = [int(search_rows[i].numel()) for i in b_idxs]
+                    s_max = max(lens)
+                    inp = torch.zeros((len(b_idxs), s_max), dtype=torch.long, device=device)
+                    for loc_i, r_i in enumerate(b_idxs):
+                        inp[loc_i, : lens[loc_i]] = search_rows[r_i].to(device=device, dtype=torch.long)
+                    h_batch = text_model(input_ids=inp, use_cache=False, return_dict=True).last_hidden_state
+                    for loc_i, r_i in enumerate(b_idxs):
+                        kl_val = hidden_kl(
+                            h_batch[loc_i : loc_i + 1, : lens[loc_i]],
+                            teacher_states[r_i],
+                            model.lm_head,
+                            token_chunk_size=kl_chunk_size,
+                            checkpointed=False,
+                        )
+                        kls.append(float(kl_val.item()))
+                return sum(kls) / len(kls)
 
             low_kl = eval_allocation_kl(allocations_out["all_low"]["choices"])
             high_kl = eval_allocation_kl(allocations_out["all_high"]["choices"])
@@ -200,7 +219,13 @@ def run_rco_search_on_bank(
                     student_h = text_model(
                         inputs_embeds=emb, use_cache=False, return_dict=True
                     ).last_hidden_state
-                    return hidden_kl(student_h, teacher_states[row_i], model.lm_head, checkpointed=True)
+                    return hidden_kl(
+                        student_h,
+                        teacher_states[row_i],
+                        model.lm_head,
+                        token_chunk_size=kl_chunk_size,
+                        checkpointed=kl_ckpt,
+                    )
 
                 def _on_step(rec: dict, _tag: str = tag):
                     if rec["step"] == 0 or (rec["step"] + 1) % 20 == 0 or rec["step"] + 1 == steps:
@@ -396,6 +421,32 @@ def run_rco_cli(args: argparse.Namespace) -> None:
         model = cls.from_pretrained(str(base_dir), dtype=torch.bfloat16, device_map={"": device})
         model.eval()
 
+    qat_teacher_states: list[torch.Tensor] | None = None
+    if getattr(args, "scale_qat", False) and qat_train_rows:
+        qat_cache_file = work_dir / "qat_teacher_states.pt"
+        if qat_cache_file.is_file():
+            log_event("RCO_QAT_TEACHER_CACHE_HIT", path=str(qat_cache_file))
+            qat_teacher_states = torch.load(qat_cache_file, map_location="cpu", weights_only=True)
+        else:
+            log_event("RCO_QAT_TEACHER_CAPTURE", rows=len(qat_train_rows))
+            qat_teacher_states = [
+                t for t in capture_teacher_hidden_states(model, qat_train_rows) if isinstance(t, torch.Tensor)
+            ]
+            torch.save(qat_teacher_states, qat_cache_file)
+
+    clean_bf16_backup: dict[str, torch.Tensor] = {}
+    if getattr(args, "scale_qat", False):
+        text_m_ref, text_pref = get_text_model(model)
+        for sub_name, sub_mod in text_m_ref.named_modules():
+            w = getattr(sub_mod, "weight", None)
+            if not isinstance(w, nn.Parameter):
+                continue
+            leaf = sub_name.rsplit(".", 1)[-1]
+            if "norm" in leaf.lower() or leaf in ("in_proj_a", "in_proj_b"):
+                clean_bf16_backup[f"{text_pref}.{sub_name}.weight"] = (
+                    w.detach().to(torch.bfloat16).cpu().clone()
+                )
+
     active_bank_dir = bank_dir
     if getattr(args, "scale_qat", False):
         import shutil
@@ -405,16 +456,16 @@ def run_rco_cli(args: argparse.Namespace) -> None:
         if low_state_file.is_file():
             low_qat = torch.load(low_state_file, map_location="cpu", weights_only=True)
         else:
-            teacher_model = cls.from_pretrained(str(base_dir), dtype=torch.bfloat16, device_map={"": device})
             low_qat = run_e2e_scale_qat(
                 model,
-                teacher_model,
+                None,
                 manifest,
                 candidates,
                 [0] * len(manifest["groups"]),
                 train_rows=qat_train_rows,
                 val_rows=search_rows[:32],
                 val_teacher_states=teacher_states[:32],
+                train_teacher_states=qat_teacher_states,
                 num_epochs=1,
                 batch_size=4,
                 lr=1.2e-4,
@@ -425,9 +476,6 @@ def run_rco_cli(args: argparse.Namespace) -> None:
                 train_gdn_gates=True,
                 seed=args.seed,
             )
-            del teacher_model
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
             torch.save(low_qat, low_state_file)
 
         active_bank_dir = work_dir / "bank_opt"
@@ -454,6 +502,9 @@ def run_rco_cli(args: argparse.Namespace) -> None:
                     mod = model.get_submodule(full_k[:-7])
                     mod.weight.copy_(new_w.to(device=mod.weight.device, dtype=mod.weight.dtype))
 
+    high_kl_chunk = (
+        1024 if (torch.cuda.is_available() and torch.cuda.mem_get_info(device)[0] > 40 * (1024**3)) else 128
+    )
     if (active_bank_dir / "allocations.json").is_file():
         allocations = json.loads((active_bank_dir / "allocations.json").read_text())
     else:
@@ -467,15 +518,18 @@ def run_rco_cli(args: argparse.Namespace) -> None:
             lr=args.lr,
             seed=args.seed,
             teacher_states=teacher_states,
+            kl_chunk_size=high_kl_chunk,
         )
-
-    del model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
     if args.assemble:
         to_assemble = args.assemble if "all" not in args.assemble else list(allocations.keys())
         manifest, opt_candidates = load_rco_bank(active_bank_dir)
+        low_st_cached = (
+            torch.load(work_dir / "all_low_scale_qat_state.pt", map_location="cpu", weights_only=True)
+            if (work_dir / "all_low_scale_qat_state.pt").is_file()
+            else None
+        )
+
         for name in to_assemble:
             if name not in allocations:
                 raise ValueError(f"Unknown allocation '{name}'; available: {sorted(allocations)}")
@@ -488,36 +542,36 @@ def run_rco_cli(args: argparse.Namespace) -> None:
             bf16_overrides = None
             if getattr(args, "scale_qat", False) and not name.endswith("_sensitivity"):
                 state_file = work_dir / f"{name}_scale_qat_state.pt"
-                if state_file.is_file():
+                if name == "all_low" and low_st_cached is not None:
+                    st = low_st_cached
+                elif state_file.is_file():
                     st = torch.load(state_file, map_location="cpu", weights_only=True)
                 else:
-                    student_m = cls.from_pretrained(
-                        str(base_dir), dtype=torch.bfloat16, device_map={"": device}
-                    )
                     is_all_high = name == "all_high"
-                    if not is_all_high and (work_dir / "all_low_scale_qat_state.pt").is_file():
-                        low_st = torch.load(
-                            work_dir / "all_low_scale_qat_state.pt", map_location="cpu", weights_only=True
-                        )
-                        with torch.no_grad():
-                            for full_k, new_w in low_st["bf16_overrides"].items():
+                    with torch.no_grad():
+                        for full_k, orig_w in clean_bf16_backup.items():
+                            mod = model.get_submodule(full_k[:-7])
+                            mod.weight.copy_(orig_w.to(device=mod.weight.device, dtype=mod.weight.dtype))
+                        if not is_all_high and low_st_cached is not None:
+                            for full_k, new_w in low_st_cached["bf16_overrides"].items():
                                 if full_k.endswith(".weight"):
-                                    mod = student_m.get_submodule(full_k[:-7])
+                                    mod = model.get_submodule(full_k[:-7])
                                     mod.weight.copy_(
                                         new_w.to(device=mod.weight.device, dtype=mod.weight.dtype)
                                     )
-                    teacher_m = cls.from_pretrained(
-                        str(base_dir), dtype=torch.bfloat16, device_map={"": device}
-                    )
+                    n_qat = 512 if is_all_high else 384
                     st = run_e2e_scale_qat(
-                        student_m,
-                        teacher_m,
+                        model,
+                        None,
                         manifest,
                         opt_candidates,
                         allocations[name]["choices"],
-                        train_rows=qat_train_rows[: (512 if is_all_high else 384)],
+                        train_rows=qat_train_rows[:n_qat],
                         val_rows=search_rows[:32],
                         val_teacher_states=teacher_states[:32],
+                        train_teacher_states=(
+                            qat_teacher_states[:n_qat] if qat_teacher_states is not None else None
+                        ),
                         num_epochs=1,
                         batch_size=4,
                         lr=0.0 if is_all_high else 8e-5,
@@ -528,9 +582,6 @@ def run_rco_cli(args: argparse.Namespace) -> None:
                         train_gdn_gates=not is_all_high,
                         seed=args.seed,
                     )
-                    del student_m, teacher_m
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
                     torch.save(st, state_file)
                 scale_overrides = st["scale_overrides"]
                 bf16_overrides = st["bf16_overrides"]
@@ -550,3 +601,7 @@ def run_rco_cli(args: argparse.Namespace) -> None:
                 component_group_size=64,
             )
             print(f"[ok] assembled {out_ckpt}")
+
+    del model, qat_teacher_states
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()

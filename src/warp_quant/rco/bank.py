@@ -164,7 +164,7 @@ def build_rco_bank(
                 mod = model.get_submodule(member_name)
                 mod.weight.data = _hadamard_rotate_weight(mod.weight.data, hadamard_block_size)
 
-    # 2. Precompute initial token embeddings on CPU
+    # 2. Precompute initial token embeddings (keep resident in VRAM when ample HBM is free)
     hidden_rows: list[torch.Tensor] = []
     total_tokens = 0
     for ids in calib_rows:
@@ -180,17 +180,68 @@ def build_rco_bank(
     if not hidden_rows:
         raise ValueError("No valid calibration sequences with length >= 2")
 
-    # Cache rotary embeddings per sequence length
-    rotary_cache: dict[int, tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]] = {}
+    hidden_bytes = sum(t.numel() * t.element_size() for t in hidden_rows)
+    keep_hidden_on_gpu = str(device).startswith("cuda") and torch.cuda.mem_get_info(device)[
+        0
+    ] > hidden_bytes + 28 * (1024**3)
+    if keep_hidden_on_gpu:
+        hidden_rows = [t.to(device=device, non_blocking=True) for t in hidden_rows]
 
-    def _get_pos(seq_len: int, hidden_sample: torch.Tensor):
-        cached = rotary_cache.get(seq_len)
+    # Length-sorted right-padded causal batching on high-VRAM GPUs (0.0 numerical drift on causal layers)
+    row_lens = [int(t.shape[1]) for t in hidden_rows]
+    max_batch_tokens = 49152 if keep_hidden_on_gpu else 0
+    batch_groups: list[list[int]] = []
+    if max_batch_tokens <= 0:
+        batch_groups = [[i] for i in range(len(hidden_rows))]
+    else:
+        sorted_idxs = sorted(range(len(hidden_rows)), key=lambda i: row_lens[i])
+        pos = 0
+        while pos < len(sorted_idxs):
+            grp_idxs: list[int] = []
+            max_l = 0
+            while pos < len(sorted_idxs):
+                cand_l = row_lens[sorted_idxs[pos]]
+                new_max = max(max_l, cand_l)
+                if grp_idxs and (len(grp_idxs) + 1) * new_max > max_batch_tokens:
+                    break
+                grp_idxs.append(sorted_idxs[pos])
+                max_l = new_max
+                pos += 1
+            batch_groups.append(grp_idxs)
+
+    active_batch_ctx: dict[str, torch.Tensor | int | None] = {"mask": None, "bsz": 1}
+
+    def _pack_batch(b_idxs: list[int]) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if len(b_idxs) == 1:
+            return hidden_rows[b_idxs[0]].to(device=device, non_blocking=True), None
+        lens = [row_lens[i] for i in b_idxs]
+        s_max = max(lens)
+        if min(lens) == s_max:
+            return (
+                torch.cat([hidden_rows[i].to(device=device, non_blocking=True) for i in b_idxs], dim=0),
+                None,
+            )
+        h_dim = hidden_rows[b_idxs[0]].shape[-1]
+        h_pad = torch.zeros((len(b_idxs), s_max, h_dim), dtype=torch.bfloat16, device=device)
+        mask = torch.zeros((len(b_idxs), s_max), dtype=torch.bool, device=device)
+        for local_i, r_idx in enumerate(b_idxs):
+            rl = lens[local_i]
+            h_pad[local_i, :rl] = hidden_rows[r_idx][0].to(device=device, non_blocking=True)
+            mask[local_i, :rl] = True
+        return h_pad, mask
+
+    # Cache rotary embeddings per (sequence length, batch size)
+    rotary_cache: dict[tuple[int, int], tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]] = {}
+
+    def _get_pos(seq_len: int, bsz: int, hidden_sample: torch.Tensor):
+        key = (seq_len, bsz)
+        cached = rotary_cache.get(key)
         if cached is None:
-            pos_3d = torch.arange(seq_len, device=device).view(1, 1, -1).expand(3, 1, -1)
-            text_pos = torch.arange(seq_len, device=device).view(1, -1)
+            pos_3d = torch.arange(seq_len, device=device).view(1, 1, -1).expand(3, bsz, -1)
+            text_pos = torch.arange(seq_len, device=device).view(1, -1).expand(bsz, -1)
             pos_emb = text_model.rotary_emb(hidden_sample, pos_3d)
             cached = (pos_emb, text_pos)
-            rotary_cache[seq_len] = cached
+            rotary_cache[key] = cached
         return cached
 
     had_hooks = attach_online_hadamard_hooks(model, groups, hadamard_block_size)
@@ -224,16 +275,24 @@ def build_rco_bank(
                     ):
                         def _hook(_module, args):
                             with torch.amp.autocast("cuda", enabled=False):
-                                accumulate_hessian(args[0], ref, h_map[key], n_map[key])
+                                vmask = active_batch_ctx["mask"]
+                                if vmask is None:
+                                    accumulate_hessian(args[0], ref, h_map[key], n_map[key])
+                                else:
+                                    x_valid = args[0][vmask].to(device=h_map[key].device, dtype=torch.float32)
+                                    h_map[key].addmm_(x_valid.T, x_valid, beta=1.0, alpha=2.0)
+                                    n_map[key].add_(int(active_batch_ctx["bsz"]))
 
                         return _hook
 
                     stage_hooks.append(mod.register_forward_pre_hook(_make_accum_hook(m_name, mod)))
 
                 try:
-                    for h_cpu in hidden_rows:
-                        h_in = h_cpu.to(device=device, non_blocking=True)
-                        pos_emb, text_pos = _get_pos(h_in.shape[1], h_in)
+                    for b_idxs in batch_groups:
+                        h_in, vmask = _pack_batch(b_idxs)
+                        active_batch_ctx["mask"] = vmask
+                        active_batch_ctx["bsz"] = len(b_idxs)
+                        pos_emb, text_pos = _get_pos(h_in.shape[1], h_in.shape[0], h_in)
                         _ = layer(
                             h_in,
                             position_embeddings=pos_emb,
@@ -243,6 +302,7 @@ def build_rco_bank(
                             use_cache=False,
                         )
                 finally:
+                    active_batch_ctx["mask"] = None
                     for h in stage_hooks:
                         h.remove()
 
@@ -296,9 +356,10 @@ def build_rco_bank(
                     group_costs[grp["group_idx"]] = tuple(g_costs)
 
             # Propagate hidden states through the completed quantized block to feed layer_idx + 1
-            for row_idx, h_cpu in enumerate(hidden_rows):
-                h_in = h_cpu.to(device=device, non_blocking=True)
-                pos_emb, text_pos = _get_pos(h_in.shape[1], h_in)
+            out_dev = device if keep_hidden_on_gpu else torch.device("cpu")
+            for b_idxs in batch_groups:
+                h_in, _ = _pack_batch(b_idxs)
+                pos_emb, text_pos = _get_pos(h_in.shape[1], h_in.shape[0], h_in)
                 h_out = layer(
                     h_in,
                     position_embeddings=pos_emb,
@@ -309,10 +370,13 @@ def build_rco_bank(
                 )
                 if isinstance(h_out, tuple):
                     h_out = h_out[0]
-                hidden_rows[row_idx] = h_out.detach().to(torch.bfloat16).cpu()
+                h_out_cast = h_out.detach().to(dtype=torch.bfloat16, device=out_dev)
+                for local_i, row_idx in enumerate(b_idxs):
+                    rl = row_lens[row_idx]
+                    hidden_rows[row_idx] = h_out_cast[local_i : local_i + 1, :rl].contiguous()
 
             torch.save(layer_bundle, layers_dir / f"layer_{layer_idx:03d}.pt")
-            if str(device).startswith("cuda"):
+            if str(device).startswith("cuda") and not keep_hidden_on_gpu:
                 torch.cuda.empty_cache()
             log_event(
                 "RCO_BANK_LAYER",

@@ -11,6 +11,12 @@ set -euo pipefail
 PYTHON="${PYTHON:-.venv/bin/python}"
 export MAX_JOBS="${MAX_JOBS:-8}"
 export NVCC_THREADS="${NVCC_THREADS:-2}"
+if [[ -z "${CUDA_HOME:-}" && -d /usr/local/cuda ]]; then
+    export CUDA_HOME="/usr/local/cuda"
+fi
+if [[ -n "${CUDA_HOME:-}" && -d "${CUDA_HOME}/bin" ]]; then
+    export PATH="${CUDA_HOME}/bin:${PATH}"
+fi
 
 uv pip install --python "$PYTHON" "flash-linear-attention==0.6.0" "fla-core==0.6.0" "ninja>=1.11" "packaging>=24"
 

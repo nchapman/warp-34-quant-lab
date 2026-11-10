@@ -310,3 +310,72 @@ def test_refine_hessian_cd_3d_matches_2d_and_pack_tensor_channel() -> None:
     )
     assert packed_fc2["weight_packed"].shape == (32, 10)
     assert packed_fc2["weight_scale"].shape == (32, 1)
+
+
+def test_scale_qat_with_cached_teacher_states_and_multi_quant_cli(tmp_path) -> None:
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
+
+    from warp_quant.rco.bank import build_rco_bank, load_rco_bank
+    from warp_quant.rco.hidden_teacher import capture_teacher_hidden_states
+    from warp_quant.rco.scale_qat import run_e2e_scale_qat
+
+    torch.manual_seed(11)
+    cfg = Qwen3_5Config(
+        text_config={
+            "vocab_size": 128,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 1,
+            "layer_types": ["full_attention"],
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "rms_norm_eps": 1e-6,
+            "rope_parameters": {
+                "rope_theta": 10000.0,
+                "partial_rotary_factor": 0.5,
+                "mrope_section": [2, 1, 1],
+            },
+        }
+    )
+    teacher = Qwen3_5ForConditionalGeneration(cfg).to(torch.bfloat16).eval()
+    student = Qwen3_5ForConditionalGeneration(cfg).to(torch.bfloat16).eval()
+    student.load_state_dict(teacher.state_dict())
+
+    rows = [
+        torch.randint(2, 120, (12,), dtype=torch.long),
+        torch.randint(2, 120, (20,), dtype=torch.long),
+    ]
+    cached_t = [t for t in capture_teacher_hidden_states(teacher, rows) if isinstance(t, torch.Tensor)]
+    assert len(cached_t) == 2 and cached_t[0].shape == (1, 12, 64) and cached_t[1].shape == (1, 20, 64)
+
+    bank_dir = tmp_path / "bank"
+    build_rco_bank(
+        teacher,
+        rows,
+        ["w2_g64", "w4_g64"],
+        bank_dir,
+        hadamard_block_size=64,
+        rotate_weights_in_place=True,
+    )
+    manifest, cands = load_rco_bank(bank_dir)
+    assert manifest["calib_rows"] == 2
+    assert manifest["calib_tokens"] == 32
+    assert len(manifest["groups"]) == 4
+
+    res = run_e2e_scale_qat(
+        student,
+        None,
+        manifest,
+        cands,
+        [0] * len(manifest["groups"]),
+        train_rows=rows,
+        val_rows=rows,
+        val_teacher_states=cached_t,
+        train_teacher_states=cached_t,
+        num_epochs=1,
+        batch_size=2,
+        lr=1e-3,
+    )
+    assert res["best_val_kl"] <= res["init_val_kl"] + 1e-5
