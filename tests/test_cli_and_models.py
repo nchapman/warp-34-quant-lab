@@ -254,6 +254,14 @@ def test_model_cards_match_published_receipts() -> None:
             "results/rco-35b-w2w4/README-W2.6A16-HGPTQ-RCO.md",
             "results/rco-35b-w2w4/probe_25pct_rco.json",
         ),
+        (
+            "results/qwen38-flash-next-w4a16-hgptq/README.md",
+            "results/qwen38-flash-next-w4a16-hgptq/probe_results.json",
+        ),
+        (
+            "results/qwen38-flash-next-w26a16-hgptq-rco/README.md",
+            "results/qwen38-flash-next-w26a16-hgptq-rco/probe_results.json",
+        ),
     ]
     for md_rel, json_rel in pairs:
         md = (repo_root / md_rel).read_text(encoding="utf-8")

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import math
 import os
@@ -4263,15 +4264,66 @@ def run_probe_qwen4_exp(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     t0 = time.time()
     quant_routing_stats: dict[str, dict[str, torch.Tensor]] = {}
-    base_final_all, base_pre_mixer_all, base_head = _stream_forward_qwen4_exp_states(
-        base_dir,
-        cfg.text_config,
-        base_ids_all,
-        device,
-        inputs_embeds_override=base_emb_all,
-        position_ids_override=base_pos_all,
-        return_pre_mixer=bool(args.eval_mtp),
+    base_cache_env = os.environ.get("WARP_QUANT_PROBE_BASE_CACHE")
+    base_cache_path = Path(base_cache_env) if base_cache_env else None
+    sig_hasher = hashlib.sha256()
+    sig_hasher.update(
+        f"{base_dir.resolve()}|mtp={bool(args.eval_mtp)}|n={len(base_ids_all)}|emb={len(base_emb_all)}".encode()
     )
+    for seq_t in base_ids_all:
+        sig_hasher.update(seq_t.detach().cpu().to(torch.int64).numpy().tobytes())
+    expected_cache_sig = sig_hasher.hexdigest()
+    cache_hit = False
+    if base_cache_path is not None and base_cache_path.is_file():
+        cached_b = torch.load(base_cache_path, map_location="cpu", weights_only=True)
+        has_pre_mixer = cached_b.get("base_pre_mixer_all") is not None
+        if (
+            isinstance(cached_b, dict)
+            and cached_b.get("cache_signature") == expected_cache_sig
+            and len(cached_b.get("base_final_all", ())) == len(base_ids_all)
+            and has_pre_mixer == bool(args.eval_mtp)
+        ):
+            base_final_all = cached_b["base_final_all"]
+            base_pre_mixer_all = cached_b["base_pre_mixer_all"]
+            from llmcompressor.utils.dev import skip_weights_initialize
+
+            with torch.device(device), skip_weights_initialize():
+                base_head = nn.Linear(
+                    cfg.text_config.hidden_size,
+                    cfg.text_config.vocab_size,
+                    bias=False,
+                    dtype=torch.bfloat16,
+                ).eval()
+            b_smap, _ = _load_shard_map(base_dir)
+            b_hraw = _load_top_level_module_tensors(base_dir, b_smap, "lm_head.")
+            base_head.weight.data.copy_(b_hraw["lm_head.weight"].to(device=device, dtype=torch.bfloat16))
+            del cached_b, b_hraw
+            cache_hit = True
+            log_event("QWEN4_EXP_PROBE_BASE_CACHE_HIT", path=str(base_cache_path))
+        else:
+            del cached_b
+            log_event("QWEN4_EXP_PROBE_BASE_CACHE_MISMATCH", path=str(base_cache_path))
+    if not cache_hit:
+        base_final_all, base_pre_mixer_all, base_head = _stream_forward_qwen4_exp_states(
+            base_dir,
+            cfg.text_config,
+            base_ids_all,
+            device,
+            inputs_embeds_override=base_emb_all,
+            position_ids_override=base_pos_all,
+            return_pre_mixer=bool(args.eval_mtp),
+        )
+        if base_cache_path is not None:
+            base_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "cache_signature": expected_cache_sig,
+                    "base_final_all": base_final_all,
+                    "base_pre_mixer_all": base_pre_mixer_all,
+                },
+                base_cache_path,
+            )
+            log_event("QWEN4_EXP_PROBE_BASE_CACHE_SAVED", path=str(base_cache_path))
     quant_final_all, quant_pre_mixer_all, quant_head = _stream_forward_qwen4_exp_states(
         quant_dir,
         cfg.text_config,
@@ -4988,22 +5040,28 @@ def run_moe_rco_search_and_qat(
     }
 
     def _activate_fixed_choices(choices: list[int]) -> None:
+        prev_choices = active_mode.get(" applied_choices")
         active_mode["mode"] = "fixed"
         active_mode["choices"] = list(choices)
         if keep_both_banks_on_gpu or not w2_packed_gpu:
             return
+        changed = 0
         for li, ch in enumerate(choices):
+            if prev_choices is not None and prev_choices[li] == ch:
+                continue
+            changed += 1
             if ch == 1:
                 if w2_packed_gpu[li][0].device.type != "cpu":
                     w2_packed_gpu[li] = tuple(t.cpu() for t in w2_packed_gpu[li])  # type: ignore[assignment]
                 if w4_packed_gpu[li][0].device != device:
-                    w4_packed_gpu[li] = tuple(t.to(device) for t in w4_packed_gpu[li])  # type: ignore[assignment]
+                    w4_packed_gpu[li] = tuple(t.to(device, non_blocking=True) for t in w4_packed_gpu[li])  # type: ignore[assignment]
             else:
                 if w4_packed_gpu[li][0].device.type != "cpu":
                     w4_packed_gpu[li] = tuple(t.cpu() for t in w4_packed_gpu[li])  # type: ignore[assignment]
                 if w2_packed_gpu[li][0].device != device:
-                    w2_packed_gpu[li] = tuple(t.to(device) for t in w2_packed_gpu[li])  # type: ignore[assignment]
-        if device.type == "cuda":
+                    w2_packed_gpu[li] = tuple(t.to(device, non_blocking=True) for t in w2_packed_gpu[li])  # type: ignore[assignment]
+        active_mode[" applied_choices"] = list(choices)
+        if device.type == "cuda" and changed > 2:
             torch.cuda.empty_cache()
 
     def _run_single_expert_branch(
@@ -5026,6 +5084,30 @@ def run_moe_rco_search_and_qat(
             if had_moe_in > 0
             else x_2d
         )
+        if x_2d.is_cuda and hasattr(torch.nn.functional, "grouped_mm"):
+            num_tokens, hidden_dim = x_in.shape
+            num_top_k = top_k_index.size(-1)
+            sample_weights = top_k_weights.reshape(-1)
+            expert_ids = top_k_index.reshape(-1)
+            expert_ids_g, perm = torch.sort(expert_ids)
+            selected_x = x_in.index_select(0, perm // num_top_k)
+            sample_weights_g = sample_weights.index_select(0, perm)
+            tokens_per_expert = torch.bincount(expert_ids_g, minlength=num_exp).to(torch.int32)
+            offsets = torch.cumsum(tokens_per_expert, dim=0, dtype=torch.int32)
+            gu = torch.nn.functional.grouped_mm(
+                selected_x.to(gu_3d.dtype), gu_3d.transpose(-2, -1), offs=offsets
+            )
+            gate, up = gu.chunk(2, dim=-1)
+            mid = experts_mod.act_fn(gate) * up
+            if had_moe_down > 0:
+                mid = _hadamard_rotate_last_dim(mid, had_moe_down, compute_dtype=torch.float32)
+            out_e = torch.nn.functional.grouped_mm(mid.to(dn_3d.dtype), dn_3d.transpose(-2, -1), offs=offsets)
+            weighted_out = out_e * sample_weights_g.unsqueeze(-1)
+            inv_perm = torch.empty_like(perm)
+            inv_perm[perm] = torch.arange(perm.size(0), device=x_2d.device)
+            weighted_out = weighted_out.index_select(0, inv_perm)
+            del gu_3d, dn_3d
+            return weighted_out.view(num_tokens, num_top_k, hidden_dim).sum(dim=1).to(x_2d.dtype)
         final_h = torch.zeros_like(x_2d)
         with torch.no_grad():
             expert_mask = F.one_hot(top_k_index, num_classes=num_exp + 1).permute(2, 1, 0)
@@ -5214,8 +5296,18 @@ def run_moe_rco_search_and_qat(
         )
         min_bytes = float(byte_costs[:, 0].sum().item())
         max_bytes = float(byte_costs[:, 1].sum().item())
+
+        # Exact leave-one-out end-to-end teacher-forced KL sensitivity from all_high on train subset
+        loo_idxs = train_indices[: min(len(train_indices), 4)]
+        base_loo_kl = _eval_choices_val_kl([1] * num_layers, eval_idxs=loo_idxs)
+        loo_dkl: list[float] = []
+        for li in range(num_layers):
+            ch_loo = [1] * num_layers
+            ch_loo[li] = 0
+            loo_dkl.append(_eval_choices_val_kl(ch_loo, eval_idxs=loo_idxs) - base_loo_kl)
+        loo_kl_scores = torch.tensor(loo_dkl, dtype=torch.float64)
     else:
-        out_l2_scores = h_loss_scores = z_out = z_h = combined_prior = byte_costs = None
+        out_l2_scores = h_loss_scores = z_out = z_h = combined_prior = byte_costs = loo_kl_scores = None
         min_bytes = max_bytes = 0.0
 
     search_pool = train_indices[: min(len(train_indices), max(search_samples, 8))]
@@ -5232,7 +5324,11 @@ def run_moe_rco_search_and_qat(
         top_comb = torch.argsort(combined_prior, descending=True)[:k_w4].tolist()
         c_comb = [1 if i in set(top_comb) else 0 for i in range(num_layers)]
 
-        # Candidate 3: End-to-End Gumbel-Softmax STE RCO search (or Hessian top-K when streaming bank)
+        # Candidate 3: Exact leave-one-out end-to-end KL sensitivity top-K
+        top_loo = torch.argsort(loo_kl_scores, descending=True)[:k_w4].tolist()
+        c_loo = [1 if i in set(top_loo) else 0 for i in range(num_layers)]
+
+        # Candidate 4: End-to-End Gumbel-Softmax STE RCO search (or Hessian top-K when steps=0)
         top_h = torch.argsort(h_loss_scores, descending=True)[:k_w4].tolist()
         c_rco_proj = [1 if i in set(top_h) else 0 for i in range(num_layers)]
         if steps > 0:
@@ -5283,8 +5379,10 @@ def run_moe_rco_search_and_qat(
 
         kl_out = _eval_choices_val_kl(c_out)
         kl_comb = _eval_choices_val_kl(c_comb)
+        kl_loo = _eval_choices_val_kl(c_loo)
         kl_rco = _eval_choices_val_kl(c_rco_proj)
         best_kl, best_c, best_src = min(
+            (kl_loo, c_loo, "loo_kl_sensitivity"),
             (kl_rco, c_rco_proj, "rco_gumbel_ste" if steps > 0 else "h_loss_prior"),
             (kl_comb, c_comb, "combined_prior"),
             (kl_out, c_out, "out_l2_prior"),
@@ -5294,6 +5392,7 @@ def run_moe_rco_search_and_qat(
             "MOE_RCO_BUDGET_SOLVED",
             name=b_name,
             budget=b_frac,
+            val_kl_loo=round(kl_loo, 6),
             val_kl_rco=round(kl_rco, 6),
             val_kl_comb=round(kl_comb, 6),
             val_kl_out=round(kl_out, 6),
