@@ -15,15 +15,13 @@ tags:
 
 # Qwen3.8-27B-W2.2A16-HGPTQ-RCO
 
-2.20-bit (`W2`/`W4` mixed backbone + `W8` head, group size 64) **Hadamard + Cholesky GPTQ with Riemannian Co-design (`HGPTQ-RCO`)** quantization of [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) across **Text (`400` backbone linears + `lm_head`), Native MTP (`8` linears), and Vision (`110` linears)**, reducing the checkpoint payload from `51.75 GiB` in BF16 to **`11.04 GiB` (`4.69×` smaller; `10.58 GiB` text-only)**.
-
-> **Summary:** Compresses a `51.8 GiB` dense multimodal model by `4.69×` (`11.04 GiB` full VLM+MTP / `10.58 GiB` text-only, saving `40.7 GiB` of VRAM). Upgrading just the top `10%` (`+580 MiB`) most sensitive fused `vLLM` linear groups (`13/32` Full-Attention, `20/96` GDN Linear-Attention, `14/128` MLP) via Riemannian Co-design + end-to-end Scale/Norm QAT captures **45% of the entire `0%→30%` `probe-v4` KL reduction** (`0.3477 → 0.3137`). Use this checkpoint for **ultra-long-context `16 GB` serving** or **headless `12 GB` text-only serving** (`--language-model-only`); for general `16 GB` multimodal + MTP serving, prefer [`Qwen3.8-27B-W2.6A16-HGPTQ-RCO`](https://huggingface.co/nchapman/Qwen3.8-27B-W2.6A16-HGPTQ-RCO) (`12.18 GiB`).
+2.20-bit (`W2`/`W4` mixed backbone + `W8_g64` head, group size 64) **Hadamard + Cholesky GPTQ with Riemannian Co-design (`HGPTQ-RCO`)** quantization of [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) across **Text (`400` backbone linears + `lm_head`), Native MTP (`8` linears), and Vision (`110` linears)**, reducing the checkpoint payload from `51.75 GiB` in BF16 to **`11.04 GiB` (`4.69×` smaller; `10.58 GiB` text-only, saving `40.71 GiB` of VRAM)**. Upgrading the top `10%` (`+580 MiB`) most sensitive fused `vLLM` linear groups (`13/32` Full-Attention, `20/96` GDN Linear-Attention, `14/128` MLP) via Riemannian Co-design + end-to-end Scale/Norm QAT captures **45% of the entire `0%→30%` `probe-v4` KL reduction** (`0.3477 → 0.3137`). Use this checkpoint for **ultra-long-context `16 GB` serving** or **headless `12 GB` text-only serving** (`--language-model-only`); for general `16 GB` multimodal + MTP serving, prefer [`Qwen3.8-27B-W2.6A16-HGPTQ-RCO`](https://huggingface.co/nchapman/Qwen3.8-27B-W2.6A16-HGPTQ-RCO) (`12.18 GiB`).
 
 | Variant | Avg Backbone Bits | Full VLM+MTP Size | Text-Only Size | Target GPU Tier |
 |---|---:|---:|---:|---|
 | **`Qwen3.8-27B-W2.2A16-HGPTQ-RCO` (this repo)** | **`2.20` (`10%` `W4`)** | **`11.04 GiB`** | **`10.58 GiB`** | **Headless `12 GB` (text-only) / ultra-long-context `16 GB`** |
 | [`Qwen3.8-27B-W2.6A16-HGPTQ-RCO`](https://huggingface.co/nchapman/Qwen3.8-27B-W2.6A16-HGPTQ-RCO) | `2.60` (`30%` `W4`) | `12.18 GiB` | `11.71 GiB` | Recommended `16 GB` GPU (full VLM + MTP + CUDA graphs) |
-| [`Qwen3.8-27B-W4A16-HGPTQ`](https://huggingface.co/nchapman/Qwen3.8-27B-W4A16-HGPTQ) | `4.00` (`100%` `W4`) | `17.33 GiB` | `16.86 GiB` | `24 GB` GPU (RTX 3090 / 4090 / 5090) |
+| [`Qwen3.8-27B-W4A16-HGPTQ`](https://huggingface.co/nchapman/Qwen3.8-27B-W4A16-HGPTQ) | `4.00` (`100%` `W4`) | `16.14 GiB` | `15.67 GiB` | `24 GB` GPU (RTX 3090 / 4090 / 5090) |
 
 ## Quality vs. BF16 Base Model (`Qwen/Qwen3.8-27B`)
 

@@ -14,9 +14,7 @@ tags:
 
 # Qwen3.5-4B-W4A16-HGPTQ
 
-4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ (`HGPTQ`, `MSE + 2-Pass H-CD + FP32 Norm/GDN QAT + W8_g64 mtp.fc`)** quantization of [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) across **Text (`200` linears), Native MTP (`7` W4A16 linears + `1` `W8_g64` `mtp.fc`), and Vision (`98` linears)**, reducing the checkpoint payload from `8.68 GiB` in BF16 to **`3.19 GiB` (`2.72×` smaller)**.
-
-> **Summary:** Compresses the model `2.72×` (`8.68 GiB → 3.19 GiB`, saving `5.49 GiB` of VRAM) so it runs easily on 6–8 GB GPUs. Tracks the BF16 base model closely on text (`-1.89%` perplexity delta, `0.0811` weighted KL divergence, `0.0533` holdout mean KL) and preserves near-lossless vision accuracy (`99.34%` top-1 match on VQA/OCR and `99.26%` on UI/math) alongside `94.26%` speculative drafter agreement.
+4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ + Hessian Coordinate Descent + FP32-Master Norm QAT (`HGPTQ`)** quantization of [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) across **Text (`200` linears in `W4`), Native MTP (`7` transformer linears in `W4` + `mtp.fc` in `W8_g64`), and Vision (`98` linears in `W4`)**, reducing the checkpoint payload from `8.68 GiB` in BF16 to **`3.19 GiB` (`2.72×` smaller, saving `5.49 GiB` of VRAM)** so it runs easily on 6–8 GB GPUs. Tracks the BF16 base model closely on text (`-1.89%` perplexity delta, `0.0811` weighted KL divergence, `0.0533` holdout mean KL) and preserves near-lossless vision accuracy (`99.34%` top-1 match on VQA/OCR and `99.26%` on UI/math) alongside `94.26%` speculative drafter agreement.
 
 ## Quality vs. BF16 Base Model (`Qwen/Qwen3.5-4B`)
 

@@ -14,9 +14,7 @@ tags:
 
 # Ornith-1.5-9B-W4A16-HGPTQ
 
-4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ (`HGPTQ`, `MSE + 2-Pass H-CD + FP32 Norm/GDN QAT + W8_g64 Head`)** quantization of [ornith-ai/Ornith-1.5-9B](https://huggingface.co/ornith-ai/Ornith-1.5-9B) across **Text (`200` W4A16 linears + `1` `W8_g64` `lm_head`), Native MTP (`7` W4A16 linears + `1` `W8_g64` `mtp.fc`), and Vision (`110` linears)**, reducing the checkpoint payload from `17.98 GiB` in BF16 to **`6.67 GiB` (`2.70×` smaller)**.
-
-> **Summary:** Shrinks `Ornith-1.5-9B` by `2.70×` (`17.98 GiB → 6.67 GiB`) to fit on 8–10 GB GPUs. Preserves `97.02%–97.04%` vision top-1 agreement and `94.68%` speculative drafter agreement (`-15.34%` text perplexity delta, `0.1440` weighted KL divergence, `0.0965` holdout mean KL).
+4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ + Hessian Coordinate Descent + FP32-Master Norm QAT (`HGPTQ`)** quantization of [ornith-ai/Ornith-1.5-9B](https://huggingface.co/ornith-ai/Ornith-1.5-9B) across **Text (`200` backbone linears in `W4` + `lm_head` in `W8_g64`), Native MTP (`7` transformer linears in `W4` + `mtp.fc` in `W8_g64`), and Vision (`110` linears in `W4`)**, reducing the checkpoint payload from `17.98 GiB` in BF16 to **`6.67 GiB` (`2.70×` smaller, saving `11.31 GiB` of VRAM)** to fit on 8–10 GB GPUs. Preserves `97.02%–97.04%` vision top-1 agreement and `94.68%` speculative drafter agreement (`-15.34%` text perplexity delta, `0.1440` weighted KL divergence, `0.0965` holdout mean KL).
 
 ## Quality vs. BF16 Base Model (`ornith-ai/Ornith-1.5-9B`)
 

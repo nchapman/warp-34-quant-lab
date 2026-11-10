@@ -15,15 +15,13 @@ tags:
 
 # Qwen3.8-27B-W2.6A16-HGPTQ-RCO
 
-2.60-bit (`W2`/`W4` mixed backbone + `W8` head, group size 64) **Hadamard + Cholesky GPTQ with Riemannian Co-design (`HGPTQ-RCO`)** quantization of [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) across **Text (`400` backbone linears + `lm_head`), Native MTP (`8` linears), and Vision (`110` linears)**, reducing the checkpoint payload from `51.75 GiB` in BF16 to **`12.18 GiB` (`4.25×` smaller)**.
-
-> **Summary:** Compresses a `51.8 GiB` dense multimodal model by `4.25×` (`12.18 GiB` full VLM+MTP, saving `39.6 GiB` of VRAM) so it fits on a **single 16 GB GPU (RTX 4060 Ti 16GB / 4070 Ti Super / 4080 / 5060 Ti 16GB / 5070 Ti)** with ~`3.8 GiB` left for KV cache, Vision, Native MTP speculative decoding, and CUDA graphs. Riemannian Co-design upgrades the `30%` most sensitive fused `vLLM` linear groups (`21/32` Full-Attention, `38/96` GDN Linear-Attention, `39/128` MLP) from `W2` to `W4` and polishes 2-bit scales + FP32-master `RMSNorm`/GDN gates end-to-end (`probe-v4` weighted KL `0.2717`, holdout KL `0.3272`, E2E MTP top-1 `74.47%`, E2E Vision top-1 `88.74%`).
+2.60-bit (`W2`/`W4` mixed backbone + `W8_g64` head, group size 64) **Hadamard + Cholesky GPTQ with Riemannian Co-design (`HGPTQ-RCO`)** quantization of [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) across **Text (`400` backbone linears + `lm_head`), Native MTP (`8` linears), and Vision (`110` linears)**, reducing the checkpoint payload from `51.75 GiB` in BF16 to **`12.18 GiB` (`4.25×` smaller, saving `39.57 GiB` of VRAM)** so it fits on a **single 16 GB GPU (RTX 4060 Ti 16GB / 4070 Ti Super / 4080 / 5060 Ti 16GB / 5070 Ti)** with `~3.8 GiB` left for KV cache, Vision, Native MTP speculative decoding, and CUDA graphs. Riemannian Co-design upgrades the `30%` most sensitive fused `vLLM` linear groups (`21/32` Full-Attention, `38/96` GDN Linear-Attention, `39/128` MLP) from `W2` to `W4` and polishes 2-bit scales + FP32-master `RMSNorm`/GDN gates end-to-end (`probe-v4` weighted KL `0.2717`, holdout KL `0.3272`, E2E MTP top-1 `74.47%`, E2E Vision top-1 `88.74%`).
 
 | Variant | Avg Backbone Bits | Full VLM+MTP Size | Text-Only Size | Target GPU Tier |
 |---|---:|---:|---:|---|
 | [`Qwen3.8-27B-W2.2A16-HGPTQ-RCO`](https://huggingface.co/nchapman/Qwen3.8-27B-W2.2A16-HGPTQ-RCO) | `2.20` (`10%` `W4`) | `11.04 GiB` | `10.58 GiB` | Headless `12 GB` (text-only) / ultra-long-context `16 GB` |
 | **`Qwen3.8-27B-W2.6A16-HGPTQ-RCO` (this repo)** | **`2.60` (`30%` `W4`)** | **`12.18 GiB`** | **`11.71 GiB`** | **Recommended `16 GB` GPU (full VLM + MTP + CUDA graphs)** |
-| [`Qwen3.8-27B-W4A16-HGPTQ`](https://huggingface.co/nchapman/Qwen3.8-27B-W4A16-HGPTQ) | `4.00` (`100%` `W4`) | `17.33 GiB` | `16.86 GiB` | `24 GB` GPU (RTX 3090 / 4090 / 5090) |
+| [`Qwen3.8-27B-W4A16-HGPTQ`](https://huggingface.co/nchapman/Qwen3.8-27B-W4A16-HGPTQ) | `4.00` (`100%` `W4`) | `16.14 GiB` | `15.67 GiB` | `24 GB` GPU (RTX 3090 / 4090 / 5090) |
 
 ## Quality vs. BF16 Base Model (`Qwen/Qwen3.8-27B`)
 

@@ -14,9 +14,7 @@ tags:
 
 # Swift-1.5-Qwen3.8-27b-W4A16-HGPTQ
 
-4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ (`HGPTQ`, `MSE + 2-Pass H-CD + FP32 Norm/GDN QAT + W8_g64 Head`)** quantization of [ukisai/Swift-1.5-Qwen3.8-27b](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b) across **Text (`400` W4A16 linears + `1` `W8_g64` `lm_head`), Native MTP (`7` W4A16 linears + `1` `W8_g64` `mtp.fc`), and Vision (`110` linears)**, reducing the checkpoint payload from `51.75 GiB` in BF16 to **`16.14 GiB` (`3.21×` smaller)**.
-
-> **Summary:** Compresses `Swift-1.5-Qwen3.8-27b` by `3.21×` (`51.75 GiB → 16.14 GiB`, saving `35.61 GiB` of VRAM) to fit comfortably on a **single 24 GB GPU**. Tracks the BF16 fine-tune closely across text (`0.1074` weighted KL divergence, `0.0555` holdout mean KL), speculative drafting (`96.43%` top-1 agreement), and vision (`98.01%–99.26%` top-1 agreement).
+4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ + Hessian Coordinate Descent + FP32-Master Norm QAT (`HGPTQ`)** quantization of [ukisai/Swift-1.5-Qwen3.8-27b](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b) across **Text (`400` backbone linears in `W4` + `lm_head` in `W8_g64`), Native MTP (`7` transformer linears in `W4` + `mtp.fc` in `W8_g64`), and Vision (`110` linears in `W4`)**, reducing the checkpoint payload from `51.75 GiB` in BF16 to **`16.14 GiB` (`3.21×` smaller, saving `35.61 GiB` of VRAM)** to fit comfortably on a **single 24 GB GPU**. Tracks the BF16 fine-tune closely across text (`0.1074` weighted KL divergence, `0.0555` holdout mean KL), speculative drafting (`96.43%` top-1 agreement), and vision (`98.01%–99.26%` top-1 agreement).
 
 ## Quality vs. BF16 Base Model (`ukisai/Swift-1.5-Qwen3.8-27b`)
 

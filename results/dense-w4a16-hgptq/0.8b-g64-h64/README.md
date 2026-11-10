@@ -14,9 +14,7 @@ tags:
 
 # Qwen3.5-0.8B-W4A16-HGPTQ
 
-4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ + Hessian Coordinate Descent + FP32-Master Norm QAT (`HGPTQ`)** quantization of [Qwen/Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B) across **Text (`150` linears in `W4`), Native MTP (`7` transformer linears in `W4` + `mtp.fc` in `W8_g64`), and Vision (`50` linears in `W4`)**, reducing the checkpoint payload from `1.63 GiB` in BF16 to **`0.79 GiB` (`2.07×` smaller)**.
-
-> **Summary:** Cuts the model in half (`1.63 GiB → 0.79 GiB`) so the entire multimodal model, vision encoder, and speculative drafter fit in under `850 MiB` of memory. Combining MSE-initialized Cholesky GPTQ + 2-pass Gauss–Seidel Hessian Coordinate Descent (`H-CD`) + end-to-end FP32-master `RMSNorm` KL tuning cuts `probe-v4` weighted KL by `−18.4%` (`0.0901 → 0.0735`), `probe-guard` weighted KL by `−38.7%` (`0.1446 → 0.0887`), text perplexity delta from `+4.55%` to **`+3.17%`**, Vision isolated Top-1 to **`94.04%`** (`94.81%` E2E on `vision-guard-v2`), and speculative drafting Top-1 to **`90.24%`** (`78.36%` E2E).
+4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ + Hessian Coordinate Descent + FP32-Master Norm QAT (`HGPTQ`)** quantization of [Qwen/Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B) across **Text (`150` linears in `W4`), Native MTP (`7` transformer linears in `W4` + `mtp.fc` in `W8_g64`), and Vision (`50` linears in `W4`)**, reducing the checkpoint payload from `1.63 GiB` in BF16 to **`0.79 GiB` (`2.07×` smaller)** so the entire multimodal model, vision encoder, and speculative drafter fit in under `850 MiB` of memory. Combining MSE-initialized Cholesky GPTQ + 2-pass Gauss–Seidel Hessian Coordinate Descent (`H-CD`) + end-to-end FP32-master `RMSNorm` KL tuning cuts `probe-v4` weighted KL by `−18.4%` (`0.0901 → 0.0735`), `probe-guard` weighted KL by `−38.7%` (`0.1446 → 0.0887`), text perplexity delta from `+4.55%` to **`+3.17%`**, Vision isolated Top-1 to **`94.04%`** (`94.81%` E2E on `vision-guard-v2`), and speculative drafting Top-1 to **`90.24%`** (`78.36%` E2E).
 
 ## Quality vs. BF16 Base Model (`Qwen/Qwen3.5-0.8B`)
 

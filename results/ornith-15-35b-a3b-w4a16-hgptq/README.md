@@ -15,9 +15,7 @@ tags:
 
 # Ornith-1.5-35B-A3B-W4A16-HGPTQ
 
-4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ (`HGPTQ`, `MSE + 2-Pass H-CD + FP32 Norm/GDN QAT + W8_g64 Head`)** quantization of [ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B) across **Text (`30,970` W4A16 linears + `1` `W8_g64` `lm_head`), Native MTP (`775` W4A16 linears + `1` `W8_g64` `mtp.fc`), and Vision (`110` linears)**, reducing the checkpoint payload from `66.97 GiB` in BF16 to **`18.78 GiB` (`3.57×` smaller)**.
-
-> **Summary:** Compresses `Ornith-1.5-35B-A3B` by `3.57×` (`67.0 GiB → 18.78 GiB`, `−48.19 GiB` of VRAM) to fit within a **24 GB GPU** budget. Main-suite text tracking (`0.1139` weighted KL, `0.1647` holdout mean KL) and vision (`96.36%–97.04%` top-1 agreement) are solid, with two caveats inherited from the sharp fine-tune: out-of-distribution holdout prompts show higher divergence (`0.2289` weighted KL), and speculative drafter agreement is lower (`91.44%` vs. `95.80%` on base `Qwen3.6-35B-A3B`) because the upstream fine-tune shifted the backbone away from its un-updated MTP head.
+4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ + Hessian Coordinate Descent + FP32-Master Norm/GDN QAT (`HGPTQ`)** quantization of [ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B) across **Text (`30,970` W4A16 linears + `lm_head` in `W8_g64`), Native MTP (`775` W4A16 linears + `mtp.fc` in `W8_g64`), and Vision (`110` W4A16 linears)**, reducing the checkpoint payload from `66.97 GiB` in BF16 to **`18.78 GiB` (`3.57×` smaller, saving `48.19 GiB` of VRAM)** to fit within a **24 GB GPU** budget. Main-suite text tracking (`0.1139` weighted KL, `0.1647` holdout mean KL) and vision (`96.36%–97.04%` top-1 agreement) are solid, with two caveats inherited from the sharp fine-tune: out-of-distribution holdout prompts show higher divergence (`0.2289` weighted KL), and speculative drafter agreement is lower (`91.44%` vs. `95.80%` on base `Qwen3.6-35B-A3B`) because the upstream fine-tune shifted the backbone away from its un-updated MTP head.
 
 ## Quality vs. BF16 Base Model (`ornith-ai/Ornith-1.5-35B-A3B`)
 
