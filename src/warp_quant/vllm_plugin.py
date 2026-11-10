@@ -27,6 +27,7 @@ Patches four upstream gaps when present in the active vLLM version:
 
 from __future__ import annotations
 
+import importlib
 import math
 import os
 from fractions import Fraction
@@ -92,8 +93,7 @@ def fast_block_hadamard(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
         )
     hadacore_fn = None
     try:
-        import vllm._custom_ops as ops
-
+        ops = importlib.import_module("vllm._custom_ops")
         hadacore_fn = getattr(ops, "hadacore_transform", None)
     except ImportError:
         hadacore_fn = None
@@ -230,14 +230,18 @@ class CustomLut4PLEMethod:
 
 def _patch_ct_linear_transform() -> None:
     try:
-        from compressed_tensors.transform import TransformLocation
-        from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
-        from vllm.model_executor.layers.quantization.compressed_tensors.transform.linear import (
-            CompressedTensorsLinearTransformMethod,
+        ct_tfm = importlib.import_module("compressed_tensors.transform")
+        TransformLocation = ct_tfm.TransformLocation
+        par_state = importlib.import_module("vllm.distributed.parallel_state")
+        get_tensor_model_parallel_world_size = par_state.get_tensor_model_parallel_world_size
+        lin_mod = importlib.import_module(
+            "vllm.model_executor.layers.quantization.compressed_tensors.transform.linear"
         )
-        from vllm.model_executor.layers.quantization.compressed_tensors.transform.module import (
-            HadamardTransform,
+        CompressedTensorsLinearTransformMethod = lin_mod.CompressedTensorsLinearTransformMethod
+        ht_mod = importlib.import_module(
+            "vllm.model_executor.layers.quantization.compressed_tensors.transform.module"
         )
+        HadamardTransform = ht_mod.HadamardTransform
     except Exception:
         return
 
@@ -291,8 +295,6 @@ def _patch_ct_linear_transform() -> None:
                 for t in transforms.values()
             )
             if can_shard_block_hadamard:
-                import vllm.model_executor.layers.quantization.compressed_tensors.transform.module as ht_mod
-
                 orig_tp_fn = ht_mod.get_tensor_model_parallel_world_size
                 try:
                     ht_mod.get_tensor_model_parallel_world_size = lambda: 1
@@ -321,14 +323,18 @@ def _patch_ct_linear_transform() -> None:
 
 def _patch_ct_moe_transform() -> None:
     try:
-        from compressed_tensors.transform import TransformLocation
-        from vllm.model_executor.layers.fused_moe.layer import RoutedExperts
-        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
-            CompressedTensorsConfig,
+        ct_tfm = importlib.import_module("compressed_tensors.transform")
+        TransformLocation = ct_tfm.TransformLocation
+        moe_layer_mod = importlib.import_module("vllm.model_executor.layers.fused_moe.layer")
+        RoutedExperts = moe_layer_mod.RoutedExperts
+        ct_mod = importlib.import_module(
+            "vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors"
         )
-        from vllm.model_executor.layers.quantization.compressed_tensors.transform.utils import (
-            get_linear_transform_schemes,
+        CompressedTensorsConfig = ct_mod.CompressedTensorsConfig
+        ct_utils_mod = importlib.import_module(
+            "vllm.model_executor.layers.quantization.compressed_tensors.transform.utils"
         )
+        get_linear_transform_schemes = ct_utils_mod.get_linear_transform_schemes
     except Exception:
         return
 
@@ -447,14 +453,14 @@ def _patch_ct_moe_transform() -> None:
 
 def _patch_ct_w2a16() -> None:
     try:
-        from vllm.scalar_type import scalar_types
+        scalar_types = importlib.import_module("vllm.scalar_type").scalar_types
     except Exception:
         return
 
     # 1. Fix Humming schema mapping for uint2 -> scalar_types.uint2b2 if present
     try:
-        import vllm.model_executor.layers.quantization.utils.humming.schema as hum_schema
-        from vllm.utils.humming import dtypes as humming_dtypes
+        hum_schema = importlib.import_module("vllm.model_executor.layers.quantization.utils.humming.schema")
+        humming_dtypes = importlib.import_module("vllm.utils.humming").dtypes
 
         orig_map_fn = hum_schema._humming_to_quant_dtype
 
@@ -470,17 +476,17 @@ def _patch_ct_w2a16() -> None:
 
     # 2. Patch CompressedTensorsWNA16 (LinearBase) for num_bits == 2 when Humming is not used
     try:
-        from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
-            CompressedTensorsWNA16,
+        wna16_mod = importlib.import_module(
+            "vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16"
         )
-        from vllm.model_executor.parameter import (
-            ChannelQuantScaleParameter,
-            GroupQuantScaleParameter,
-            PackedColumnParameter,
-            PackedvLLMParameter,
-            RowvLLMParameter,
-        )
-        from vllm.utils.import_utils import has_humming
+        CompressedTensorsWNA16 = wna16_mod.CompressedTensorsWNA16
+        param_mod = importlib.import_module("vllm.model_executor.parameter")
+        ChannelQuantScaleParameter = param_mod.ChannelQuantScaleParameter
+        GroupQuantScaleParameter = param_mod.GroupQuantScaleParameter
+        PackedColumnParameter = param_mod.PackedColumnParameter
+        PackedvLLMParameter = param_mod.PackedvLLMParameter
+        RowvLLMParameter = param_mod.RowvLLMParameter
+        has_humming = importlib.import_module("vllm.utils.import_utils").has_humming
     except Exception:
         return
 
@@ -642,9 +648,10 @@ def _patch_ct_w2a16() -> None:
 
     # 3. Patch CompressedTensorsWNA16MoEMethod for num_bits == 2 when Humming is not used
     try:
-        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16 import (
-            CompressedTensorsWNA16MoEMethod,
+        moe_wna16_mod = importlib.import_module(
+            "vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16"
         )
+        CompressedTensorsWNA16MoEMethod = moe_wna16_mod.CompressedTensorsWNA16MoEMethod
     except Exception:
         return
 
@@ -785,7 +792,7 @@ def _patch_ct_w2a16() -> None:
     CompressedTensorsWNA16MoEMethod.process_weights_after_loading = _moe_process_weights
 
     try:
-        from vllm.model_executor.layers.fused_moe.layer import RoutedExperts
+        RoutedExperts = importlib.import_module("vllm.model_executor.layers.fused_moe.layer").RoutedExperts
 
         orig_routed_forward = RoutedExperts.forward_modular
 
@@ -817,14 +824,10 @@ def _patch_ct_w2a16() -> None:
 
 def _patch_qwen4_exp_ple_lut4() -> None:
     try:
-        import vllm.models.qwen4_exp.common.ngram_embedding as common_ple
-        import vllm.models.qwen4_exp.nvidia.ngram_embedding as nvidia_ple
-        from vllm.models.qwen4_exp.common.ngram_embedding import (
-            Qwen4ExpPLEEmbeddingMethod,
-        )
-        from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
-            Qwen4ExpNGramEmbedding,
-        )
+        common_ple = importlib.import_module("vllm.models.qwen4_exp.common.ngram_embedding")
+        nvidia_ple = importlib.import_module("vllm.models.qwen4_exp.nvidia.ngram_embedding")
+        Qwen4ExpPLEEmbeddingMethod = common_ple.Qwen4ExpPLEEmbeddingMethod
+        Qwen4ExpNGramEmbedding = nvidia_ple.Qwen4ExpNGramEmbedding
     except Exception:
         return
 
@@ -932,8 +935,63 @@ def _patch_qwen4_exp_ple_lut4() -> None:
     Qwen4ExpPLEEmbeddingMethod._warp_quant_lut4_patched = True
 
 
+def _install_subprocess_autoload() -> None:
+    """Ensure spawned vLLM worker subprocesses auto-import and run `register()`
+    even when loaded via Hugging Face `auto_map` (`--trust-remote-code`) without
+    `warp-quant` installed as a package in the environment.
+    """
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    if os.environ.get("WARP_QUANT_SUBPROCESS_AUTOLOAD") == "1":
+        return
+    src_file = Path(__file__).resolve()
+    if not src_file.is_file():
+        return
+    try:
+        boot_dir = Path(tempfile.gettempdir()) / f"warp_quant_vllm_boot_{os.getuid()}"
+        boot_dir.mkdir(parents=True, exist_ok=True)
+        dst_plugin = boot_dir / "vllm_warp_quant.py"
+        if not dst_plugin.exists() or dst_plugin.read_bytes() != src_file.read_bytes():
+            shutil.copyfile(src_file, dst_plugin)
+        sitecust = boot_dir / "sitecustomize.py"
+        sitecust_code = (
+            "import os, sys\n"
+            "_boot_dir = os.path.dirname(__file__)\n"
+            "try:\n"
+            "    import importlib as _il\n"
+            "    _il.import_module('vllm_warp_quant').register()\n"
+            "except Exception:\n"
+            "    pass\n"
+            "# Chain to any next sitecustomize on sys.path\n"
+            "_orig_path = list(sys.path)\n"
+            "try:\n"
+            "    sys.path = [p for p in sys.path if os.path.abspath(p) != os.path.abspath(_boot_dir)]\n"
+            "    import importlib.machinery, importlib.util\n"
+            "    _spec = importlib.machinery.PathFinder.find_spec('sitecustomize', sys.path)\n"
+            "    if _spec is not None and _spec.loader is not None:\n"
+            "        _mod = importlib.util.module_from_spec(_spec)\n"
+            "        _spec.loader.exec_module(_mod)\n"
+            "except Exception:\n"
+            "    pass\n"
+            "finally:\n"
+            "    sys.path = _orig_path\n"
+        )
+        if not sitecust.exists() or sitecust.read_text(encoding="utf-8") != sitecust_code:
+            sitecust.write_text(sitecust_code, encoding="utf-8")
+        cur_pp = os.environ.get("PYTHONPATH", "")
+        boot_str = str(boot_dir)
+        parts = [p for p in cur_pp.split(os.pathsep) if p]
+        if boot_str not in parts:
+            os.environ["PYTHONPATH"] = os.pathsep.join([boot_str, *parts])
+        os.environ["WARP_QUANT_SUBPROCESS_AUTOLOAD"] = "1"
+    except Exception:
+        pass
+
+
 def register() -> None:
-    """Entry point for `vllm.general_plugins`."""
+    """Entry point for `vllm.general_plugins` and HF `auto_map` preload."""
     global _REGISTERED
     if _REGISTERED:
         return
@@ -942,3 +1000,39 @@ def register() -> None:
     _patch_ct_moe_transform()
     _patch_ct_w2a16()
     _patch_qwen4_exp_ple_lut4()
+
+
+try:
+    from transformers import PretrainedConfig
+
+    class WarpQuantConfig(PretrainedConfig):
+        """Hugging Face `AutoConfig` shim (`"auto_map": {"AutoConfig": "vllm_warp_quant.WarpQuantConfig"}`).
+
+        When loaded with `trust_remote_code=True` (e.g. `vllm serve <repo> --trust-remote-code`),
+        this runs `register()`, installs the `PYTHONPATH` subprocess bootstrapper so vLLM's
+        spawned `EngineCore` and GPU worker processes also run `register()`, and delegates
+        to the native `PretrainedConfig` class for the checkpoint's `model_type`.
+        When loaded with `trust_remote_code=False`, `transformers.AutoConfig` cleanly ignores
+        `auto_map` for known `model_type`s and uses the native config class directly.
+        """
+
+        @classmethod
+        def from_pretrained(
+            cls,
+            pretrained_model_name_or_path: str | os.PathLike[str],
+            **kwargs: Any,
+        ) -> PretrainedConfig:
+            register()
+            _install_subprocess_autoload()
+            kwargs.pop("trust_remote_code", None)
+            config_dict, kwargs = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
+            model_type = config_dict.get("model_type")
+            from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+            if model_type in CONFIG_MAPPING:
+                target_cls = CONFIG_MAPPING[model_type]
+                return target_cls.from_dict(config_dict, **kwargs)
+            return PretrainedConfig.from_dict(config_dict, **kwargs)
+
+except Exception:
+    pass

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import types
 
@@ -319,3 +320,36 @@ def test_patch_qwen4_exp_ple_lut4_end_to_end_with_stub_vllm(monkeypatch: pytest.
 def test_register_is_idempotent_without_vllm() -> None:
     register()
     register()
+
+
+def test_hf_auto_map_warp_quant_config_from_checkpoint_dir(
+    tmp_path: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+    import shutil
+    from pathlib import Path
+
+    from transformers import AutoConfig
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
+
+    import warp_quant.vllm_plugin as vp
+
+    ckpt_dir = Path(str(tmp_path))
+    shutil.copyfile(Path(vp.__file__).resolve(), ckpt_dir / "vllm_warp_quant.py")
+    (ckpt_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_5_moe",
+                "auto_map": {"AutoConfig": "vllm_warp_quant.WarpQuantConfig"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("WARP_QUANT_SUBPROCESS_AUTOLOAD", raising=False)
+
+    cfg_trusted = AutoConfig.from_pretrained(str(ckpt_dir), trust_remote_code=True)
+    assert isinstance(cfg_trusted, Qwen3_5MoeConfig)
+    assert os.environ.get("WARP_QUANT_SUBPROCESS_AUTOLOAD") == "1"
+
+    cfg_untrusted = AutoConfig.from_pretrained(str(ckpt_dir), trust_remote_code=False)
+    assert isinstance(cfg_untrusted, Qwen3_5MoeConfig)
