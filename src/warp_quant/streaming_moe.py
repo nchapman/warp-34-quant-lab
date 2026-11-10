@@ -41,6 +41,8 @@ from transformers import AutoProcessor
 from warp_quant.cachepath import resolve_snapshot
 from warp_quant.hadamard_gptq import (
     BASE_IGNORE,
+    LM_HEAD_TARGET_RE,
+    MTP_FC_TARGET_RE,
     MTP_HAD_TARGET_RE,
     MTP_TARGET_RE,
     TEXT_HAD_TARGET_RE,
@@ -49,12 +51,15 @@ from warp_quant.hadamard_gptq import (
     VISION_GROUP_TARGET_RE,
     _assert_packed_alignment,
     _attach_expert_hadamard_hooks,
+    _decompress_packed_2d,
     _gptq_calibrate_vision,
+    _gptq_pack_tensor,
     _hadamard_rotate_last_dim,
     _hadamard_rotate_weight,
     _is_power_of_two,
     _load_shard_map,
     _pack_w4_tensor,
+    _pack_w8_mse_tensor,
 )
 from warp_quant.lablog import log_event, run_done, run_fail
 from warp_quant.models import quant_recipe, resolve
@@ -2106,6 +2111,20 @@ def _load_qwen4_exp_mtp_from_checkpoint(
                     top_tensors[k.removeprefix("mtp.")] = f.get_tensor(k)
 
     param_map = dict(mtp.named_parameters())
+    packed_top_prefixes = sorted(
+        k_rel.removesuffix(".weight_packed") for k_rel in top_tensors if k_rel.endswith(".weight_packed")
+    )
+    for p_rel in packed_top_prefixes:
+        deq = _decompress_packed_2d(
+            top_tensors.pop(f"{p_rel}.weight_packed").to(device),
+            top_tensors.pop(f"{p_rel}.weight_scale").to(device),
+            top_tensors.pop(f"{p_rel}.weight_shape"),
+        )
+        w_key = f"{p_rel}.weight"
+        if w_key not in param_map:
+            raise RuntimeError(f"Unexpected packed top-level MTP prefix: mtp.{p_rel}")
+        param_map[w_key].data.copy_(deq.to(device=device, dtype=param_map[w_key].dtype))
+        del deq
     for k_rel, tensor in top_tensors.items():
         if k_rel not in param_map:
             raise RuntimeError(f"Unexpected top-level MTP tensor key: mtp.{k_rel}")
@@ -2126,6 +2145,8 @@ def _write_qwen4_exp_quant_config(
     vision_fc2_channel: bool,
     ple_group_size: int = 32,
     ple_cd_passes: int = 1,
+    quantize_lm_head_w8: bool = False,
+    quantize_mtp_fc_w8: bool = False,
 ) -> None:
     """Write complete config.json with compressed-tensors W4A16-HGPTQ + 4-bit Custom-LUT4 PLE metadata."""
     cfg = copy.deepcopy(base_cfg_dict)
@@ -2171,8 +2192,29 @@ def _write_qwen4_exp_quant_config(
             "weights": fc2_weights,
         }
 
+    w8_head_targets: list[str] = []
+    if quantize_lm_head_w8:
+        w8_head_targets.append(LM_HEAD_TARGET_RE)
+    if quantize_mtp_fc_w8:
+        w8_head_targets.append(MTP_FC_TARGET_RE)
+    if w8_head_targets:
+        config_groups["w8_head"] = {
+            "format": "pack-quantized",
+            "input_activations": None,
+            "output_activations": None,
+            "targets": w8_head_targets,
+            "weights": dict(
+                base_weights,
+                num_bits=8,
+                group_size=group_size,
+                strategy="group",
+                actorder=None,
+            ),
+        }
+
     is_qwen35_moe = base_cfg_dict.get("text_config", {}).get("model_type") == "qwen3_5_moe_text"
     ignore_list = list(BASE_IGNORE) if is_qwen35_moe else list(QWEN4_EXP_IGNORE)
+    top_ignore = [ig for ig in ignore_list if not (quantize_lm_head_w8 and ig == "lm_head")]
 
     if hadamard_block_size > 0:
         main_had_targets = [TEXT_HAD_TARGET_RE]
@@ -2243,7 +2285,7 @@ def _write_qwen4_exp_quant_config(
         "config_groups": config_groups,
         "format": "pack-quantized",
         "global_compression_ratio": None,
-        "ignore": list(ignore_list),
+        "ignore": top_ignore,
         "kv_cache_scheme": None,
         "quant_method": "compressed-tensors",
         "quantization_status": "compressed",
@@ -2383,6 +2425,8 @@ def run_quantize_qwen4_exp(args: argparse.Namespace) -> None:
     shard_counts = {
         "stripped_transform_weights": 0,
         "mtp_quantized": 0,
+        "mtp_fc_w8": 0,
+        "lm_head_w8": 0,
         "vision_quantized": 0,
         "vision_fc2_channel": 0,
         "ple_shards_quantized": 0,
@@ -2390,6 +2434,12 @@ def run_quantize_qwen4_exp(args: argparse.Namespace) -> None:
         "text_shared_experts_quantized": 0,
         "text_experts_quantized": 0,
     }
+    want_head_w8 = bool(getattr(args, "quantize_lm_head_w8", True))
+    is_tied_head = bool(
+        raw_base_cfg.get("tie_word_embeddings")
+        or raw_base_cfg.get("text_config", {}).get("tie_word_embeddings")
+    )
+    want_lm_head_w8 = want_head_w8 and not is_tied_head
 
     # ------------------------------------------------------------------
     # Phase 1: Vision Tower W4A16-HGPTQ (if present)
@@ -2558,13 +2608,12 @@ def run_quantize_qwen4_exp(args: argparse.Namespace) -> None:
         h_calib.append(h_init.to(calib_store_device))
         del ids_dev, inputs_embeds, cos, sin
 
+    deferred_embed_raw = dict(embed_raw)
     if is_qwen35_moe:
         norm_raw = _load_top_level_module_tensors(base_dir, shard_map, "model.language_model.norm.")
-        head_raw = _load_top_level_module_tensors(base_dir, shard_map, "lm_head.")
         qwen35_shard1_tensors.update(embed_raw)
         qwen35_shard1_tensors.update(norm_raw)
-        qwen35_shard2_tensors.update(head_raw)
-        del norm_raw, head_raw
+        del norm_raw, deferred_embed_raw
     else:
         embed_head_shard = "model-embed-head.safetensors"
         if reuse_ple_vision_dir is not None and (reuse_ple_vision_dir / embed_head_shard).exists():
@@ -2581,17 +2630,9 @@ def run_quantize_qwen4_exp(args: argparse.Namespace) -> None:
                     tv = sf.get_tensor(tk)
                     new_weight_map[tk] = embed_head_shard
                     total_bytes += tv.numel() * tv.element_size()
-        else:
-            mixer_raw = _load_top_level_module_tensors(
-                base_dir, shard_map, "model.language_model.hyper_connection_mixer."
-            )
-            head_raw = _load_top_level_module_tensors(base_dir, shard_map, "lm_head.")
-            embed_head_tensors = {**embed_raw, **mixer_raw, **head_raw}
-            save_file(embed_head_tensors, str(output_dir / embed_head_shard))
-            for tk, tv in embed_head_tensors.items():
-                new_weight_map[tk] = embed_head_shard
-                total_bytes += tv.numel() * tv.element_size()
-            del embed_head_tensors, mixer_raw, head_raw
+                    if tk == "lm_head.weight_packed":
+                        shard_counts["lm_head_w8"] += 1
+            deferred_embed_raw = {}
 
     # Keep embed_w on CPU if needed for MTP later; free from GPU now
     embed_w_cpu = embed_w.cpu()
@@ -2688,6 +2729,96 @@ def run_quantize_qwen4_exp(args: argparse.Namespace) -> None:
         if pending_layer_save_fut is not None:
             pending_layer_save_fut.result()
 
+    # Calibrate or pack untied lm_head (W8_g{group_size}, unrotated) using post-norm hidden states
+    if is_qwen35_moe or deferred_embed_raw:
+        head_raw = _load_top_level_module_tensors(base_dir, shard_map, "lm_head.")
+        head_out_tensors: dict[str, torch.Tensor] = {}
+        if (
+            want_lm_head_w8
+            and "lm_head.weight" in head_raw
+            and head_raw["lm_head.weight"].ndim == 2
+            and head_raw["lm_head.weight"].shape[0] % 64 == 0
+            and head_raw["lm_head.weight"].shape[1] % args.group_size == 0
+        ):
+            if args.component_quant_mode == "gptq":
+                from warp_quant.rco.assemble import calibrate_lm_head_w8
+
+                if is_qwen35_moe:
+                    with torch.device(device), skip_weights_initialize():
+                        fn_head = (
+                            Qwen3_5MoeRMSNorm(cfg.text_config.hidden_size, eps=cfg.text_config.rms_norm_eps)
+                            .to(dtype=torch.bfloat16)
+                            .eval()
+                        )
+                    n_raw = _load_top_level_module_tensors(base_dir, shard_map, "model.language_model.norm.")
+                    fn_head.weight.data.copy_(
+                        n_raw["model.language_model.norm.weight"].to(device=device, dtype=torch.bfloat16)
+                    )
+                    del n_raw
+                else:
+                    from transformers.models.qwen4_exp.modeling_qwen4_exp import (
+                        Qwen4ExpTextGatedResidual,
+                    )
+
+                    with torch.device(device), skip_weights_initialize():
+                        fn_head = (
+                            Qwen4ExpTextGatedResidual(cfg.text_config, use_combine=False)
+                            .to(dtype=torch.bfloat16)
+                            .eval()
+                        )
+                    m_raw = _load_top_level_module_tensors(
+                        base_dir, shard_map, "model.language_model.hyper_connection_mixer."
+                    )
+                    fn_head.load_state_dict(
+                        {
+                            k.removeprefix("model.language_model.hyper_connection_mixer."): v.to(
+                                device=device, dtype=torch.bfloat16
+                            )
+                            for k, v in m_raw.items()
+                        },
+                        strict=True,
+                    )
+                    del m_raw
+                n_head_cal = min(len(h_calib), args.component_calib_samples)
+                post_norm_states = [fn_head(h_calib[i].to(device)).cpu() for i in range(n_head_cal)]
+                del fn_head
+                packed_lm = calibrate_lm_head_w8(
+                    head_raw["lm_head.weight"],
+                    post_norm_states,
+                    group_size=args.group_size,
+                    dampening_frac=args.dampening_frac,
+                    device=device,
+                )
+                del post_norm_states
+            else:
+                packed_lm = _pack_w8_mse_tensor(head_raw["lm_head.weight"], group_size=args.group_size)
+            for suffix, pt in packed_lm.items():
+                head_out_tensors[f"lm_head.{suffix}"] = pt.cpu().contiguous()
+            for hk, hv in head_raw.items():
+                if hk != "lm_head.weight":
+                    head_out_tensors[hk] = hv
+            shard_counts["lm_head_w8"] += 1
+        else:
+            head_out_tensors = head_raw
+        del head_raw
+
+        if is_qwen35_moe:
+            qwen35_shard2_tensors.update(head_out_tensors)
+        else:
+            embed_head_shard = "model-embed-head.safetensors"
+            mixer_raw = _load_top_level_module_tensors(
+                base_dir, shard_map, "model.language_model.hyper_connection_mixer."
+            )
+            embed_head_tensors = {**deferred_embed_raw, **mixer_raw, **head_out_tensors}
+            save_file(embed_head_tensors, str(output_dir / embed_head_shard))
+            for tk, tv in embed_head_tensors.items():
+                new_weight_map[tk] = embed_head_shard
+                total_bytes += tv.numel() * tv.element_size()
+            del embed_head_tensors, mixer_raw, deferred_embed_raw
+        del head_out_tensors
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
     if is_qwen35_moe:
         if qwen35_shard2_tensors:
             s1_name = "model-00001-of-00002.safetensors"
@@ -2736,21 +2867,77 @@ def run_quantize_qwen4_exp(args: argparse.Namespace) -> None:
                 )
                 del norm_raw
 
-            for i in range(n_mtp):
-                h_backbone = h_calib[i][:, :-1, :].to(device)
-                if final_norm_mtp is not None:
-                    h_backbone = final_norm_mtp(h_backbone)
-                next_ids = calib_ids_list[i][:, 1:].to(device)
-                next_embeds = F.embedding(next_ids, embed_w_dev)
-                h_in = mtp.prepare_layer_input(h_backbone, next_embeds)
-                seq_len_m = next_ids.shape[1]
-                pos_ids_m = torch.arange(seq_len_m, device=device).view(1, 1, -1).expand(3, 1, -1)
-                cos_m, sin_m = mtp.rotary_emb(next_embeds, pos_ids_m)
-                h_mtp_calib.append(h_in.cpu())
-                mtp_pos_list.append((cos_m.cpu(), sin_m.cpu()))
-                mtp_ids_list.append(next_ids.cpu())
-                del h_backbone, next_ids, next_embeds, h_in, cos_m, sin_m
+            mtp_fc_packed: dict[str, torch.Tensor] | None = None
+            has_mtp_fc_linear = (
+                is_qwen35_moe
+                and want_head_w8
+                and hasattr(mtp, "fc")
+                and isinstance(mtp.fc, nn.Linear)
+                and mtp.fc.weight.shape[0] % 64 == 0
+                and mtp.fc.weight.shape[1] % args.group_size == 0
+            )
+            mtp_fc_hessian = (
+                torch.zeros(
+                    (mtp.fc.weight.shape[1], mtp.fc.weight.shape[1]),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                if (has_mtp_fc_linear and args.component_quant_mode == "gptq")
+                else None
+            )
+            mtp_fc_tokens = 0
+            mtp_fc_hook = None
+            if mtp_fc_hessian is not None:
+
+                def _fc_hook(_mod, hook_args):
+                    nonlocal mtp_fc_tokens
+                    x_fc = (
+                        hook_args[0]
+                        .to(device=device, dtype=torch.float32)
+                        .reshape(-1, mtp_fc_hessian.shape[0])
+                    )
+                    if x_fc.shape[0] > 0:
+                        mtp_fc_hessian.addmm_(x_fc.T, x_fc, beta=1.0, alpha=2.0)
+                        mtp_fc_tokens += int(x_fc.shape[0])
+
+                mtp_fc_hook = mtp.fc.register_forward_pre_hook(_fc_hook)
+
+            try:
+                for i in range(n_mtp):
+                    h_backbone = h_calib[i][:, :-1, :].to(device)
+                    if final_norm_mtp is not None:
+                        h_backbone = final_norm_mtp(h_backbone)
+                    next_ids = calib_ids_list[i][:, 1:].to(device)
+                    next_embeds = F.embedding(next_ids, embed_w_dev)
+                    h_in = mtp.prepare_layer_input(h_backbone, next_embeds)
+                    seq_len_m = next_ids.shape[1]
+                    pos_ids_m = torch.arange(seq_len_m, device=device).view(1, 1, -1).expand(3, 1, -1)
+                    cos_m, sin_m = mtp.rotary_emb(next_embeds, pos_ids_m)
+                    h_mtp_calib.append(h_in.cpu())
+                    mtp_pos_list.append((cos_m.cpu(), sin_m.cpu()))
+                    mtp_ids_list.append(next_ids.cpu())
+                    del h_backbone, next_ids, next_embeds, h_in, cos_m, sin_m
+            finally:
+                if mtp_fc_hook is not None:
+                    mtp_fc_hook.remove()
             del embed_w_dev, final_norm_mtp
+
+            if has_mtp_fc_linear:
+                if mtp_fc_hessian is not None and mtp_fc_tokens > 0:
+                    mtp_fc_packed = _gptq_pack_tensor(
+                        mtp.fc.weight.detach(),
+                        mtp_fc_hessian,
+                        torch.tensor([mtp_fc_tokens], dtype=torch.int64, device=device),
+                        strategy="group",
+                        group_size=args.group_size,
+                        actorder=None,
+                        dampening_frac=args.dampening_frac,
+                        num_bits=8,
+                        cd_passes=0,
+                    )
+                else:
+                    mtp_fc_packed = _pack_w8_mse_tensor(mtp.fc.weight.detach(), group_size=args.group_size)
+            del mtp_fc_hessian
 
             if args.component_quant_mode == "gptq":
                 mtp_layer_tensors, _, mtp_l_bytes, mtp_counts = _quantize_decoder_layer_streaming(
@@ -2832,6 +3019,14 @@ def run_quantize_qwen4_exp(args: argparse.Namespace) -> None:
             # Add top-level mtp.* weights (fc_*, pre_fc_*, hyper_connection_mixer.* / norm.*)
             for name, param in mtp.named_parameters():
                 if not name.startswith("layers."):
+                    if name == "fc.weight" and mtp_fc_packed is not None:
+                        for suffix, pt in mtp_fc_packed.items():
+                            t_cpu = pt.cpu().contiguous()
+                            mtp_layer_tensors[f"mtp.fc.{suffix}"] = t_cpu
+                            mtp_l_bytes += t_cpu.numel() * t_cpu.element_size()
+                        shard_counts["mtp_quantized"] += 1
+                        shard_counts["mtp_fc_w8"] += 1
+                        continue
                     t_cpu = param.detach().cpu().contiguous()
                     mtp_layer_tensors[f"mtp.{name}"] = t_cpu
                     mtp_l_bytes += t_cpu.numel() * t_cpu.element_size()
@@ -2875,6 +3070,8 @@ def run_quantize_qwen4_exp(args: argparse.Namespace) -> None:
         vision_fc2_channel=shard_counts["vision_fc2_channel"] > 0,
         ple_group_size=ple_group_size,
         ple_cd_passes=ple_cd_passes,
+        quantize_lm_head_w8=shard_counts["lm_head_w8"] > 0,
+        quantize_mtp_fc_w8=shard_counts["mtp_fc_w8"] > 0,
     )
 
     processor.save_pretrained(str(output_dir))
@@ -3317,6 +3514,16 @@ def _stream_forward_qwen4_exp_states(
     head_raw = _load_top_level_module_tensors(ckpt_dir, shard_map, "lm_head.")
     if "lm_head.weight" in head_raw:
         lm_head.weight.data.copy_(head_raw["lm_head.weight"].to(device=device, dtype=torch.bfloat16))
+    elif "lm_head.weight_packed" in head_raw:
+        from warp_quant.hadamard_gptq import _decompress_packed_2d
+
+        deq_head = _decompress_packed_2d(
+            head_raw["lm_head.weight_packed"].to(device),
+            head_raw["lm_head.weight_scale"].to(device),
+            head_raw["lm_head.weight_shape"],
+        )
+        lm_head.weight.data.copy_(deq_head.to(device=device, dtype=torch.bfloat16))
+        del deq_head
     else:
         emb_raw = _load_top_level_module_tensors(ckpt_dir, shard_map, "model.language_model.embed_tokens.")
         lm_head.weight.data.copy_(

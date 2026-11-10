@@ -379,3 +379,159 @@ def test_scale_qat_with_cached_teacher_states_and_multi_quant_cli(tmp_path) -> N
         lr=1e-3,
     )
     assert res["best_val_kl"] <= res["init_val_kl"] + 1e-5
+
+
+def test_w8_lm_head_and_mtp_fc_assembly_and_tie_guard(tmp_path) -> None:
+    import json
+    import re
+    import shutil
+
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
+
+    from warp_quant.hadamard_gptq import (
+        LM_HEAD_TARGET_RE,
+        MTP_FC_TARGET_RE,
+        _decompress_packed_2d,
+    )
+    from warp_quant.rco.assemble import assemble_rco_checkpoint, calibrate_lm_head_w8
+    from warp_quant.rco.bank import build_rco_bank
+    from warp_quant.rco.hidden_teacher import capture_teacher_hidden_states
+
+    lm_pat = re.compile(LM_HEAD_TARGET_RE.removeprefix("re:"))
+    mtp_fc_pat = re.compile(MTP_FC_TARGET_RE.removeprefix("re:"))
+    assert lm_pat.match("lm_head")
+    assert lm_pat.match("language_model.lm_head")
+    assert not lm_pat.match("model.language_model.embed_tokens")
+    assert mtp_fc_pat.match("mtp.fc")
+    assert not mtp_fc_pat.match("mtp.layers.0.mlp.gate_proj")
+
+    torch.manual_seed(31)
+    cfg = Qwen3_5Config(
+        tie_word_embeddings=False,
+        vision_config={
+            "depth": 1,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_heads": 4,
+            "out_hidden_size": 64,
+        },
+        text_config={
+            "vocab_size": 128,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 1,
+            "layer_types": ["full_attention"],
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "head_dim": 16,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": False,
+            "rope_parameters": {
+                "rope_theta": 10000.0,
+                "partial_rotary_factor": 0.5,
+                "mrope_section": [2, 1, 1],
+            },
+        },
+    )
+    base_model = Qwen3_5ForConditionalGeneration(cfg).to(torch.bfloat16).eval()
+    # Make untied lm_head distinct from embed_tokens
+    with torch.no_grad():
+        base_model.lm_head.weight.copy_(torch.randn_like(base_model.lm_head.weight) * 0.05)
+
+    base_dir = tmp_path / "base_untied"
+    base_model.save_pretrained(base_dir)
+    # Add a synthetic mtp.fc.weight + mtp.layers.0.self_attn.q_proj.weight shard to verify W8 mtp.fc
+    mtp_shard = base_dir / "model_mtp.safetensors"
+    save_file(
+        {
+            "mtp.fc.weight": torch.randn(64, 128, dtype=torch.bfloat16) * 0.05,
+            "mtp.layers.0.self_attn.q_proj.weight": torch.randn(64, 64, dtype=torch.bfloat16) * 0.05,
+        },
+        str(mtp_shard),
+    )
+
+    rows = [
+        torch.randint(2, 120, (16,), dtype=torch.long),
+        torch.randint(2, 120, (24,), dtype=torch.long),
+    ]
+    teacher_states = [
+        t for t in capture_teacher_hidden_states(base_model, rows) if isinstance(t, torch.Tensor)
+    ]
+    lm_packed = calibrate_lm_head_w8(base_model.lm_head.weight, teacher_states, group_size=64)
+    assert lm_packed["weight_packed"].shape == (128, 16)
+    assert lm_packed["weight_scale"].shape == (128, 1)
+    deq_lm = _decompress_packed_2d(
+        lm_packed["weight_packed"], lm_packed["weight_scale"], lm_packed["weight_shape"]
+    )
+    assert deq_lm.shape == (128, 64)
+    ref_lm = base_model.lm_head.weight.detach().float()
+    rel_err = (deq_lm.float() - ref_lm).norm() / ref_lm.norm()
+    assert float(rel_err) < 0.02
+
+    bank_model = Qwen3_5ForConditionalGeneration.from_pretrained(base_dir, dtype=torch.bfloat16).eval()
+    bank_dir = tmp_path / "bank"
+    manifest = build_rco_bank(
+        bank_model,
+        rows,
+        ["w2_g64", "w4_g64"],
+        bank_dir,
+        hadamard_block_size=64,
+        rotate_weights_in_place=True,
+    )
+
+    out_untied = tmp_path / "out_untied"
+    receipt = assemble_rco_checkpoint(
+        base_dir=base_dir,
+        bank_dir=bank_dir,
+        choices=[0, 1, 0, 1][: len(manifest["groups"])],
+        output_dir=out_untied,
+        lm_head_packed=lm_packed,
+        quantize_mtp_rtn=True,
+        quantize_lm_head_w8=True,
+        component_group_size=64,
+    )
+    assert receipt["w8_head_tensors"] == ["lm_head", "mtp.fc"]
+
+    qcfg = json.loads((out_untied / "config.json").read_text())["quantization_config"]
+    assert "lm_head" not in qcfg["ignore"]
+    for rule in qcfg["transform_config"]["config_groups"]["v"]["apply"]:
+        assert "lm_head" in rule["ignore"]
+    assert qcfg["config_groups"]["w8_head"]["weights"]["num_bits"] == 8
+    assert qcfg["config_groups"]["w8_head"]["targets"] == [LM_HEAD_TARGET_RE, MTP_FC_TARGET_RE]
+
+    with safe_open(str(out_untied / "model_mtp.safetensors"), framework="pt", device="cpu") as f_mtp:
+        assert "mtp.fc.weight_packed" in f_mtp.keys()
+        assert f_mtp.get_tensor("mtp.fc.weight_packed").shape == (64, 32)
+        assert f_mtp.get_tensor("mtp.layers.0.self_attn.q_proj.weight_packed").shape == (64, 8)
+
+    # Verify HF compressed-tensors loads the mixed W2/W4/W8 checkpoint cleanly (removing synthetic partial MTP shard)
+    (out_untied / "model_mtp.safetensors").unlink()
+    loaded = Qwen3_5ForConditionalGeneration.from_pretrained(out_untied, dtype=torch.bfloat16).eval()
+    logits = loaded(input_ids=rows[0].unsqueeze(0)).logits
+    assert logits.shape == (1, 16, 128) and torch.isfinite(logits).all()
+
+    # Verify tied-embedding guard leaves lm_head unquantized and ignored
+    tied_dir = tmp_path / "base_tied"
+    shutil.copytree(base_dir, tied_dir)
+    (tied_dir / "model_mtp.safetensors").unlink()
+    tied_cfg = json.loads((tied_dir / "config.json").read_text())
+    tied_cfg["tie_word_embeddings"] = True
+    tied_cfg["text_config"]["tie_word_embeddings"] = True
+    (tied_dir / "config.json").write_text(json.dumps(tied_cfg, indent=2) + "\n")
+
+    out_tied = tmp_path / "out_tied"
+    tied_receipt = assemble_rco_checkpoint(
+        base_dir=tied_dir,
+        bank_dir=bank_dir,
+        choices=[0] * len(manifest["groups"]),
+        output_dir=out_tied,
+        quantize_lm_head_w8=True,
+        component_group_size=64,
+    )
+    assert "w8_head_tensors" not in tied_receipt
+    tied_qcfg = json.loads((out_tied / "config.json").read_text())["quantization_config"]
+    assert "lm_head" in tied_qcfg["ignore"]
+    assert "w8_head" not in tied_qcfg["config_groups"]

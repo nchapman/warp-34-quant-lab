@@ -22,7 +22,7 @@ from warp_quant.hadamard_gptq import (
 from warp_quant.lablog import log_event
 from warp_quant.models import model_class, quant_recipe, resolve
 from warp_quant.rco import allocation
-from warp_quant.rco.assemble import assemble_rco_checkpoint
+from warp_quant.rco.assemble import assemble_rco_checkpoint, calibrate_lm_head_w8
 from warp_quant.rco.bank import (
     attach_online_hadamard_hooks,
     build_rco_bank,
@@ -364,14 +364,35 @@ def run_rco_cli(args: argparse.Namespace) -> None:
 
     comp_dir = work_dir / "components"
     comp_dir.mkdir(parents=True, exist_ok=True)
+    want_lm_head_w8 = bool(getattr(args, "quantize_lm_head_w8", True))
+    text_cfg = model.config.get_text_config() if hasattr(model.config, "get_text_config") else model.config
+    is_tied = bool(
+        getattr(model.config, "tie_word_embeddings", False) or getattr(text_cfg, "tie_word_embeddings", False)
+    )
     mtp_packed = None
     vision_packed = None
+    lm_head_packed = None
+    if want_lm_head_w8 and not is_tied:
+        lm_file = comp_dir / "lm_head_w8.pt"
+        if lm_file.is_file():
+            lm_head_packed = torch.load(lm_file, map_location="cpu", weights_only=True)
+        else:
+            log_event("RCO_LM_HEAD_W8_CALIBRATE", rows=len(teacher_states))
+            lm_head_packed = calibrate_lm_head_w8(
+                model.lm_head.weight.detach(),
+                teacher_states,
+                group_size=64,
+                dampening_frac=args.dampening_frac,
+                device=device,
+            )
+            torch.save(lm_head_packed, lm_file)
+
     if args.quantize_mtp:
         mtp_file = comp_dir / "mtp_w4.pt"
         if mtp_file.is_file():
             mtp_packed = torch.load(mtp_file, map_location="cpu", weights_only=True)
         else:
-            log_event("RCO_MTP_CALIBRATE")
+            log_event("RCO_MTP_CALIBRATE", quantize_fc_w8=want_lm_head_w8)
             mtp_packed = _gptq_calibrate_mtp(
                 model,
                 base_dir,
@@ -381,6 +402,7 @@ def run_rco_cli(args: argparse.Namespace) -> None:
                 actorder="static",
                 dampening_frac=args.dampening_frac,
                 max_calib_samples=64,
+                quantize_fc_w8=want_lm_head_w8,
             )
             torch.save(mtp_packed, mtp_file)
 
@@ -596,8 +618,10 @@ def run_rco_cli(args: argparse.Namespace) -> None:
                 allocation_name=name,
                 mtp_packed=mtp_packed,
                 vision_packed=vision_packed,
+                lm_head_packed=lm_head_packed,
                 scale_overrides=scale_overrides,
                 bf16_overrides=bf16_overrides,
+                quantize_lm_head_w8=want_lm_head_w8,
                 component_group_size=64,
             )
             print(f"[ok] assembled {out_ckpt}")

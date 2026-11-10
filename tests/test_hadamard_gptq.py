@@ -332,9 +332,11 @@ def test_moe_mtp_and_quant_load_with_transforms():
             actorder="static",
             dampening_frac=0.01,
             max_calib_samples=4,
+            quantize_fc_w8=True,
         )
-        # 4 self_attn + 3 shared_expert + 2 experts * 3 = 13 MTP linears
-        assert len(packed_mtp) == 13
+        # 4 self_attn + 3 shared_expert + 2 experts * 3 + 1 W8 mtp.fc = 14 MTP linears
+        assert len(packed_mtp) == 14
+        assert packed_mtp["mtp.fc"]["weight_packed"].shape == (64, 32)
 
         save_file(mtp_sd, str(quant_d / "model_mtp.safetensors"))
         (quant_d / "config.json").write_text(
@@ -368,8 +370,10 @@ def test_moe_mtp_and_quant_load_with_transforms():
             group_size=64,
             hadamard_block_size=64,
             precomputed_packed=packed_mtp,
+            quantize_mtp_fc_w8=True,
         )
-        assert counts["mtp_quantized"] == 13
+        assert counts["mtp_quantized"] == 14
+        assert counts["mtp_fc_w8"] == 1
         _update_config_for_components(
             quant_d,
             group_size=64,
@@ -378,6 +382,8 @@ def test_moe_mtp_and_quant_load_with_transforms():
             quantize_mtp=True,
             quantize_vision=False,
             vision_fc2_channel=False,
+            quantize_lm_head_w8=True,
+            quantize_mtp_fc_w8=True,
         )
         mtp_q = _load_mtp_module_from_checkpoint(quant_d, cfg, torch.device("cpu"))
         ids = torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long)
@@ -423,6 +429,11 @@ def test_moe_mtp_and_quant_load_with_transforms():
                 packed = _pack_w4_tensor(w_rot, strategy="group", group_size=64)
                 for pk, pv in packed.items():
                     main_sd[f"{prefix}.{pk}"] = pv.contiguous()
+            elif k == "lm_head.weight":
+                from warp_quant.hadamard_gptq import _pack_w8_mse_tensor
+
+                for pk, pv in _pack_w8_mse_tensor(v, group_size=64).items():
+                    main_sd[f"lm_head.{pk}"] = pv.contiguous()
             else:
                 main_sd[k] = v.contiguous()
         save_file(main_sd, str(quant_d / "model.safetensors"))

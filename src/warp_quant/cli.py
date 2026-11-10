@@ -107,6 +107,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Quantize model.visual.* linear layers to W4A16-HGPTQ (default: enabled)",
     )
     q.add_argument(
+        "--quantize-lm-head-w8",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Quantize untied lm_head (and mtp.fc when MTP is quantized) to unrotated W8_g64 GPTQ+MSE (default: enabled)",
+    )
+    q.add_argument(
         "--component-quant-mode",
         choices=["gptq", "rtn"],
         default="gptq",
@@ -202,6 +208,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Calibrate and include W4A16-HGPTQ Vision in assembled checkpoints",
     )
     r.add_argument("--vision-calib-dir", default="data/vision-calib-v2")
+    r.add_argument(
+        "--quantize-lm-head-w8",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Quantize untied lm_head (and mtp.fc when MTP is quantized) to unrotated W8_g64 GPTQ+MSE (default: enabled)",
+    )
     r.add_argument(
         "--scale-qat",
         action=argparse.BooleanOptionalAction,

@@ -13,6 +13,8 @@ from transformers import AutoProcessor
 
 from warp_quant.hadamard_gptq import (
     BASE_IGNORE,
+    LM_HEAD_TARGET_RE,
+    MTP_FC_TARGET_RE,
     MTP_HAD_TARGET_RE,
     MTP_TARGET_RE,
     TEXT_HAD_TARGET_RE,
@@ -20,6 +22,7 @@ from warp_quant.hadamard_gptq import (
     VISION_GROUP_TARGET_RE,
     _assert_packed_alignment,
     _clean_and_augment_shards,
+    _pack_w8_mse_tensor,
 )
 from warp_quant.rco.bank import load_rco_bank
 from warp_quant.rco.options import pack_candidate
@@ -41,6 +44,45 @@ def _unanchored_layer_target_re(member_name: str) -> str:
     return rf"re:.*(?<!mtp\.){suffix}$"
 
 
+@torch.no_grad()
+def calibrate_lm_head_w8(
+    lm_head_weight: torch.Tensor,
+    post_norm_states: list[torch.Tensor],
+    *,
+    group_size: int = 64,
+    dampening_frac: float = 0.01,
+    device: torch.device | str | None = None,
+) -> dict[str, torch.Tensor]:
+    """Calibrate untied lm_head to unrotated W8 (MSE-init Cholesky GPTQ) from post-norm hidden states."""
+    from warp_quant.hadamard_gptq import _gptq_pack_tensor
+
+    dev = torch.device(device) if device is not None else lm_head_weight.device
+    k_in = int(lm_head_weight.shape[1])
+    hessian = torch.zeros((k_in, k_in), dtype=torch.float32, device=dev)
+    total_tokens = 0
+    for h in post_norm_states:
+        if not isinstance(h, torch.Tensor):
+            continue
+        x = h.to(device=dev, dtype=torch.float32).reshape(-1, k_in)
+        if x.shape[0] == 0:
+            continue
+        hessian.addmm_(x.T, x, beta=1.0, alpha=2.0)
+        total_tokens += int(x.shape[0])
+    if total_tokens == 0:
+        raise ValueError("calibrate_lm_head_w8 received no valid post-norm hidden states")
+    return _gptq_pack_tensor(
+        lm_head_weight.to(device=dev),
+        hessian,
+        torch.tensor([total_tokens], dtype=torch.int64, device=dev),
+        strategy="group",
+        group_size=group_size,
+        actorder=None,
+        dampening_frac=dampening_frac,
+        num_bits=8,
+        cd_passes=0,
+    )
+
+
 def build_rco_quantization_config(
     base_cfg: dict,
     manifest: dict,
@@ -50,6 +92,8 @@ def build_rco_quantization_config(
     quantize_vision: bool = False,
     vision_fc2_channel: bool = False,
     component_group_size: int = 64,
+    quantize_lm_head_w8: bool = False,
+    quantize_mtp_fc_w8: bool = False,
 ) -> dict:
     """Build a compressed-tensors quantization_config with one config_group per active option."""
     options = manifest["options"]
@@ -129,11 +173,52 @@ def build_rco_quantization_config(
                 "weights": dict(comp_weights, strategy="channel", group_size=None),
             }
 
+    w8_head_targets: list[str] = []
+    if quantize_lm_head_w8:
+        w8_head_targets.append(LM_HEAD_TARGET_RE)
+    if quantize_mtp_fc_w8:
+        w8_head_targets.append(MTP_FC_TARGET_RE)
+    if w8_head_targets:
+        merged = False
+        for grp_cfg in config_groups.values():
+            w_cfg = grp_cfg.get("weights", {})
+            if (
+                w_cfg.get("num_bits") == 8
+                and w_cfg.get("strategy") == "group"
+                and w_cfg.get("group_size") == component_group_size
+                and w_cfg.get("actorder") is None
+            ):
+                grp_cfg["targets"].extend(w8_head_targets)
+                merged = True
+                break
+        if not merged:
+            config_groups["w8_head"] = {
+                "format": "pack-quantized",
+                "input_activations": None,
+                "output_activations": None,
+                "targets": w8_head_targets,
+                "weights": {
+                    "actorder": None,
+                    "block_structure": None,
+                    "dynamic": False,
+                    "group_size": component_group_size,
+                    "num_bits": 8,
+                    "observer": "minmax",
+                    "observer_kwargs": {},
+                    "scale_dtype": None,
+                    "strategy": "group",
+                    "symmetric": True,
+                    "type": "int",
+                    "zp_dtype": None,
+                },
+            }
+
+    top_ignore = [ig for ig in BASE_IGNORE if not (quantize_lm_head_w8 and ig == "lm_head")]
     qcfg: dict = {
         "config_groups": config_groups,
         "format": "pack-quantized",
         "global_compression_ratio": None,
-        "ignore": list(BASE_IGNORE),
+        "ignore": top_ignore,
         "kv_cache_scheme": None,
         "quant_method": "compressed-tensors",
         "quantization_status": "compressed",
@@ -217,10 +302,12 @@ def assemble_rco_checkpoint(
     allocation_name: str = "rco",
     mtp_packed: dict[str, dict[str, torch.Tensor]] | None = None,
     vision_packed: dict[str, dict[str, torch.Tensor]] | None = None,
+    lm_head_packed: dict[str, torch.Tensor] | None = None,
     scale_overrides: dict[str, torch.Tensor] | None = None,
     bf16_overrides: dict[str, torch.Tensor] | None = None,
     quantize_mtp_rtn: bool = False,
     quantize_vision_rtn: bool = False,
+    quantize_lm_head_w8: bool = False,
     component_group_size: int = 64,
 ) -> dict:
     """Stream base safetensors shards, replace eligible text weights with packed RCO candidates, and stamp config."""
@@ -247,10 +334,12 @@ def assemble_rco_checkpoint(
             allocation_name=allocation_name,
             mtp_packed=mtp_packed,
             vision_packed=vision_packed,
+            lm_head_packed=lm_head_packed,
             scale_overrides=scale_overrides,
             bf16_overrides=bf16_overrides,
             quantize_mtp_rtn=quantize_mtp_rtn,
             quantize_vision_rtn=quantize_vision_rtn,
+            quantize_lm_head_w8=quantize_lm_head_w8,
             component_group_size=component_group_size,
         )
     except BaseException:
@@ -269,10 +358,12 @@ def _assemble_rco_checkpoint_into(
     allocation_name: str = "rco",
     mtp_packed: dict[str, dict[str, torch.Tensor]] | None = None,
     vision_packed: dict[str, dict[str, torch.Tensor]] | None = None,
+    lm_head_packed: dict[str, torch.Tensor] | None = None,
     scale_overrides: dict[str, torch.Tensor] | None = None,
     bf16_overrides: dict[str, torch.Tensor] | None = None,
     quantize_mtp_rtn: bool = False,
     quantize_vision_rtn: bool = False,
+    quantize_lm_head_w8: bool = False,
     component_group_size: int = 64,
 ) -> dict:
     groups = manifest["groups"]
@@ -295,12 +386,19 @@ def _assemble_rco_checkpoint_into(
     base_cfg = json.loads((base_dir / "config.json").read_text())
     vision_inter = base_cfg.get("vision_config", {}).get("intermediate_size", 0)
     vision_fc2_channel = (vision_inter % component_group_size != 0) if vision_inter else False
+    is_tied = bool(
+        base_cfg.get("tie_word_embeddings") or base_cfg.get("text_config", {}).get("tie_word_embeddings")
+    )
+    want_lm_head_w8 = (quantize_lm_head_w8 or lm_head_packed is not None) and not is_tied
 
     index_path = base_dir / "model.safetensors.index.json"
     has_index = index_path.is_file()
     index_data = json.loads(index_path.read_text()) if has_index else None
     new_weight_map: dict[str, str] = {}
     code_offsets: dict[str, dict[str, float | int]] = {}
+    w8_head_tensors: list[str] = []
+    did_quantize_lm_head_w8 = False
+    has_mtp_fc_in_base = False
     total_bytes = 0
     packed_count = 0
 
@@ -309,6 +407,28 @@ def _assemble_rco_checkpoint_into(
         out_tensors: dict[str, torch.Tensor] = {}
         with safe_open(str(shard_path), framework="pt", device="cpu") as f:
             for key in f.keys():
+                if key == "mtp.fc.weight":
+                    has_mtp_fc_in_base = True
+                if key == "lm_head.weight" and want_lm_head_w8:
+                    raw_lm = f.get_tensor(key)
+                    if (
+                        raw_lm.ndim == 2
+                        and raw_lm.shape[0] % 64 == 0
+                        and raw_lm.shape[1] % component_group_size == 0
+                    ):
+                        packed = (
+                            lm_head_packed
+                            if lm_head_packed is not None
+                            else _pack_w8_mse_tensor(raw_lm, group_size=component_group_size)
+                        )
+                        for suffix, pt in packed.items():
+                            full_k = f"lm_head.{suffix}"
+                            out_tensors[full_k] = pt
+                            new_weight_map[full_k] = shard_name
+                            total_bytes += pt.numel() * pt.element_size()
+                        did_quantize_lm_head_w8 = True
+                        w8_head_tensors.append("lm_head")
+                        continue
                 if key.endswith(".weight") and key[:-7] in member_to_choice:
                     prefix = key[:-7]
                     c_idx = member_to_choice[prefix]
@@ -356,6 +476,11 @@ def _assemble_rco_checkpoint_into(
 
     has_mtp = mtp_packed is not None or quantize_mtp_rtn
     has_vis = vision_packed is not None or quantize_vision_rtn
+    want_mtp_fc_w8 = (
+        has_mtp
+        and has_mtp_fc_in_base
+        and (quantize_lm_head_w8 or bool(mtp_packed and "mtp.fc" in mtp_packed))
+    )
     if has_mtp or has_vis:
         precomputed: dict[str, dict[str, torch.Tensor]] = {}
         if mtp_packed:
@@ -369,7 +494,14 @@ def _assemble_rco_checkpoint_into(
             group_size=component_group_size,
             hadamard_block_size=int(manifest.get("hadamard_block_size", 64)),
             precomputed_packed=precomputed if precomputed else None,
+            quantize_mtp_fc_w8=want_mtp_fc_w8,
         )
+        if want_mtp_fc_w8:
+            w8_head_tensors.append("mtp.fc")
+        out_idx_path = output_dir / "model.safetensors.index.json"
+        if out_idx_path.is_file():
+            out_idx = json.loads(out_idx_path.read_text())
+            total_bytes = int(out_idx.get("metadata", {}).get("total_size", total_bytes))
 
     base_cfg["quantization_config"] = build_rco_quantization_config(
         base_cfg,
@@ -379,6 +511,8 @@ def _assemble_rco_checkpoint_into(
         quantize_vision=has_vis,
         vision_fc2_channel=vision_fc2_channel,
         component_group_size=component_group_size,
+        quantize_lm_head_w8=did_quantize_lm_head_w8,
+        quantize_mtp_fc_w8=want_mtp_fc_w8,
     )
     (output_dir / "config.json").write_text(json.dumps(base_cfg, indent=2, sort_keys=True) + "\n")
 
@@ -414,5 +548,7 @@ def _assemble_rco_checkpoint_into(
     }
     if code_offsets:
         receipt["code_offsets"] = code_offsets
+    if w8_head_tensors:
+        receipt["w8_head_tensors"] = w8_head_tensors
     (output_dir / "rco_manifest.json").write_text(json.dumps(receipt, indent=2) + "\n")
     return receipt

@@ -59,6 +59,8 @@ VISION_GROUP_TARGET_RE = (
     r"re:.*visual\.(blocks\.\d+\.(attn\.(qkv|proj)|mlp\.linear_fc1)|merger\.linear_fc[12])$"
 )
 VISION_FC2_TARGET_RE = r"re:.*visual\.blocks\.\d+\.mlp\.linear_fc2$"
+LM_HEAD_TARGET_RE = r"re:(?:^|.*\.)lm_head$"
+MTP_FC_TARGET_RE = r"re:(?:^|.*\.)mtp\.fc$"
 
 BASE_IGNORE = [
     "lm_head",
@@ -189,6 +191,64 @@ def _pack_w4_tensor(
     return {k: v.contiguous() for k, v in compressed.items()}
 
 
+def _pack_w8_mse_tensor(weight: torch.Tensor, group_size: int = 64) -> dict[str, torch.Tensor]:
+    """Quantize a 2D weight tensor to symmetric INT8 with MSE-optimal group scales and pack losslessly."""
+    from warp_quant.rco.options import find_mse_scale, pack_candidate
+
+    w_f32 = weight.detach().float()
+    n_out, k_in = w_f32.shape
+    if k_in % group_size != 0:
+        raise ValueError(f"Invalid group_size={group_size} for in_features={k_in}")
+    scale = find_mse_scale(w_f32, 8, group_size)
+    grouped = w_f32.view(n_out, k_in // group_size, group_size)
+    codes = torch.clamp(torch.round(grouped / scale.float().unsqueeze(-1)), -128, 127).to(torch.int8)
+    return {k: v.contiguous().cpu() for k, v in pack_candidate(codes.reshape(n_out, k_in), scale, 8).items()}
+
+
+def _decompress_packed_2d(
+    weight_packed: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_shape: torch.Tensor,
+) -> torch.Tensor:
+    """Decompress any symmetric pack-quantized 2D INT weight tensor (W2/W4/W8, group or channel)."""
+    from compressed_tensors.compressors import PackedQuantizationCompressor
+    from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
+
+    n_out = int(weight_shape[0])
+    k_in = int(weight_shape[1])
+    packed_cols = int(weight_packed.shape[1])
+    if (32 * packed_cols) % k_in != 0:
+        raise ValueError(f"Cannot infer num_bits from packed_cols={packed_cols} and k_in={k_in}")
+    num_bits = (32 * packed_cols) // k_in
+    num_groups = int(weight_scale.shape[1])
+    if num_groups == 1:
+        strategy = "channel"
+        group_size = None
+    else:
+        if k_in % num_groups != 0:
+            raise ValueError(f"k_in={k_in} not divisible by num_groups={num_groups}")
+        strategy = "group"
+        group_size = k_in // num_groups
+    scheme = QuantizationScheme(
+        targets=["Linear"],
+        weights=QuantizationArgs(
+            num_bits=num_bits,
+            type="int",
+            symmetric=True,
+            strategy=strategy,
+            group_size=group_size,
+        ),
+    )
+    return PackedQuantizationCompressor.decompress(
+        {
+            "weight_packed": weight_packed,
+            "weight_scale": weight_scale,
+            "weight_shape": torch.tensor([n_out, k_in], dtype=torch.int64),
+        },
+        scheme,
+    )["weight"]
+
+
 def _gptq_pack_tensor(
     weight: torch.Tensor,
     hessian: torch.Tensor,
@@ -198,14 +258,17 @@ def _gptq_pack_tensor(
     actorder: str | None,
     dampening_frac: float,
     *,
-    cd_passes: int = 2,
+    num_bits: int = 4,
+    cd_passes: int | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Quantize a 2D BF16 weight tensor using MSE-init Cholesky GPTQ + H-CD and pack losslessly to INT4."""
+    """Quantize a 2D BF16 weight tensor using MSE-init Cholesky GPTQ + H-CD and pack losslessly."""
     from compressed_tensors.quantization import QuantizationArgs
     from llmcompressor.modifiers.gptq.gptq_quantize import quantize_weight
 
     from warp_quant.rco.options import find_mse_scale, pack_candidate, refine_hessian_cd
 
+    if num_bits not in (2, 4, 8):
+        raise ValueError(f"Unsupported num_bits={num_bits}; expected 2, 4, or 8")
     w_f32 = weight.detach().float()
     n_out, k_in = w_f32.shape
     if strategy == "group":
@@ -217,9 +280,11 @@ def _gptq_pack_tensor(
     else:
         raise ValueError(f"Unsupported strategy: {strategy}")
 
-    scale = find_mse_scale(w_f32, 4, eff_gs)
+    qmin = -(1 << (num_bits - 1))
+    qmax = (1 << (num_bits - 1)) - 1
+    scale = find_mse_scale(w_f32, num_bits, eff_gs)
     qargs = QuantizationArgs(
-        num_bits=4,
+        num_bits=num_bits,
         type="int",
         symmetric=True,
         strategy=strategy,
@@ -243,19 +308,20 @@ def _gptq_pack_tensor(
         raise RuntimeError("GPTQ fell back to RTN during component quantization")
     q_w = q_w_batch[0]
     scale_exp = scale.float().repeat_interleave(eff_gs, dim=1)
-    codes = torch.clamp(torch.round(q_w.float() / scale_exp), -8, 7).to(torch.int8)
-    if cd_passes > 0:
+    codes = torch.clamp(torch.round(q_w.float() / scale_exp), qmin, qmax).to(torch.int8)
+    eff_cd = (2 if num_bits == 4 else (4 if num_bits == 2 else 0)) if cd_passes is None else cd_passes
+    if eff_cd > 0:
         codes, scale = refine_hessian_cd(
             w_f32,
             norm_h,
             codes,
             scale,
-            4,
+            num_bits,
             eff_gs,
-            passes=cd_passes,
+            passes=eff_cd,
             dampening_frac=dampening_frac,
         )
-    return {k: v.contiguous().cpu() for k, v in pack_candidate(codes, scale, 4).items()}
+    return {k: v.contiguous().cpu() for k, v in pack_candidate(codes, scale, num_bits).items()}
 
 
 @torch.no_grad()
@@ -269,6 +335,7 @@ def _gptq_calibrate_mtp(
     actorder: str | None,
     dampening_frac: float,
     max_calib_samples: int = 64,
+    quantize_fc_w8: bool = False,
 ) -> dict[str, dict[str, torch.Tensor]]:
     """Run Cholesky GPTQ (+ optional Hadamard) on the Native MTP linear layers using text calibration samples."""
     import re
@@ -285,17 +352,22 @@ def _gptq_calibrate_mtp(
     mtp_pat = re.compile(MTP_TARGET_RE.removeprefix("re:"))
     mtp_had_pat = re.compile(MTP_HAD_TARGET_RE.removeprefix("re:"))
     target_mods: dict[str, nn.Linear] = {}
+    target_bits: dict[str, int] = {}
     hessians: dict[str, torch.Tensor] = {}
     num_samples: dict[str, torch.Tensor] = {}
     hooks = []
 
     for name, mod in mtp.named_modules():
-        if not isinstance(mod, nn.Linear) or not mtp_pat.match(f"mtp.{name}"):
+        if not isinstance(mod, nn.Linear):
             continue
-        use_had = hadamard_block_size > 0 and bool(mtp_had_pat.match(f"mtp.{name}"))
+        is_w8_fc = quantize_fc_w8 and name == "fc"
+        if not is_w8_fc and not mtp_pat.match(f"mtp.{name}"):
+            continue
+        use_had = (not is_w8_fc) and hadamard_block_size > 0 and bool(mtp_had_pat.match(f"mtp.{name}"))
         if use_had:
             mod.weight.data = _hadamard_rotate_weight(mod.weight.data, hadamard_block_size)
         target_mods[name] = mod
+        target_bits[name] = 8 if is_w8_fc else 4
         hessians[name] = make_empty_hessian(mod, device)
         num_samples[name] = torch.zeros(1, device=device, dtype=torch.int64)
 
@@ -333,18 +405,58 @@ def _gptq_calibrate_mtp(
 
     packed_by_prefix: dict[str, dict[str, torch.Tensor]] = {}
     for name, mod in target_mods.items():
+        bits = target_bits[name]
         packed_by_prefix[f"mtp.{name}"] = _gptq_pack_tensor(
             mod.weight.data,
             hessians.pop(name),
             num_samples.pop(name),
             strategy="group",
             group_size=group_size,
-            actorder=actorder,
+            actorder=None if bits == 8 else actorder,
             dampening_frac=dampening_frac,
+            num_bits=bits,
+            cd_passes=0 if bits == 8 else None,
         )
     del mtp
     torch.cuda.empty_cache()
     return packed_by_prefix
+
+
+@torch.no_grad()
+def _gptq_calibrate_lm_head(
+    model: nn.Module,
+    ds,
+    *,
+    group_size: int,
+    dampening_frac: float,
+    max_calib_samples: int = 64,
+) -> dict[str, torch.Tensor]:
+    """Calibrate untied lm_head to unrotated W8 (GPTQ+MSE) using backbone post-norm hidden states."""
+    from warp_quant.rco.assemble import calibrate_lm_head_w8
+
+    device = next(model.parameters()).device
+    post_norm_states: list[torch.Tensor] = []
+    n_run = min(len(ds), max_calib_samples)
+    for i in range(n_run):
+        row = ds[i]
+        ids = torch.tensor(row["input_ids"], dtype=torch.long, device=device)
+        if ids.ndim == 1:
+            ids = ids.unsqueeze(0)
+        ids = ids[:, :2048]
+        if ids.shape[1] < 4:
+            continue
+        out = model.model.language_model(input_ids=ids, use_cache=False)
+        post_norm_states.append(out.last_hidden_state.detach().cpu())
+    packed = calibrate_lm_head_w8(
+        model.lm_head.weight.detach(),
+        post_norm_states,
+        group_size=group_size,
+        dampening_frac=dampening_frac,
+        device=device,
+    )
+    del post_norm_states
+    torch.cuda.empty_cache()
+    return packed
 
 
 @torch.no_grad()
@@ -468,6 +580,8 @@ def _clean_and_augment_shards(
     group_size: int,
     hadamard_block_size: int,
     precomputed_packed: dict[str, dict[str, torch.Tensor]] | None = None,
+    quantize_mtp_fc_w8: bool = False,
+    quantize_lm_head_w8: bool = False,
 ) -> dict[str, int]:
     """Strip extraneous *.v_input.weight keys and optionally quantize MTP / Vision in-place."""
     index_path = save_dir / "model.safetensors.index.json"
@@ -503,6 +617,8 @@ def _clean_and_augment_shards(
     counts = {
         "stripped_transform_weights": 0,
         "mtp_quantized": 0,
+        "mtp_fc_w8": 0,
+        "lm_head_w8": 0,
         "vision_quantized": 0,
         "vision_fc2_channel": 0,
     }
@@ -520,6 +636,27 @@ def _clean_and_augment_shards(
             #    so neither transformers nor vLLM AutoWeightsLoader sees an unknown param.
             if key.endswith(".v_input.weight"):
                 counts["stripped_transform_weights"] += 1
+                modified = True
+                continue
+
+            if (
+                key == "lm_head.weight"
+                and (quantize_lm_head_w8 or (precomputed_packed and "lm_head" in precomputed_packed))
+                and tensor.ndim == 2
+                and tensor.shape[0] % 64 == 0
+                and tensor.shape[1] % group_size == 0
+            ):
+                prefix = "lm_head"
+                if precomputed_packed and prefix in precomputed_packed:
+                    packed = precomputed_packed[prefix]
+                else:
+                    packed = _pack_w8_mse_tensor(tensor, group_size=group_size)
+                for suffix, pt in packed.items():
+                    full_key = f"{prefix}.{suffix}"
+                    updated[full_key] = pt
+                    new_weight_map[full_key] = shard_name
+                    total_bytes += pt.numel() * pt.element_size()
+                counts["lm_head_w8"] += 1
                 modified = True
                 continue
 
@@ -566,6 +703,26 @@ def _clean_and_augment_shards(
                         new_weight_map[full_key] = shard_name
                         total_bytes += pt.numel() * pt.element_size()
                     counts["mtp_quantized"] += 1
+                modified = True
+                continue
+
+            if (
+                quantize_mtp
+                and key == "mtp.fc.weight"
+                and (quantize_mtp_fc_w8 or (precomputed_packed and "mtp.fc" in precomputed_packed))
+            ):
+                prefix = "mtp.fc"
+                if precomputed_packed and prefix in precomputed_packed:
+                    packed = precomputed_packed[prefix]
+                else:
+                    packed = _pack_w8_mse_tensor(tensor, group_size=group_size)
+                for suffix, pt in packed.items():
+                    full_key = f"{prefix}.{suffix}"
+                    updated[full_key] = pt
+                    new_weight_map[full_key] = shard_name
+                    total_bytes += pt.numel() * pt.element_size()
+                counts["mtp_quantized"] += 1
+                counts["mtp_fc_w8"] += 1
                 modified = True
                 continue
 
@@ -667,6 +824,8 @@ def _update_config_for_components(
     quantize_mtp: bool,
     quantize_vision: bool,
     vision_fc2_channel: bool,
+    quantize_lm_head_w8: bool = False,
+    quantize_mtp_fc_w8: bool = False,
 ) -> None:
     """Ensure config.json has clean regex targets for Text, MTP, and Vision in both quantization_config and transform_config."""
     cfg_path = save_dir / "config.json"
@@ -715,8 +874,28 @@ def _update_config_for_components(
             "weights": fc2_weights,
         }
 
+    w8_head_targets: list[str] = []
+    if quantize_lm_head_w8:
+        w8_head_targets.append(LM_HEAD_TARGET_RE)
+    if quantize_mtp_fc_w8:
+        w8_head_targets.append(MTP_FC_TARGET_RE)
+    if w8_head_targets:
+        config_groups["w8_head"] = {
+            "format": "pack-quantized",
+            "input_activations": None,
+            "output_activations": None,
+            "targets": w8_head_targets,
+            "weights": dict(
+                base_weights,
+                num_bits=8,
+                group_size=group_size,
+                strategy="group",
+                actorder=None,
+            ),
+        }
+
     qcfg["config_groups"] = config_groups
-    qcfg["ignore"] = list(BASE_IGNORE)
+    qcfg["ignore"] = [ig for ig in BASE_IGNORE if not (quantize_lm_head_w8 and ig == "lm_head")]
 
     if hadamard_block_size > 0:
         main_had_targets = [TEXT_HAD_TARGET_RE]
@@ -976,8 +1155,26 @@ def run_quantize(args: argparse.Namespace) -> None:
 
     ds = get_calibration_dataset(processor, calib, num_samples, max_seq_length, window=window, seed=args.seed)
 
+    want_head_w8 = bool(getattr(args, "quantize_lm_head_w8", True))
+    text_cfg_obj = (
+        model.config.get_text_config() if hasattr(model.config, "get_text_config") else model.config
+    )
+    is_tied = bool(
+        getattr(model.config, "tie_word_embeddings", False)
+        or getattr(text_cfg_obj, "tie_word_embeddings", False)
+    )
+    want_lm_head_w8 = want_head_w8 and not is_tied
+
     precomputed_packed: dict[str, dict[str, torch.Tensor]] = {}
     if args.component_quant_mode == "gptq":
+        if want_lm_head_w8 and hasattr(model, "lm_head"):
+            precomputed_packed["lm_head"] = _gptq_calibrate_lm_head(
+                model,
+                ds,
+                group_size=args.group_size,
+                dampening_frac=args.dampening_frac,
+                max_calib_samples=args.component_calib_samples,
+            )
         if args.quantize_mtp:
             mtp_packed = _gptq_calibrate_mtp(
                 model,
@@ -988,6 +1185,7 @@ def run_quantize(args: argparse.Namespace) -> None:
                 actorder=actorder,
                 dampening_frac=args.dampening_frac,
                 max_calib_samples=args.component_calib_samples,
+                quantize_fc_w8=want_head_w8,
             )
             precomputed_packed.update(mtp_packed)
         if args.quantize_vision:
@@ -1040,7 +1238,7 @@ def run_quantize(args: argparse.Namespace) -> None:
     model.save_pretrained(str(output_dir), save_compressed=True)
     processor.save_pretrained(str(output_dir))
 
-    # Clean *.v_input.weight and optionally quantize MTP / Vision in-place
+    # Clean *.v_input.weight and optionally quantize MTP / Vision / W8 head in-place
     shard_counts = _clean_and_augment_shards(
         output_dir,
         quantize_mtp=args.quantize_mtp,
@@ -1048,6 +1246,8 @@ def run_quantize(args: argparse.Namespace) -> None:
         group_size=args.group_size,
         hadamard_block_size=args.hadamard_block_size,
         precomputed_packed=precomputed_packed,
+        quantize_mtp_fc_w8=want_head_w8,
+        quantize_lm_head_w8=want_lm_head_w8,
     )
     _update_config_for_components(
         output_dir,
@@ -1057,6 +1257,8 @@ def run_quantize(args: argparse.Namespace) -> None:
         quantize_mtp=args.quantize_mtp,
         quantize_vision=args.quantize_vision,
         vision_fc2_channel=shard_counts["vision_fc2_channel"] > 0,
+        quantize_lm_head_w8=shard_counts["lm_head_w8"] > 0,
+        quantize_mtp_fc_w8=shard_counts["mtp_fc_w8"] > 0,
     )
 
     _assert_packed_alignment(output_dir)
@@ -1096,29 +1298,16 @@ def _load_moe_quant_model_direct(path: Path, device: str) -> nn.Module:
     import re
     from contextlib import ExitStack
 
-    from compressed_tensors.compressors import PackedQuantizationCompressor
-    from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
     from llmcompressor.utils.dev import skip_weights_initialize
     from transformers import Qwen3_5MoeConfig
 
     raw_cfg = json.loads((path / "config.json").read_text())
-    qcfg = raw_cfg["quantization_config"]
-    g_size = qcfg["config_groups"]["group_0"]["weights"]["group_size"]
     clean_cfg_dict = {k: v for k, v in raw_cfg.items() if k != "quantization_config"}
     cfg = Qwen3_5MoeConfig.from_dict(clean_cfg_dict)
     cls = model_class(str(path))
 
     with torch.device(device), skip_weights_initialize():
         model = cls._from_config(cfg, dtype=torch.bfloat16).eval()
-
-    group_scheme = QuantizationScheme(
-        targets=["Linear"],
-        weights=QuantizationArgs(num_bits=4, type="int", symmetric=True, strategy="group", group_size=g_size),
-    )
-    channel_scheme = QuantizationScheme(
-        targets=["Linear"],
-        weights=QuantizationArgs(num_bits=4, type="int", symmetric=True, strategy="channel", group_size=None),
-    )
 
     shards = [s for s in sorted(path.glob("*.safetensors")) if s.name != "model_mtp.safetensors"]
     exp_pat = re.compile(
@@ -1169,14 +1358,11 @@ def _load_moe_quant_model_direct(path: Path, device: str) -> nn.Module:
                     )
                     for e in range(num_exp)
                 ]
-                deq = PackedQuantizationCompressor.decompress(
-                    {
-                        "weight_packed": torch.cat(wps, dim=0).to(device),
-                        "weight_scale": torch.cat(wss, dim=0).to(device),
-                        "weight_shape": torch.tensor([num_exp * out_dim, in_dim]),
-                    },
-                    group_scheme,
-                )["weight"].view(num_exp, out_dim, in_dim)
+                deq = _decompress_packed_2d(
+                    torch.cat(wps, dim=0).to(device),
+                    torch.cat(wss, dim=0).to(device),
+                    torch.tensor([num_exp * out_dim, in_dim]),
+                ).view(num_exp, out_dim, in_dim)
                 if proj_name == "gate_proj":
                     experts.gate_up_proj.data[:, :inter].copy_(deq)
                 elif proj_name == "up_proj":
@@ -1187,18 +1373,14 @@ def _load_moe_quant_model_direct(path: Path, device: str) -> nn.Module:
                     loaded_params.add(f"model.language_model.layers.{l_idx}.mlp.experts.down_proj")
                 del wps, wss, deq
 
-        # 2. Decompress all non-expert packed 2D linears (attention, GDN, vision)
+        # 2. Decompress all non-expert packed 2D linears (attention, GDN, vision, lm_head)
         for prefix in packed_prefixes:
             if exp_pat.match(prefix) or prefix.startswith("mtp."):
                 continue
             wp = key_to_f[f"{prefix}.weight_packed"].get_tensor(f"{prefix}.weight_packed").to(device)
             ws = key_to_f[f"{prefix}.weight_scale"].get_tensor(f"{prefix}.weight_scale").to(device)
             wsh = key_to_f[f"{prefix}.weight_shape"].get_tensor(f"{prefix}.weight_shape")
-            sch = channel_scheme if ws.shape[1] == 1 else group_scheme
-            deq = PackedQuantizationCompressor.decompress(
-                {"weight_packed": wp, "weight_scale": ws, "weight_shape": wsh},
-                sch,
-            )["weight"]
+            deq = _decompress_packed_2d(wp, ws, wsh)
             model.get_submodule(prefix).weight.data.copy_(deq)
             loaded_params.add(f"{prefix}.weight")
             del wp, ws, deq
@@ -1240,7 +1422,7 @@ def load_quant_model_with_transforms(path: str | Path, device: str = "cuda:0") -
     if cls.__name__ == "Qwen3_5MoeForConditionalGeneration":
         model = _load_moe_quant_model_direct(path, device)
     else:
-        model = cls.from_pretrained(str(path), dtype="auto", device_map={"": device})
+        model = cls.from_pretrained(str(path), dtype=torch.bfloat16, device_map={"": device})
         model.eval()
         if hasattr(model, "hf_quantizer") and hasattr(model.hf_quantizer, "compressor"):
             model.hf_quantizer.compressor.decompress_model(model)
@@ -1391,8 +1573,6 @@ def _load_mtp_module_from_checkpoint(
     linearize_experts: bool = False,
 ) -> nn.Module:
     """Instantiate FixedInputMTP and load BF16 or W4A16 (+ Hadamard) MTP weights from ckpt_dir."""
-    from compressed_tensors.compressors import PackedQuantizationCompressor
-    from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
     from compressed_tensors.transform import (
         TransformArgs,
         TransformConfig,
@@ -1427,22 +1607,12 @@ def _load_mtp_module_from_checkpoint(
             state_dict[k.removeprefix("mtp.")] = v.to(torch.bfloat16)
 
     if packed_prefixes:
-        g_size = qcfg["config_groups"]["group_0"]["weights"]["group_size"]
-        scheme = QuantizationScheme(
-            targets=["Linear"],
-            weights=QuantizationArgs(
-                num_bits=4, type="int", symmetric=True, strategy="group", group_size=g_size
-            ),
-        )
         for prefix in packed_prefixes:
-            deq = PackedQuantizationCompressor.decompress(
-                {
-                    "weight_packed": raw_mtp[f"{prefix}.weight_packed"],
-                    "weight_scale": raw_mtp[f"{prefix}.weight_scale"],
-                    "weight_shape": raw_mtp[f"{prefix}.weight_shape"],
-                },
-                scheme,
-            )["weight"]
+            deq = _decompress_packed_2d(
+                raw_mtp[f"{prefix}.weight_packed"],
+                raw_mtp[f"{prefix}.weight_scale"],
+                raw_mtp[f"{prefix}.weight_shape"],
+            )
             state_dict[f"{prefix.removeprefix('mtp.')}.weight"] = deq.to(torch.bfloat16)
 
     if is_moe_mtp:
@@ -1528,7 +1698,8 @@ def evaluate_mtp_fidelity(
     base_mtp = _load_mtp_module_from_checkpoint(base_dir, base_model.config, device)
     quant_mtp = _load_mtp_module_from_checkpoint(quant_dir, base_model.config, device)
     embed = base_model.get_input_embeddings()
-    lm_head = base_model.get_output_embeddings()
+    base_lm_head = base_model.get_output_embeddings()
+    quant_lm_head = quant_model.get_output_embeddings()
 
     selected = select_text_rows(str(eval_path), per_domain)
     isolated_rows = []
@@ -1554,9 +1725,9 @@ def evaluate_mtp_fidelity(
                 mtp_h_base = base_mtp(h_base, emb, pos)
                 mtp_h_iso = quant_mtp(h_base, emb, pos)
                 mtp_h_e2e = quant_mtp(h_quant, emb, pos)
-                ref_logits = lm_head(mtp_h_base)
-                iso_logits = lm_head(mtp_h_iso)
-                e2e_logits = lm_head(mtp_h_e2e)
+                ref_logits = base_lm_head(mtp_h_base)
+                iso_logits = base_lm_head(mtp_h_iso)
+                e2e_logits = quant_lm_head(mtp_h_e2e)
             isolated_rows.append(compare_logits(ref_logits, iso_logits, labels))
             e2e_rows.append(compare_logits(ref_logits, e2e_logits, labels))
     finally:
@@ -1803,7 +1974,9 @@ def run_probe(args: argparse.Namespace) -> None:
         return
 
     processor = AutoProcessor.from_pretrained(str(base_dir))
-    base_model = model_class(str(base_dir)).from_pretrained(str(base_dir), dtype="auto", device_map={"": 0})
+    base_model = model_class(str(base_dir)).from_pretrained(
+        str(base_dir), dtype=torch.bfloat16, device_map={"": 0}
+    )
     base_model.eval()
     torch.cuda.empty_cache()
 
@@ -1958,7 +2131,10 @@ def run_probe(args: argparse.Namespace) -> None:
 
             run_done(quant=str(quant_dir))
         finally:
+            import gc
+
             del quant_model
+            gc.collect()
             torch.cuda.empty_cache()
 
 
