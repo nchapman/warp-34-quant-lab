@@ -29,6 +29,9 @@ dev = [
 [project.scripts]
 warp-quant = "warp_quant.cli:main"
 
+[project.entry-points."vllm.general_plugins"]
+warp_quant = "warp_quant.vllm_plugin:register"
+
 [build-system]
 requires = ["uv_build>=0.11.0,<0.12.0"]
 build-backend = "uv_build"
