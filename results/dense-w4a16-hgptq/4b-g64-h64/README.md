@@ -18,7 +18,7 @@ tags:
 
 - **VRAM & footprint:** 3.19 GiB total (saving 5.49 GiB vs. BF16) across all 200 text linears, 98 vision linears, and 8 Native MTP linears (`mtp.fc` in `W8_g64`, tied `lm_head` in BF16).
 - **Quantization recipe:** 64×64 Walsh–Hadamard input rotation + MSE-initialized Cholesky GPTQ + 2-pass Hessian Coordinate Descent (`H-CD`) + end-to-end FP32-master `RMSNorm` KL tuning.
-- **Fidelity vs. BF16:** 0.0811 weighted KL (0.0681 mean KL, −1.89% PPL) on `probe-v4`, 0.0533 mean KL (+1.66% PPL) on the `probe-guard` holdout, 94.26% / 85.15% isolated/E2E MTP top-1 agreement, and 99.34% / 97.35% isolated/E2E vision top-1 agreement.
+- **Fidelity vs. BF16:** 0.0811 weighted KL (0.2133 mean KL, −1.89% PPL) on `probe-v4`, 0.0533 mean KL (0.0741 weighted KL, +0.66% PPL) on the `probe-guard` holdout, 94.26% / 85.63% isolated/E2E MTP top-1 agreement, and 99.34% / 92.38% isolated/E2E vision top-1 agreement (99.26% / 95.56% on `vision-guard-v2`).
 
 ## Quality vs. BF16 Base Model (`Qwen/Qwen3.5-4B`)
 

@@ -19,7 +19,7 @@ tags:
 
 - **VRAM & GPU fit:** 18.78 GiB total (saving 48.19 GiB vs. BF16) across 30,970 text linears, 775 MTP linears, and 110 vision linears, leaving ~5.2 GiB on a 24 GB card for KV cache and speculative decoding (for 16 GB GPUs, see [`Qwen3.6-35B-A3B-W2.6A16-HGPTQ-RCO`](https://huggingface.co/nchapman/Qwen3.6-35B-A3B-W2.6A16-HGPTQ-RCO) at 13.15 GiB).
 - **Quantization recipe:** 64×64 Walsh–Hadamard input rotation + MSE-initialized Cholesky GPTQ + 2-pass Hessian Coordinate Descent (`H-CD`) + end-to-end FP32-master `RMSNorm`/GDN KL tuning, with `lm_head` and `mtp.fc` in 8-bit (`W8_g64`).
-- **Fidelity vs. BF16:** 0.0847 weighted KL (0.0642 mean KL) on `probe-v4`, 0.0509 weighted KL (0.0598 mean KL, +0.75% PPL) on the `probe-guard` holdout, 95.80% / 88.34% isolated/E2E MTP top-1 agreement, and 99.34% / 96.03% isolated/E2E vision top-1 agreement.
+- **Fidelity vs. BF16:** 0.0847 weighted KL (0.2103 mean KL, −6.68% PPL) on `probe-v4`, 0.0462 mean KL (0.0509 weighted KL, −4.79% PPL) on the `probe-guard` holdout, 95.80% / 89.61% isolated/E2E MTP top-1 agreement, and 99.34% / 97.68% isolated/E2E vision top-1 agreement (98.52% / 97.04% on `vision-guard-v2`).
 
 ## Quality vs. BF16 Base Model (`Qwen/Qwen3.6-35B-A3B`)
 

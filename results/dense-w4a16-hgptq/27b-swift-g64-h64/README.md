@@ -18,7 +18,7 @@ tags:
 
 - **VRAM & GPU fit:** 16.14 GiB total (saving 35.61 GiB vs. BF16), leaving ~7.8 GiB on a 24 GB card for KV cache, vision tokens, MTP drafting, and CUDA graphs.
 - **Quantization recipe:** 64×64 Walsh–Hadamard input rotation + MSE-initialized Cholesky GPTQ + 2-pass Hessian Coordinate Descent (`H-CD`) + end-to-end FP32-master `RMSNorm` KL tuning, with `lm_head` and `mtp.fc` in 8-bit (`W8_g64`).
-- **Fidelity vs. BF16:** 0.1074 weighted KL (0.0725 mean KL) on `probe-v4`, 0.0555 mean KL (+1.70% PPL) on the `probe-guard` holdout, 96.43% / 88.78% isolated/E2E MTP top-1 agreement, and 98.01% / 93.05% isolated/E2E vision top-1 agreement.
+- **Fidelity vs. BF16:** 0.1074 weighted KL (0.2831 mean KL, −5.59% PPL) on `probe-v4`, 0.0555 mean KL (0.0720 weighted KL, −9.49% PPL) on the `probe-guard` holdout, 96.43% / 89.03% isolated/E2E MTP top-1 agreement, and 98.01% / 91.39% isolated/E2E vision top-1 agreement (99.26% / 92.59% on `vision-guard-v2`).
 
 ## Quality vs. BF16 Base Model (`ukisai/Swift-1.5-Qwen3.8-27b`)
 

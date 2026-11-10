@@ -22,7 +22,7 @@ Mixed 2-bit / 4-bit Hadamard + GPTQ (`W2.6A16`, group size 64) quantization of [
 
 - **VRAM & GPU fit:** 13.15 GiB total across all 40 MoE layers, Vision, and Native MTP, leaving ~2.85 GiB on a 16 GB card for KV cache and speculative decoding (for 24 GB GPUs, see [`Qwen3.6-35B-A3B-W4A16-HGPTQ`](https://huggingface.co/nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ) at 18.78 GiB).
 - **Quantization recipe:** Keeps 100% of Attention/GDN (130 linears), Shared Experts (120 linears), Native MTP (775 linears), and Vision (110 linears) in `W4_g64` (`lm_head` and `mtp.fc` in `W8_g64`), while allocating the 10 most sensitive routed-expert layers (2,560 experts) to `W4_g64` and the remaining 30 routed-expert layers (7,680 experts) to `W2_g64`, polished with end-to-end FP32-master Norm/GDN KL QAT.
-- **Fidelity vs. BF16:** 0.2121 weighted KL (0.1844 mean KL, +4.28% PPL) on `probe-v4`, 0.1943 mean KL (0.1714 weighted KL, +5.74% PPL) on the `probe-guard` holdout, 95.80% / 81.20% isolated/E2E MTP top-1 agreement, and 99.34% / 94.70% isolated/E2E vision top-1 agreement.
+- **Fidelity vs. BF16:** 0.2121 weighted KL (0.3885 mean KL, −7.41% PPL) on `probe-v4`, 0.1943 mean KL (0.2080 weighted KL, −17.47% PPL) on the `probe-guard` holdout, 95.80% / 83.47% isolated/E2E MTP top-1 agreement, and 99.34% / 91.72% isolated/E2E vision top-1 agreement (98.52% / 93.33% on `vision-guard-v2`).
 
 ## Quality vs. BF16 Base Model (`Qwen/Qwen3.6-35B-A3B`)
 

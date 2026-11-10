@@ -18,7 +18,7 @@ tags:
 
 - **VRAM & footprint:** 1.83 GiB total across all 150 text linears, 98 vision linears, and 8 Native MTP linears (`mtp.fc` in `W8_g64`, tied `lm_head` in BF16).
 - **Quantization recipe:** 64×64 Walsh–Hadamard input rotation + MSE-initialized Cholesky GPTQ + 2-pass Hessian Coordinate Descent (`H-CD`) + end-to-end FP32-master `RMSNorm` KL tuning.
-- **Fidelity vs. BF16:** 0.0591 weighted KL (0.1173 mean KL) on `probe-v4`, 0.0739 weighted KL (+0.72% PPL) on the `probe-guard` holdout, 92.78% / 81.64% isolated/E2E MTP top-1 agreement, and 97.35% / 94.04% isolated/E2E vision top-1 agreement (95.56% E2E on `vision-guard-v2`).
+- **Fidelity vs. BF16:** 0.0591 weighted KL (0.2038 mean KL, −1.35% PPL) on `probe-v4`, 0.0500 mean KL (0.0630 weighted KL, +0.72% PPL) on the `probe-guard` holdout, 92.78% / 81.64% isolated/E2E MTP top-1 agreement, and 97.35% / 93.71% isolated/E2E vision top-1 agreement (99.26% / 95.56% on `vision-guard-v2`).
 
 ## Quality vs. BF16 Base Model (`Qwen/Qwen3.5-2B`)
 
@@ -31,7 +31,7 @@ Teacher-forced evaluation comparing this checkpoint directly against the unquant
 | **Text Divergence vs. BF16** (weighted KL / token mean KL) ↓ | `0.0000` | **`0.0591` / `0.2038`** | Full-vocabulary FP32 KL divergence |
 | **General & Multilingual Holdout Perplexity** (76 prompts, 20k tokens) ↓ | `12.7820` | **`12.8746` (`+0.72%`)** | Token mean KL `0.0500` (weighted KL `0.0630`) |
 | **Native MTP (Speculative Drafter)** (11,583 positions) | `100.0%` Top-1 (`NLL 2.5969`) | **`92.78%` Isolated Top-1 (`NLL 2.6173`)** | Isolated MTP KL `0.0201` (end-to-end Top-1 `81.64%`, KL `0.3566`) |
-| **Vision (`vision-probe-v2`)** (96 images, 302 answer tokens) | `100.0%` Top-1 | **`97.35%` Isolated Top-1 · `93.71%` E2E Top-1** | Isolated ViT KL `0.0130`, E2E KL `0.0737` (`vision-guard-v2` E2E Top-1 `95.56%`, KL `0.0562`) |
+| **Vision (`vision-probe-v2`)** (96 images, 302 answer tokens) | `100.0%` Top-1 | **`97.35%` Isolated Top-1 · `93.71%` E2E Top-1** | Isolated ViT KL `0.0130`, E2E KL `0.0737` (`vision-guard-v2` Iso Top-1 `99.26%`, E2E Top-1 `95.56%`, KL `0.0562`) |
 
 ## What Is Quantized
 

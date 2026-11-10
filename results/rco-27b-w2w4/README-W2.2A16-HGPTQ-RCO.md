@@ -19,7 +19,7 @@ Ultra-compact mixed 2-bit / 4-bit Hadamard + GPTQ (`W2.2A16`, group size 64) qua
 
 - **VRAM & GPU fit:** 11.04 GiB full VLM+MTP (10.58 GiB text-only, saving 40.71 GiB vs. BF16); for general 16 GB multimodal + MTP serving, prefer [`Qwen3.8-27B-W2.6A16-HGPTQ-RCO`](https://huggingface.co/nchapman/Qwen3.8-27B-W2.6A16-HGPTQ-RCO) at 12.18 GiB.
 - **Quantization recipe:** Upgrades the top 10% (+580 MiB) most sensitive fused `vLLM` backbone groups (13/32 Full-Attention, 20/96 GDN Linear-Attention, 14/128 MLP) to `W4_g64`, keeps Vision and Native MTP transformer blocks in `W4_g64` (`lm_head` and `mtp.fc` in `W8_g64`), and polishes `W2_g64` scales + FP32-master `RMSNorm`/GDN gates end-to-end.
-- **Fidelity vs. BF16:** Captures 45% of the 0%→30% `probe-v4` KL reduction (0.3137 weighted KL, 0.3822 mean KL), 0.4221 holdout mean KL, 96.49% / 68.55% isolated/E2E MTP top-1 agreement, and 99.34% / 85.10% isolated/E2E vision top-1 agreement.
+- **Fidelity vs. BF16:** Captures 45% of the 0%→30% `probe-v4` KL reduction (0.3137 weighted KL, 0.4597 mean KL), 0.3835 holdout mean KL (0.4784 weighted KL), 96.64% / 72.10% isolated/E2E MTP top-1 agreement, and 97.68% / 86.09% isolated/E2E vision top-1 agreement.
 
 | Variant | Avg Backbone Bits | Full VLM+MTP Size | Text-Only Size | Target GPU Tier |
 |---|---:|---:|---:|---|
@@ -34,10 +34,10 @@ Teacher-forced evaluation comparing this checkpoint directly against the unquant
 | Evaluation | BF16 Base (`Qwen/Qwen3.8-27B`) | **`Qwen3.8-27B-W2.2A16-HGPTQ-RCO`** | Notes |
 |---|---:|---:|---|
 | **Safetensors Size** | `51.75 GiB` (`55,563,006,776 B`) | **`11.04 GiB` (`11,856,436,968 B`)** | **`4.69×` compression** (`−40.70 GiB`; `10.58 GiB` text-only) |
-| **Text Divergence vs. BF16 (`probe-v4`)** (weighted KL / token mean KL) ↓ | `0.0000` | **`0.3137` / `0.4597`** | 378 prompts, 840k tokens (`math` `0.2051`, `chat` `0.2213`, `if` `0.2112`, `science` `0.2150`) |
-| **General & Multilingual Holdout (`probe-guard`)** (token mean KL / weighted KL) ↓ | `0.0000` | **`0.3835` / `0.4784`** | 76 prompts, 23k tokens (held-out FineWeb-Edu + 9-lang Belebele macro KL `0.4647`) |
+| **Text Divergence vs. BF16 (`probe-v4`)** (weighted KL / token mean KL) ↓ | `0.0000` | **`0.3137` / `0.4597`** | 378 prompts, 852k tokens (PPL `8.5332 → 4.2533`; `math` `0.2051`, `chat` `0.2213`, `if` `0.2112`, `science` `0.2150`) |
+| **General & Multilingual Holdout (`probe-guard`)** (token mean KL / weighted KL) ↓ | `0.0000` | **`0.3835` / `0.4784`** | 76 prompts, 23k tokens (PPL `61.0805 → 24.5085`; 9-lang Belebele macro KL `0.4647`) |
 | **Native MTP (Speculative Drafter)** (12,339 positions) | `100.0%` Top-1 (`NLL 2.9579`) | **`96.64%` Isolated Top-1 (`NLL 2.9813`)** | Isolated MTP KL `0.0090` (end-to-end Top-1 `72.10%`, KL `0.7131`) |
-| **Vision (`vision-probe-v2`)** (96 images, 302 answer tokens) | `100.0%` Top-1 | **`97.68%` Isolated Top-1 · `86.09%` E2E Top-1** | Isolated ViT KL `0.0056`, E2E KL `0.5599` (`vision-guard-v2` E2E Top-1 `85.19%`, KL `0.5783`) |
+| **Vision (`vision-probe-v2`)** (96 images, 302 answer tokens) | `100.0%` Top-1 | **`97.68%` Isolated Top-1 · `86.09%` E2E Top-1** | Isolated ViT KL `0.0056`, E2E KL `0.5599` (`vision-guard-v2` Iso Top-1 `99.26%`, E2E Top-1 `85.19%`, KL `0.5783`) |
 
 ## What Is Quantized
 

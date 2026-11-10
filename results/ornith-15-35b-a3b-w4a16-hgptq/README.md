@@ -19,7 +19,7 @@ tags:
 
 - **VRAM & GPU fit:** 18.78 GiB total (saving 48.19 GiB vs. BF16) across 30,970 text linears, 775 MTP linears, and 110 vision linears, with `lm_head` and `mtp.fc` in 8-bit (`W8_g64`).
 - **Quantization recipe:** 64×64 Walsh–Hadamard input rotation + MSE-initialized Cholesky GPTQ + 2-pass Hessian Coordinate Descent (`H-CD`) + end-to-end FP32-master `RMSNorm`/GDN KL tuning.
-- **Fidelity vs. BF16:** 0.1139 weighted KL (0.1150 mean KL) on `probe-v4`, 0.1647 mean KL (0.2289 weighted KL) on the `probe-guard` holdout, 91.44% / 82.19% isolated/E2E MTP top-1 agreement, and 96.36% / 93.38% isolated/E2E vision top-1 agreement.
+- **Fidelity vs. BF16:** 0.1139 weighted KL (0.2303 mean KL, −5.00% PPL) on `probe-v4`, 0.1647 mean KL (0.2289 weighted KL, +3.25% PPL) on the `probe-guard` holdout, 91.44% / 73.34% isolated/E2E MTP top-1 agreement, and 96.36% / 94.37% isolated/E2E vision top-1 agreement (97.04% / 96.30% on `vision-guard-v2`).
 
 ## Quality vs. BF16 Base Model (`ornith-ai/Ornith-1.5-35B-A3B`)
 

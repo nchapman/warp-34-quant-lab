@@ -18,7 +18,7 @@ tags:
 
 - **VRAM & GPU fit:** 16.14 GiB total (15.67 GiB language + MTP, 0.47 GiB vision), leaving ~7.8 GiB on a 24 GB card for KV cache, vision tokens, MTP drafting, and CUDA graphs.
 - **Quantization recipe:** 64×64 Walsh–Hadamard input rotation + MSE-initialized Cholesky GPTQ + 2-pass Hessian Coordinate Descent (`H-CD`) + end-to-end FP32-master `RMSNorm` KL tuning, with `lm_head` and `mtp.fc` in 8-bit (`W8_g64`).
-- **Fidelity vs. BF16:** 0.1002 weighted KL (0.0685 mean KL) on `probe-v4`, 0.0530 mean KL (+1.66% PPL) on the `probe-guard` holdout, 96.49% / 89.16% isolated/E2E MTP top-1 agreement, and 99.34% / 92.05% isolated/E2E vision top-1 agreement.
+- **Fidelity vs. BF16:** 0.1002 weighted KL (0.2583 mean KL, −4.09% PPL) on `probe-v4`, 0.0530 mean KL (0.0739 weighted KL, −7.23% PPL) on the `probe-guard` holdout, 96.64% / 89.16% isolated/E2E MTP top-1 agreement, and 97.68% / 92.05% isolated/E2E vision top-1 agreement (99.26% / 94.81% on `vision-guard-v2`).
 
 ## Quality vs. BF16 Base Model (`Qwen/Qwen3.8-27B`)
 
@@ -31,7 +31,7 @@ Teacher-forced evaluation comparing this checkpoint directly against the unquant
 | **Text Divergence vs. BF16** (weighted KL / token mean KL) ↓ | `0.0000` | **`0.1002` / `0.2583`** | Full-vocabulary FP32 KL (`math` `0.0718`, `chat` `0.0223`, `if` `0.0354`, `science` `0.0607`, `swe` `0.7075`) |
 | **General & Multilingual Holdout Perplexity** (76 prompts, 23k tokens) ↓ | `61.0805` | **`56.6664` (`−7.23%`)** | Token mean KL `0.0530` (weighted KL `0.0739`, 9-lang Belebele macro KL `0.0628`) |
 | **Native MTP (Speculative Drafter)** (12,339 positions) | `100.0%` Top-1 (`NLL 2.9579`) | **`96.64%` Isolated Top-1 (`NLL 2.9813`)** | Isolated MTP KL `0.0090` (end-to-end Top-1 `89.16%`, KL `0.1782`) |
-| **Vision (`vision-probe-v2`)** (96 images, 302 answer tokens) | `100.0%` Top-1 | **`97.68%` Isolated Top-1 · `92.05%` E2E Top-1** | Isolated ViT KL `0.0056`, E2E KL `0.1808` (`vision-guard-v2` E2E Top-1 `94.81%`, KL `0.0856`) |
+| **Vision (`vision-probe-v2`)** (96 images, 302 answer tokens) | `100.0%` Top-1 | **`97.68%` Isolated Top-1 · `92.05%` E2E Top-1** | Isolated ViT KL `0.0056`, E2E KL `0.1808` (`vision-guard-v2` Iso Top-1 `99.26%`, E2E Top-1 `94.81%`, KL `0.0856`) |
 
 ## What Is Quantized
 
