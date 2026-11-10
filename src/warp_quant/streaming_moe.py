@@ -108,6 +108,12 @@ def _is_qwen35_moe_text_config(text_config) -> bool:
     return getattr(text_config, "model_type", "") == "qwen3_5_moe_text"
 
 
+def _is_qwen35_moe_config_dict(cfg_dict: dict[str, Any]) -> bool:
+    mt = str(cfg_dict.get("model_type", ""))
+    t_mt = str((cfg_dict.get("text_config") or {}).get("model_type", ""))
+    return "qwen3_5_moe" in mt or "qwen3_5_moe" in t_mt
+
+
 def _ensure_qwen4_exp_device_kernels(text_config, device: torch.device) -> None:
     """Configure Qwen4Exp or Qwen3_5Moe GDN and MoE kernels for CUDA or CPU execution."""
     if _is_qwen35_moe_text_config(text_config):
@@ -172,6 +178,9 @@ def quantize_ple_batch_gptq_lut4(
     lut: torch.Tensor | None = None,
     group_size: int = 32,
     cd_passes: int = 1,
+    *,
+    mse_scale_search: bool = True,
+    refine_scales: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize a 2D PLE slice [B, D_h] using Custom-LUT4 + W_kv Cholesky GPTQ + Coordinate Descent.
 
@@ -186,6 +195,7 @@ def quantize_ple_batch_gptq_lut4(
     else:
         lut = lut.to(device=device, dtype=torch.float32)
     midpoints = 0.5 * (lut[:-1] + lut[1:])
+    lut_absmax = float(lut.abs().max().item())
 
     b_rows, d_h = w_batch.shape
     eff_group_size = min(group_size, d_h)
@@ -201,11 +211,38 @@ def quantize_ple_batch_gptq_lut4(
 
     u_diag = torch.diag(u_mat)
     h_diag = torch.diag(h_mat)
+    alphas = (
+        torch.linspace(0.75, 1.08, 17, device=device, dtype=torch.float32)
+        if mse_scale_search
+        else torch.empty(0, device=device, dtype=torch.float32)
+    )
 
     for g in range(num_groups):
         c0, c1 = g * eff_group_size, (g + 1) * eff_group_size
         w_g = w_work[:, c0:c1]
-        s_fp16 = (w_g.abs().amax(dim=1) / 1.0).clamp(min=1e-7).to(torch.float16)
+        base_s = (w_g.abs().amax(dim=1) / lut_absmax).clamp(min=1e-7)
+        if mse_scale_search:
+            h_d_g = h_diag[c0:c1].unsqueeze(0)
+            s_fp16 = torch.empty((b_rows,), dtype=torch.float16, device=device)
+            sub_step = 131_072
+            for r0 in range(0, b_rows, sub_step):
+                r1 = min(r0 + sub_step, b_rows)
+                w_sub = w_g[r0:r1]
+                b_sub = base_s[r0:r1]
+                best_s = b_sub.to(torch.float16)
+                best_err = torch.full((r1 - r0,), float("inf"), dtype=torch.float32, device=device)
+                for alpha in alphas:
+                    cand_s = (b_sub * alpha).clamp(min=1e-7).to(torch.float16)
+                    cand_sf = cand_s.float().unsqueeze(1)
+                    idx_c = torch.bucketize(w_sub / cand_sf, midpoints)
+                    q_c = lut[idx_c] * cand_sf
+                    err = ((w_sub - q_c).pow(2) * h_d_g).sum(dim=1)
+                    better = err < best_err
+                    best_err = torch.where(better, err, best_err)
+                    best_s = torch.where(better, cand_s, best_s)
+                s_fp16[r0:r1] = best_s
+        else:
+            s_fp16 = base_s.to(torch.float16)
         scales_fp16[:, g] = s_fp16
         s = s_fp16.float()
         inv_s = 1.0 / s
@@ -224,7 +261,8 @@ def quantize_ple_batch_gptq_lut4(
         if c1 < d_h:
             w_work[:, c1:] -= err_g @ u_mat[c0:c1, c1:]
 
-    for _ in range(cd_passes):
+    eff_cd_passes = max(cd_passes, 2) if (cd_passes > 0 and refine_scales) else cd_passes
+    for _ in range(eff_cd_passes):
         r_mat = (q_out - w_f32) @ h_mat
         for g in range(num_groups):
             c0, c1 = g * eff_group_size, (g + 1) * eff_group_size
@@ -243,12 +281,68 @@ def quantize_ple_batch_gptq_lut4(
                 idx_out[:, c] = idx_new.to(torch.uint8)
                 if lc + 1 < eff_group_size:
                     r_g[:, lc + 1 :] += dq.unsqueeze(1) * h_mat[c, c + 1 : c1].unsqueeze(0)
+            if refine_scales:
+                u_g = lut[idx_out[:, c0:c1].long()]
+                h_gg = h_mat[c0:c1, c0:c1]
+                denom = ((u_g @ h_gg) * u_g).sum(dim=1)
+                num = (u_g * r_g).sum(dim=1)
+                valid_s = denom > 1e-12
+                s_opt = (
+                    torch.where(valid_s, s - num / denom.clamp(min=1e-12), s)
+                    .clamp(min=1e-7)
+                    .to(torch.float16)
+                )
+                scales_fp16[:, g] = s_opt
+                q_out[:, c0:c1] = u_g * s_opt.float().unsqueeze(1)
             if c1 < d_h:
                 dq_g = q_out[:, c0:c1] - q_g_old
                 r_mat[:, c1:] += dq_g @ h_mat[c0:c1, c1:]
 
     packed_u8 = (idx_out[:, 0::2] & 0x0F) | ((idx_out[:, 1::2] & 0x0F) << 4)
     return q_out, packed_u8, scales_fp16
+
+
+@torch.no_grad()
+def apply_ple_kv_mmse_compensation(
+    ple_layer: nn.Module,
+    g_heads: list[torch.Tensor],
+    c_heads: list[torch.Tensor],
+    *,
+    ridge_frac: float = 0.01,
+) -> float:
+    """Apply closed-form per-head linear MMSE error compensation to ple_layer.{key_proj,value_proj}.
+
+    Given per-head Gram G_m = E_hat_m^T E_hat_m and residual cross-covariance
+    C_m = (E_m - E_hat_m)^T E_hat_m accumulated across PLE rows, updates each
+    head's column slice of W_k and W_v via:
+      M_m = C_m (G_m + lambda_m I)^{-1},   W_{*,m} <- W_{*,m} (I + M_m)
+    Returns average Frobenius norm ratio ||M_m||_F / sqrt(D_h).
+    """
+    w_k = ple_layer.key_proj.weight
+    w_v = ple_layer.value_proj.weight
+    device = w_k.device
+    num_heads = len(g_heads)
+    d_h = w_k.shape[1] // num_heads
+    eye_d = torch.eye(d_h, device=device, dtype=torch.float64)
+    frob_sum = 0.0
+    applied_heads = 0
+
+    for m in range(num_heads):
+        g_m = g_heads[m].to(device=device, dtype=torch.float64)
+        c_m = c_heads[m].to(device=device, dtype=torch.float64)
+        diag_mean = float(torch.diag(g_m).mean().item())
+        if diag_mean <= 1e-12:
+            continue
+        lam = max(ridge_frac * diag_mean, 1e-8)
+        m_mat = torch.linalg.solve(g_m + lam * eye_d, c_m.T).T
+        scale_mat = (eye_d + m_mat).to(dtype=torch.float32)
+        c0, c1 = m * d_h, (m + 1) * d_h
+        w_k.data[:, c0:c1].copy_((w_k.data[:, c0:c1].float() @ scale_mat).to(w_k.dtype))
+        w_v.data[:, c0:c1].copy_((w_v.data[:, c0:c1].float() @ scale_mat).to(w_v.dtype))
+        frob_sum += float(m_mat.norm().item()) / math.sqrt(d_h)
+        applied_heads += 1
+
+    return frob_sum / max(applied_heads, 1)
 
 
 @torch.no_grad()
@@ -443,11 +537,16 @@ def stream_quantize_ple_shards(
     cd_passes: int = 1,
     batch_rows: int = 2_500_100,
     shards_per_file: int = 16,
+    compensate_kv: bool = True,
+    qat_ids_list: list[torch.Tensor] | None = None,
+    qat_bf16_embeds_out: list[torch.Tensor] | None = None,
+    qat_quant_embeds_out: list[torch.Tensor] | None = None,
 ) -> tuple[list[torch.Tensor], dict[str, str], int, int]:
     """Stream through all PLE shards, quantize with Custom-LUT4 + W_kv-HGPTQ, save, and gather quantized embeds."""
     ple_emb = ple_layer.ple_embedding
     ngram_heads = ple_emb.ngram_heads
     eos_token_id = ple_emb.eos_token_id
+    head_dim = ple_layer.key_proj.weight.shape[1] // ngram_heads
 
     if ple_group_size > 0:
         h_list, u_list = compute_ple_head_hessians(
@@ -458,13 +557,19 @@ def stream_quantize_ple_shards(
         )
         lut_tensor = torch.tensor(PLE_CUSTOM_LUT4, device=device, dtype=torch.float32)
         lut_cpu = lut_tensor.cpu()
+        g_heads = [
+            torch.zeros((head_dim, head_dim), dtype=torch.float64, device=device) for _ in range(ngram_heads)
+        ]
+        c_heads = [
+            torch.zeros((head_dim, head_dim), dtype=torch.float64, device=device) for _ in range(ngram_heads)
+        ]
     else:
         h_list, u_list = [], []
         lut_tensor = torch.empty(0, device=device, dtype=torch.float32)
         lut_cpu = lut_tensor.cpu()
+        g_heads, c_heads = [], []
 
     # Precompute ngram_ids [1, S_i, ngram_heads] for every calibration sequence and flatten for O(1) vectorized gather
-    head_dim = ple_layer.key_proj.weight.shape[1] // ngram_heads
     seq_shapes: list[tuple[int, int]] = []
     flat_n_ids_parts: list[torch.Tensor] = []
 
@@ -484,6 +589,31 @@ def stream_quantize_ple_shards(
     all_ngram_ids = torch.cat(flat_n_ids_parts, dim=0)
     del flat_n_ids_parts
     all_quant_embeds = torch.zeros((all_ngram_ids.numel(), head_dim), dtype=torch.bfloat16)
+
+    qat_seq_shapes: list[tuple[int, int]] = []
+    qat_ngram_ids: torch.Tensor | None = None
+    all_qat_bf16_embeds: torch.Tensor | None = None
+    all_qat_quant_embeds: torch.Tensor | None = None
+    if qat_ids_list:
+        qat_parts: list[torch.Tensor] = []
+        for q_ids in qat_ids_list:
+            qat_seq_shapes.append((q_ids.shape[0], q_ids.shape[1]))
+            qn_ids = compute_ple_ngram_ids(
+                q_ids,
+                ple_emb.layer_multipliers,
+                ple_emb.ngram_heads_vocab_sizes,
+                ple_emb.ngram_heads_offsets,
+                ple_emb.ngram_size,
+                ple_emb.heads_per_ngram,
+                eos_token_id,
+            ).cpu()
+            qat_parts.append(qn_ids.reshape(-1))
+        qat_ngram_ids = torch.cat(qat_parts, dim=0)
+        del qat_parts
+        if qat_bf16_embeds_out is not None:
+            all_qat_bf16_embeds = torch.zeros((qat_ngram_ids.numel(), head_dim), dtype=torch.bfloat16)
+        if qat_quant_embeds_out is not None:
+            all_qat_quant_embeds = torch.zeros((qat_ngram_ids.numel(), head_dim), dtype=torch.bfloat16)
 
     ple_shards = _discover_ple_shards(shard_map, base_dir, layer_idx)
     if not ple_shards:
@@ -520,6 +650,14 @@ def stream_quantize_ple_shards(
                 f"model.language_model.layers.{layer_idx}.ple.ple_embedding.ngram_embedding.shard_{shard_id}"
             )
             hit_mask = (all_ngram_ids >= row_start) & (all_ngram_ids < row_end)
+            qat_hit_mask = (
+                ((qat_ngram_ids >= row_start) & (qat_ngram_ids < row_end))
+                if qat_ngram_ids is not None
+                else None
+            )
+            if qat_hit_mask is not None and all_qat_bf16_embeds is not None and qat_hit_mask.any():
+                qat_local = (qat_ngram_ids[qat_hit_mask] - row_start).long()
+                all_qat_bf16_embeds[qat_hit_mask] = w_shard_cpu[qat_local].to(torch.bfloat16)
 
             if ple_group_size <= 0:
                 w_bf16 = w_shard_cpu.to(torch.bfloat16)
@@ -527,6 +665,9 @@ def stream_quantize_ple_shards(
                 if hit_mask.any():
                     local_rows = (all_ngram_ids[hit_mask] - row_start).long()
                     all_quant_embeds[hit_mask] = w_bf16[local_rows]
+                if qat_hit_mask is not None and all_qat_quant_embeds is not None and qat_hit_mask.any():
+                    qat_local = (qat_ngram_ids[qat_hit_mask] - row_start).long()
+                    all_qat_quant_embeds[qat_hit_mask] = w_bf16[qat_local]
                 shard_tensors = {f"{out_prefix}.weight": w_bf16}
             else:
                 eff_group_size = min(ple_group_size, d_h)
@@ -552,6 +693,11 @@ def stream_quantize_ple_shards(
                             group_size=eff_group_size,
                             cd_passes=cd_passes,
                         )
+                        if compensate_kv:
+                            diff_b = w_batch - q_deq
+                            g_heads[head_m].add_((q_deq.T @ q_deq).to(torch.float64))
+                            c_heads[head_m].add_((diff_b.T @ q_deq).to(torch.float64))
+                            del diff_b
                         packed_shard[b0:b1].copy_(p_u8.cpu())
                         scales_shard[b0:b1].copy_(s_fp16.cpu())
                         del w_batch, q_deq, p_u8, s_fp16
@@ -565,6 +711,15 @@ def stream_quantize_ple_shards(
                     all_quant_embeds[hit_mask] = dequantize_ple_rows_lut4(
                         packed_shard[local_rows],
                         scales_shard[local_rows],
+                        lut_cpu,
+                        group_size=eff_group_size,
+                        out_dtype=torch.bfloat16,
+                    )
+                if qat_hit_mask is not None and all_qat_quant_embeds is not None and qat_hit_mask.any():
+                    qat_local = (qat_ngram_ids[qat_hit_mask] - row_start).long()
+                    all_qat_quant_embeds[qat_hit_mask] = dequantize_ple_rows_lut4(
+                        packed_shard[qat_local],
+                        scales_shard[qat_local],
                         lut_cpu,
                         group_size=eff_group_size,
                         out_dtype=torch.bfloat16,
@@ -601,7 +756,38 @@ def stream_quantize_ple_shards(
         if pending_save_fut is not None:
             pending_save_fut.result()
 
+    if ple_group_size > 0 and compensate_kv:
+        comp_ratio = apply_ple_kv_mmse_compensation(
+            ple_layer, g_heads, c_heads, ridge_frac=max(dampening_frac, 1e-4)
+        )
+        log_event(
+            "QWEN4_EXP_PLE_KV_COMPENSATED",
+            layer=layer_idx,
+            avg_frob_ratio=round(comp_ratio, 6),
+        )
+
     del all_ngram_ids
+    if qat_ngram_ids is not None:
+        del qat_ngram_ids
+        if all_qat_bf16_embeds is not None and qat_bf16_embeds_out is not None:
+            q_cur = 0
+            for bsz, slen in qat_seq_shapes:
+                n_el = bsz * slen * ngram_heads
+                qat_bf16_embeds_out.append(
+                    all_qat_bf16_embeds[q_cur : q_cur + n_el].view(bsz, slen, ngram_heads * head_dim).clone()
+                )
+                q_cur += n_el
+            del all_qat_bf16_embeds
+        if all_qat_quant_embeds is not None and qat_quant_embeds_out is not None:
+            q_cur = 0
+            for bsz, slen in qat_seq_shapes:
+                n_el = bsz * slen * ngram_heads
+                qat_quant_embeds_out.append(
+                    all_qat_quant_embeds[q_cur : q_cur + n_el].view(bsz, slen, ngram_heads * head_dim).clone()
+                )
+                q_cur += n_el
+            del all_qat_quant_embeds
+
     flat_embeds: list[torch.Tensor] = []
     cur = 0
     for bsz, slen in seq_shapes:
@@ -742,7 +928,6 @@ def stream_gather_ple_embeds(
     return embeds_list
 
 
-@torch.no_grad()
 def forward_ple_with_precomputed_embeds(
     ple_layer: nn.Module,
     hidden_states: torch.Tensor,
@@ -1364,7 +1549,6 @@ def _compute_vectorized_causal_qsa_mask(
     return fast_mask
 
 
-@torch.no_grad()
 def _forward_qsa_attention_fast(
     attn: nn.Module,
     hidden_states: torch.Tensor,
@@ -1381,7 +1565,9 @@ def _forward_qsa_attention_fast(
             sdpa_mask = (
                 None
                 if seq_len <= attn.indexer.token_budget
-                else _compute_vectorized_causal_qsa_mask(attn.indexer, hidden_states, position_embeddings)
+                else _compute_vectorized_causal_qsa_mask(
+                    attn.indexer, hidden_states.detach(), position_embeddings
+                )
             )
         else:
             from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import apply_rotary_pos_emb
@@ -1413,6 +1599,45 @@ def _forward_qsa_attention_fast(
 
     out, _ = attn(hidden_states, position_embeddings, attention_mask=attention_mask, past_key_values=None)
     return out
+
+
+def _forward_decoder_layer_core(
+    layer: nn.Module,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    *,
+    ple_layer: nn.Module | None = None,
+    ple_embeds: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Execute a Qwen4ExpTextDecoderLayer or Qwen3_5MoeDecoderLayer through fast QSA/GDN and optional pre-gathered PLE."""
+    h = hidden_states
+    if ple_layer is not None and ple_embeds is not None:
+        h = h + forward_ple_with_precomputed_embeds(ple_layer, h, ple_embeds)
+    has_hc = hasattr(layer, "attn_hyper_connection")
+    layer_kind = getattr(layer, "layer_type", getattr(layer, "block_type", ""))
+    is_linear_attn = layer_kind == "linear_attention"
+    if has_hc:
+        b_in, hyp_in, iw = layer.attn_hyper_connection(h)
+        a_out = (
+            layer.linear_attn(b_in)
+            if is_linear_attn
+            else _forward_qsa_attention_fast(layer.self_attn, b_in, position_embeddings)
+        )
+        h_post_a = hyp_in + (a_out.unsqueeze(-2) * iw.unsqueeze(-1)).flatten(-2)
+        m_in, hyp_m, iw_m = layer.mlp_hyper_connection(h_post_a)
+        m_out = layer.mlp(m_in)
+        return hyp_m + (m_out.unsqueeze(-2) * iw_m.unsqueeze(-1)).flatten(-2)
+
+    b_in = layer.input_layernorm(h)
+    a_out = (
+        layer.linear_attn(b_in)
+        if is_linear_attn
+        else _forward_qsa_attention_fast(layer.self_attn, b_in, position_embeddings)
+    )
+    h_post_a = h + a_out
+    m_in = layer.post_attention_layernorm(h_post_a)
+    m_out = layer.mlp(m_in)
+    return h_post_a + m_out
 
 
 @torch.no_grad()
@@ -1451,15 +1676,11 @@ def _quantize_decoder_layer_streaming(
         for ti in range(len(t_h_list)):
             h_t = t_h_list[ti].to(device, non_blocking=True)
             cos_t, sin_t = t_pos_list[ti]
-            h_out_t = layer(
+            h_out_t = _forward_decoder_layer_core(
+                layer,
                 h_t,
-                position_embeddings=(
-                    cos_t.to(device, non_blocking=True),
-                    sin_t.to(device, non_blocking=True),
-                ),
+                (cos_t.to(device, non_blocking=True), sin_t.to(device, non_blocking=True)),
             )
-            if isinstance(h_out_t, tuple):
-                h_out_t = h_out_t[0]
             t_h_list[ti] = h_out_t.detach().to(t_h_list[ti].device, non_blocking=True)
             del h_t, h_out_t
 
@@ -1468,6 +1689,22 @@ def _quantize_decoder_layer_streaming(
     # ------------------------------------------------------------------
     keep_calib_on_device = h_calib[0].device == device
     if getattr(layer, "ple", None) is not None:
+        t_qat_ids: list[torch.Tensor] | None = None
+        if teacher_qat_state is not None:
+            t_h_list = teacher_qat_state["h_list"]
+            raw_t_ids = teacher_qat_state.get("input_ids") or teacher_qat_state.get("ids")
+            if raw_t_ids is not None:
+                t_qat_ids = [raw_t_ids[ti][:, : t_h_list[ti].shape[1]].cpu() for ti in range(len(t_h_list))]
+            else:
+                t_qat_ids = [
+                    calib_ids_list[ti % len(calib_ids_list)][:, : t_h_list[ti].shape[1]].cpu()
+                    for ti in range(len(t_h_list))
+                ]
+        orig_ple_wk = layer.ple.key_proj.weight.detach().clone() if teacher_qat_state is not None else None
+        orig_ple_wv = layer.ple.value_proj.weight.detach().clone() if teacher_qat_state is not None else None
+        qat_bf16_ple_embeds: list[torch.Tensor] = []
+        qat_quant_ple_embeds: list[torch.Tensor] = []
+
         reuse_smap: dict[str, str] = {}
         reuse_ple_shards: list[tuple[int, str, str]] = []
         reuse_ple_files: list[str] = []
@@ -1507,6 +1744,26 @@ def _quantize_decoder_layer_streaming(
                 calib_ids_list,
                 ple_group_size=ple_group_size,
             )
+            if t_qat_ids is not None:
+                qat_quant_ple_embeds = stream_gather_ple_embeds(
+                    output_dir,
+                    ple_weight_map,
+                    layer.ple,
+                    layer_idx,
+                    t_qat_ids,
+                    ple_group_size=ple_group_size,
+                )
+                if _discover_ple_shards(shard_map, base_dir, layer_idx):
+                    qat_bf16_ple_embeds = stream_gather_ple_embeds(
+                        base_dir,
+                        shard_map,
+                        layer.ple,
+                        layer_idx,
+                        t_qat_ids,
+                        ple_group_size=ple_group_size,
+                    )
+                else:
+                    qat_bf16_ple_embeds = [e.clone() for e in qat_quant_ple_embeds]
             log_event("QWEN4_EXP_PLE_REUSED", reuse_dir=str(reuse_ple_dir), shards=n_ple_shards)
         else:
             quant_ple_embeds, ple_weight_map, ple_bytes, n_ple_shards = stream_quantize_ple_shards(
@@ -1520,7 +1777,35 @@ def _quantize_decoder_layer_streaming(
                 ple_group_size=ple_group_size,
                 dampening_frac=dampening_frac,
                 cd_passes=ple_cd_passes,
+                qat_ids_list=t_qat_ids,
+                qat_bf16_embeds_out=qat_bf16_ple_embeds if t_qat_ids is not None else None,
+                qat_quant_embeds_out=qat_quant_ple_embeds if t_qat_ids is not None else None,
             )
+        if teacher_qat_state is not None and orig_ple_wk is not None and orig_ple_wv is not None:
+            comp_ple_wk = layer.ple.key_proj.weight.detach().clone()
+            comp_ple_wv = layer.ple.value_proj.weight.detach().clone()
+            layer.ple.key_proj.weight.data.copy_(orig_ple_wk)
+            layer.ple.value_proj.weight.data.copy_(orig_ple_wv)
+            t_h_list = teacher_qat_state["h_list"]
+            t_pos_list = teacher_qat_state["pos_emb_list"]
+            for ti in range(len(t_h_list)):
+                h_t = t_h_list[ti].to(device, non_blocking=True)
+                cos_t, sin_t = t_pos_list[ti]
+                h_out_t = _forward_decoder_layer_core(
+                    layer,
+                    h_t,
+                    (cos_t.to(device, non_blocking=True), sin_t.to(device, non_blocking=True)),
+                    ple_layer=layer.ple,
+                    ple_embeds=qat_bf16_ple_embeds[ti],
+                )
+                t_h_list[ti] = h_out_t.detach().to(t_h_list[ti].device, non_blocking=True)
+                del h_t, h_out_t
+            layer.ple.key_proj.weight.data.copy_(comp_ple_wk)
+            layer.ple.value_proj.weight.data.copy_(comp_ple_wv)
+            teacher_qat_state.setdefault("ple_embeds", {})[str(layer_idx)] = [
+                e.cpu().clone() for e in qat_quant_ple_embeds
+            ]
+            del orig_ple_wk, orig_ple_wv, comp_ple_wk, comp_ple_wv, qat_bf16_ple_embeds, qat_quant_ple_embeds
         counts["ple_shards"] = n_ple_shards
         for i in range(n_seqs):
             h_dev = h_calib[i].to(device)
@@ -2763,19 +3048,22 @@ def run_quantize_qwen4_exp(args: argparse.Namespace) -> None:
             import shutil
 
             src_eh = reuse_ple_vision_dir / embed_head_shard
-            dst_eh = output_dir / embed_head_shard
-            try:
-                os.link(src_eh, dst_eh)
-            except OSError:
-                shutil.copy2(src_eh, dst_eh)
-            with safe_open(str(dst_eh), framework="pt", device="cpu") as sf:
-                for tk in sf.keys():
-                    tv = sf.get_tensor(tk)
-                    new_weight_map[tk] = embed_head_shard
-                    total_bytes += tv.numel() * tv.element_size()
-                    if tk == "lm_head.weight_packed":
-                        shard_counts["lm_head_w8"] += 1
-            deferred_embed_raw = {}
+            with safe_open(str(src_eh), framework="pt", device="cpu") as sf:
+                reused_eh_keys = set(sf.keys())
+            if (not want_lm_head_w8) or ("lm_head.weight_packed" in reused_eh_keys):
+                dst_eh = output_dir / embed_head_shard
+                try:
+                    os.link(src_eh, dst_eh)
+                except OSError:
+                    shutil.copy2(src_eh, dst_eh)
+                with safe_open(str(dst_eh), framework="pt", device="cpu") as sf:
+                    for tk in sf.keys():
+                        tv = sf.get_tensor(tk)
+                        new_weight_map[tk] = embed_head_shard
+                        total_bytes += tv.numel() * tv.element_size()
+                        if tk == "lm_head.weight_packed":
+                            shard_counts["lm_head_w8"] += 1
+                deferred_embed_raw = {}
 
     # Keep embed_w on CPU if needed for MTP later; free from GPU now
     embed_w_cpu = embed_w.cpu()
@@ -2787,7 +3075,7 @@ def run_quantize_qwen4_exp(args: argparse.Namespace) -> None:
         Path(args.save_rco_bank_dir).resolve() if getattr(args, "save_rco_bank_dir", None) else None
     )
     teacher_qat_state: dict[str, Any] | None = None
-    if rco_w2_bank_dir is not None and is_qwen35_moe:
+    if rco_w2_bank_dir is not None:
         rco_w2_bank_dir.mkdir(parents=True, exist_ok=True)
         n_qat = min(len(h_calib), 128)
         qat_max_toks = 2048
@@ -2801,6 +3089,7 @@ def run_quantize_qwen4_exp(args: argparse.Namespace) -> None:
                 )
                 for i in range(n_qat)
             ],
+            "ple_embeds": {},
         }
 
     # ------------------------------------------------------------------
@@ -2894,6 +3183,53 @@ def run_quantize_qwen4_exp(args: argparse.Namespace) -> None:
         if pending_layer_save_fut is not None:
             pending_layer_save_fut.result()
 
+    if rco_w2_bank_dir is not None and teacher_qat_state is not None:
+        if is_qwen35_moe:
+            with torch.device(device), skip_weights_initialize():
+                fn_qat = (
+                    Qwen3_5MoeRMSNorm(cfg.text_config.hidden_size, eps=cfg.text_config.rms_norm_eps)
+                    .to(dtype=torch.bfloat16)
+                    .eval()
+                )
+            n_raw = _load_top_level_module_tensors(base_dir, shard_map, "model.language_model.norm.")
+            fn_qat.weight.data.copy_(
+                n_raw["model.language_model.norm.weight"].to(device=device, dtype=torch.bfloat16)
+            )
+            del n_raw
+        else:
+            from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextGatedResidual
+
+            with torch.device(device), skip_weights_initialize():
+                fn_qat = (
+                    Qwen4ExpTextGatedResidual(cfg.text_config, use_combine=False)
+                    .to(dtype=torch.bfloat16)
+                    .eval()
+                )
+            m_raw = _load_top_level_module_tensors(
+                base_dir, shard_map, "model.language_model.hyper_connection_mixer."
+            )
+            fn_qat.load_state_dict(
+                {
+                    k.removeprefix("model.language_model.hyper_connection_mixer."): v.to(
+                        device=device, dtype=torch.bfloat16
+                    )
+                    for k, v in m_raw.items()
+                },
+                strict=True,
+            )
+            del m_raw
+        teacher_post_norm = [fn_qat(h_t.to(device)).detach().cpu() for h_t in teacher_qat_state["h_list"]]
+        torch.save(
+            {
+                "input_ids": teacher_qat_state["input_ids"],
+                "final_norm_states": teacher_post_norm,
+                "ple_embeds": teacher_qat_state.get("ple_embeds", {}),
+            },
+            rco_w2_bank_dir / "qat_teacher_states.pt",
+        )
+        del fn_qat, teacher_post_norm, teacher_qat_state
+        teacher_qat_state = None
+
     # Calibrate or pack untied lm_head (W8_g{group_size}, unrotated) using post-norm hidden states
     if is_qwen35_moe or deferred_embed_raw:
         head_raw = _load_top_level_module_tensors(base_dir, shard_map, "lm_head.")
@@ -2946,19 +3282,6 @@ def run_quantize_qwen4_exp(args: argparse.Namespace) -> None:
                     del m_raw
                 n_head_cal = min(len(h_calib), args.component_calib_samples)
                 post_norm_states = [fn_head(h_calib[i].to(device)).cpu() for i in range(n_head_cal)]
-                if rco_w2_bank_dir is not None and teacher_qat_state is not None:
-                    teacher_post_norm = [
-                        fn_head(h_t.to(device)).detach().cpu() for h_t in teacher_qat_state["h_list"]
-                    ]
-                    torch.save(
-                        {
-                            "input_ids": teacher_qat_state["input_ids"],
-                            "final_norm_states": teacher_post_norm,
-                        },
-                        rco_w2_bank_dir / "qat_teacher_states.pt",
-                    )
-                    del teacher_post_norm, teacher_qat_state
-                    teacher_qat_state = None
                 del fn_head
                 packed_lm = calibrate_lm_head_w8(
                     head_raw["lm_head.weight"],
@@ -4313,64 +4636,133 @@ def assemble_moe_rco_checkpoint(
     qat_state_dict: dict[str, torch.Tensor] | None = None,
     summary_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Assemble a standalone Qwen3.5-MoE W2/W4 HGPTQ-RCO checkpoint from a W4 checkpoint + W2 expert bank."""
+    """Assemble a standalone Qwen3.5-MoE or Qwen4Exp W2/W4 HGPTQ-RCO checkpoint from a W4 checkpoint + W2 expert bank."""
     import shutil
 
     from warp_quant.hadamard_gptq import _assert_packed_alignment
     from warp_quant.stamp import stamp_release_template
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    s1_name = "model-00001-of-00002.safetensors"
-    s2_name = "model-00002-of-00002.safetensors"
-    s1_tensors: dict[str, torch.Tensor] = {}
-    with safe_open(str(w4_ckpt_dir / s1_name), framework="pt", device="cpu") as sf:
-        for k in sf.keys():
-            s1_tensors[k] = sf.get_tensor(k)
+    w4_cfg = json.loads((w4_ckpt_dir / "config.json").read_text())
+    is_qwen35_moe = _is_qwen35_moe_config_dict(w4_cfg)
 
-    for l_idx, choice in enumerate(layer_choices):
-        if choice == 0:
-            b = torch.load(
-                rco_w2_bank_dir / f"layer_{l_idx:02d}_w2.pt",
-                map_location="cpu",
-                weights_only=True,
-            )
-            for tk, tv in b["w2_tensors"].items():
-                s1_tensors[tk] = tv.contiguous()
-            del b
+    if is_qwen35_moe:
+        s1_name = "model-00001-of-00002.safetensors"
+        s2_name = "model-00002-of-00002.safetensors"
+        s1_tensors: dict[str, torch.Tensor] = {}
+        with safe_open(str(w4_ckpt_dir / s1_name), framework="pt", device="cpu") as sf:
+            for k in sf.keys():
+                s1_tensors[k] = sf.get_tensor(k)
 
-    if qat_state_dict:
-        for tk, tv in qat_state_dict.items():
-            if tk in s1_tensors:
-                s1_tensors[tk] = tv.detach().to(dtype=s1_tensors[tk].dtype, device="cpu").contiguous()
+        for l_idx, choice in enumerate(layer_choices):
+            if choice == 0:
+                b = torch.load(
+                    rco_w2_bank_dir / f"layer_{l_idx:02d}_w2.pt",
+                    map_location="cpu",
+                    weights_only=True,
+                )
+                for tk, tv in b["w2_tensors"].items():
+                    s1_tensors[tk] = tv.contiguous()
+                del b
 
-    save_file(s1_tensors, str(out_dir / s1_name))
-    s1_bytes = sum(t.numel() * t.element_size() for t in s1_tensors.values())
-    del s1_tensors
+        if qat_state_dict:
+            for tk, tv in qat_state_dict.items():
+                if tk in s1_tensors:
+                    s1_tensors[tk] = tv.detach().to(dtype=s1_tensors[tk].dtype, device="cpu").contiguous()
 
-    other_bytes = 0
-    for extra_shard in (s2_name, "model_mtp.safetensors"):
-        src_p = w4_ckpt_dir / extra_shard
-        if src_p.is_file():
-            dst_p = out_dir / extra_shard
+        save_file(s1_tensors, str(out_dir / s1_name))
+        del s1_tensors
+
+        for extra_shard in (s2_name, "model_mtp.safetensors"):
+            src_p = w4_ckpt_dir / extra_shard
+            if src_p.is_file():
+                dst_p = out_dir / extra_shard
+                if dst_p.exists() or dst_p.is_symlink():
+                    dst_p.unlink()
+                try:
+                    os.link(src_p, dst_p)
+                except OSError:
+                    shutil.copy2(src_p, dst_p)
+    else:
+        handled_shards: set[str] = set()
+        for l_idx, choice in enumerate(layer_choices):
+            layer_shard = f"model-layer-{l_idx:02d}.safetensors"
+            src_l = w4_ckpt_dir / layer_shard
+            if not src_l.is_file():
+                continue
+            handled_shards.add(layer_shard)
+            dst_l = out_dir / layer_shard
+            if dst_l.exists() or dst_l.is_symlink():
+                dst_l.unlink()
+            l_pref = f"model.language_model.layers.{l_idx}."
+            layer_qat = {k: v for k, v in (qat_state_dict or {}).items() if k.startswith(l_pref)}
+            if choice == 1 and not layer_qat:
+                try:
+                    os.link(src_l, dst_l)
+                except OSError:
+                    shutil.copy2(src_l, dst_l)
+                continue
+            l_tensors: dict[str, torch.Tensor] = {}
+            with safe_open(str(src_l), framework="pt", device="cpu") as sf:
+                for k in sf.keys():
+                    l_tensors[k] = sf.get_tensor(k)
+            if choice == 0:
+                b = torch.load(
+                    rco_w2_bank_dir / f"layer_{l_idx:02d}_w2.pt",
+                    map_location="cpu",
+                    weights_only=True,
+                )
+                for tk, tv in b["w2_tensors"].items():
+                    l_tensors[tk] = tv.contiguous()
+                del b
+            for tk, tv in layer_qat.items():
+                if tk in l_tensors:
+                    l_tensors[tk] = tv.detach().to(dtype=l_tensors[tk].dtype, device="cpu").contiguous()
+            save_file(l_tensors, str(dst_l))
+            del l_tensors
+
+        top_qat = {
+            k: v
+            for k, v in (qat_state_dict or {}).items()
+            if k.startswith(("model.language_model.hyper_connection_mixer.", "model.language_model.norm."))
+        }
+        eh_name = "model-embed-head.safetensors"
+        if (w4_ckpt_dir / eh_name).is_file() and top_qat:
+            handled_shards.add(eh_name)
+            eh_tensors: dict[str, torch.Tensor] = {}
+            with safe_open(str(w4_ckpt_dir / eh_name), framework="pt", device="cpu") as sf:
+                for k in sf.keys():
+                    eh_tensors[k] = sf.get_tensor(k)
+            for tk, tv in top_qat.items():
+                if tk in eh_tensors:
+                    eh_tensors[tk] = tv.detach().to(dtype=eh_tensors[tk].dtype, device="cpu").contiguous()
+            save_file(eh_tensors, str(out_dir / eh_name))
+            del eh_tensors
+
+        for sp in sorted(w4_ckpt_dir.glob("*.safetensors")):
+            if sp.name in handled_shards:
+                continue
+            dst_p = out_dir / sp.name
             if dst_p.exists() or dst_p.is_symlink():
                 dst_p.unlink()
             try:
-                os.link(src_p, dst_p)
+                os.link(sp, dst_p)
             except OSError:
-                shutil.copy2(src_p, dst_p)
-            other_bytes += dst_p.stat().st_size
+                shutil.copy2(sp, dst_p)
 
     for fpath in sorted(w4_ckpt_dir.iterdir()):
         if fpath.is_file() and not fpath.name.endswith(".safetensors") and fpath.name != "config.json":
             shutil.copy2(fpath, out_dir / fpath.name)
+    if (w4_ckpt_dir / "runtime").is_dir():
+        shutil.copytree(w4_ckpt_dir / "runtime", out_dir / "runtime", dirs_exist_ok=True)
 
+    tot_bytes = sum(p.stat().st_size for p in out_dir.glob("*.safetensors"))
     idx_path = out_dir / "model.safetensors.index.json"
     if idx_path.is_file():
         idx_data = json.loads(idx_path.read_text())
-        idx_data.setdefault("metadata", {})["total_size"] = int(s1_bytes + other_bytes)
+        idx_data.setdefault("metadata", {})["total_size"] = int(tot_bytes)
         idx_path.write_text(json.dumps(idx_data, indent=2, sort_keys=True) + "\n")
 
-    w4_cfg = json.loads((w4_ckpt_dir / "config.json").read_text())
     if all(c == 1 for c in layer_choices):
         (out_dir / "config.json").write_text(json.dumps(w4_cfg, indent=2, sort_keys=True) + "\n")
     else:
@@ -4424,25 +4816,44 @@ def run_moe_rco_search_and_qat(
     qat_lr: float = 1e-4,
     assemble_names: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Run 40-layer Gumbel-Softmax STE RCO search + E2E FP32-master Norm/GDN-gate KL QAT for Qwen3.5-MoE."""
+    """Run Gumbel-Softmax STE RCO search + E2E FP32-master Norm/GDN/HC/PLE KL QAT for Qwen3.5-MoE and Qwen4Exp."""
     from llmcompressor.utils.dev import skip_weights_initialize
     from torch.utils.checkpoint import checkpoint as grad_ckpt
-    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
-    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
-        Qwen3_5MoeRMSNorm,
-        Qwen3_5MoeTextRotaryEmbedding,
-    )
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     raw_base_cfg = json.loads((base_dir / "config.json").read_text())
-    cfg = Qwen3_5MoeConfig.from_dict(raw_base_cfg)
+    is_qwen35_moe = _is_qwen35_moe_config_dict(raw_base_cfg)
+    if is_qwen35_moe:
+        from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
+        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+            Qwen3_5MoeRMSNorm,
+            Qwen3_5MoeTextRotaryEmbedding,
+        )
+
+        cfg = Qwen3_5MoeConfig.from_dict(raw_base_cfg)
+        RotaryCls = Qwen3_5MoeTextRotaryEmbedding
+    else:
+        from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpConfig
+        from transformers.models.qwen4_exp.modeling_qwen4_exp import (
+            Qwen4ExpTextGatedResidual,
+            Qwen4ExpTextRotaryEmbedding,
+        )
+
+        cfg = Qwen4ExpConfig.from_dict(raw_base_cfg)
+        RotaryCls = Qwen4ExpTextRotaryEmbedding
+
     _ensure_qwen4_exp_device_kernels(cfg.text_config, device)
     num_layers = cfg.text_config.num_hidden_layers
     num_exp = cfg.text_config.num_experts
     inter = cfg.text_config.moe_intermediate_size
     hidden = cfg.text_config.hidden_size
+    hc_count = 1 if is_qwen35_moe else cfg.text_config.hc_count
+    # Keep both W2 and W4 banks simultaneously on GPU for <=40x256 models; for 48x512 (Flash-Next),
+    # keep only the active per-layer expert bank on GPU during QAT/eval to leave >75 GiB free VRAM.
+    keep_both_banks_on_gpu = (device.type != "cuda") or (num_layers * num_exp <= 12_000)
+    w2_init_dev = device if keep_both_banks_on_gpu else torch.device("cpu")
 
-    # 1. Load per-layer W2 bank metrics and packed 3D tensors onto GPU (only needed when budgets is non-empty)
+    # 1. Load per-layer W2 bank metrics and packed 3D tensors (only needed when budgets is non-empty)
     layer_metrics: list[dict[str, Any]] = []
     w2_packed_gpu: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
     if budgets:
@@ -4454,10 +4865,10 @@ def run_moe_rco_search_and_qat(
             )
             layer_metrics.append(b["metrics"])
             p3d = b["packed_3d"]
-            wp_gu_w2 = torch.cat([p3d["gate_proj_packed"], p3d["up_proj_packed"]], dim=1).to(device)
-            ws_gu_w2 = torch.cat([p3d["gate_proj_scale"], p3d["up_proj_scale"]], dim=1).to(device)
-            wp_dn_w2 = p3d["down_proj_packed"].to(device)
-            ws_dn_w2 = p3d["down_proj_scale"].to(device)
+            wp_gu_w2 = torch.cat([p3d["gate_proj_packed"], p3d["up_proj_packed"]], dim=1).to(w2_init_dev)
+            ws_gu_w2 = torch.cat([p3d["gate_proj_scale"], p3d["up_proj_scale"]], dim=1).to(w2_init_dev)
+            wp_dn_w2 = p3d["down_proj_packed"].to(w2_init_dev)
+            ws_dn_w2 = p3d["down_proj_scale"].to(w2_init_dev)
             w2_packed_gpu.append((wp_gu_w2, ws_gu_w2, wp_dn_w2, ws_dn_w2))
             del b, p3d
 
@@ -4471,15 +4882,34 @@ def run_moe_rco_search_and_qat(
     embed_w = embed_raw["model.language_model.embed_tokens.weight"].to(device=device, dtype=torch.bfloat16)
     del embed_raw
 
-    with torch.device(device), skip_weights_initialize():
-        final_norm = (
-            Qwen3_5MoeRMSNorm(hidden, eps=cfg.text_config.rms_norm_eps).to(dtype=torch.bfloat16).eval()
+    if is_qwen35_moe:
+        with torch.device(device), skip_weights_initialize():
+            final_norm = (
+                Qwen3_5MoeRMSNorm(hidden, eps=cfg.text_config.rms_norm_eps).to(dtype=torch.bfloat16).eval()
+            )
+        norm_raw = _load_top_level_module_tensors(w4_ckpt_dir, w4_shard_map, "model.language_model.norm.")
+        final_norm.weight.data.copy_(
+            norm_raw["model.language_model.norm.weight"].to(device=device, dtype=torch.bfloat16)
         )
-    norm_raw = _load_top_level_module_tensors(w4_ckpt_dir, w4_shard_map, "model.language_model.norm.")
-    final_norm.weight.data.copy_(
-        norm_raw["model.language_model.norm.weight"].to(device=device, dtype=torch.bfloat16)
-    )
-    del norm_raw
+        del norm_raw
+    else:
+        with torch.device(device), skip_weights_initialize():
+            final_norm = (
+                Qwen4ExpTextGatedResidual(cfg.text_config, use_combine=False).to(dtype=torch.bfloat16).eval()
+            )
+        mixer_raw = _load_top_level_module_tensors(
+            w4_ckpt_dir, w4_shard_map, "model.language_model.hyper_connection_mixer."
+        )
+        final_norm.load_state_dict(
+            {
+                k.removeprefix("model.language_model.hyper_connection_mixer."): v.to(
+                    device=device, dtype=torch.bfloat16
+                )
+                for k, v in mixer_raw.items()
+            },
+            strict=True,
+        )
+        del mixer_raw
 
     base_head_raw = _load_top_level_module_tensors(base_dir, base_shard_map, "lm_head.")
     base_lm_head_w = base_head_raw["lm_head.weight"].to(device=device, dtype=torch.bfloat16)
@@ -4495,8 +4925,9 @@ def run_moe_rco_search_and_qat(
         student_lm_head_w = w4_head_raw["lm_head.weight"].to(device=device, dtype=torch.bfloat16)
     del w4_head_raw
 
-    rotary = Qwen3_5MoeTextRotaryEmbedding(config=cfg.text_config).to(device)
+    rotary = RotaryCls(config=cfg.text_config).to(device)
     layers = nn.ModuleList()
+    ple_mods: list[nn.Module | None] = []
     w4_packed_gpu: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
     had_moe_in = min(hadamard_block_size, hidden & -hidden) if hadamard_block_size > 0 else 0
@@ -4533,7 +4964,9 @@ def run_moe_rco_search_and_qat(
             prefetched_raw=raw_t,
         )
         del raw_t
-        # Free the 1.5 GiB BF16 expert buffers; experts will unpack on the fly from w2/w4_packed_gpu
+        ple_mods.append(getattr(layer, "ple", None))
+        layer.ple = None
+        # Free the BF16 expert buffers; experts will unpack on the fly from w2/w4_packed_gpu
         layer.mlp.experts.gate_up_proj = nn.Parameter(
             torch.empty(0, device=device, dtype=torch.bfloat16), requires_grad=False
         )
@@ -4554,6 +4987,25 @@ def run_moe_rco_search_and_qat(
         "z_tilde": None,
     }
 
+    def _activate_fixed_choices(choices: list[int]) -> None:
+        active_mode["mode"] = "fixed"
+        active_mode["choices"] = list(choices)
+        if keep_both_banks_on_gpu or not w2_packed_gpu:
+            return
+        for li, ch in enumerate(choices):
+            if ch == 1:
+                if w2_packed_gpu[li][0].device.type != "cpu":
+                    w2_packed_gpu[li] = tuple(t.cpu() for t in w2_packed_gpu[li])  # type: ignore[assignment]
+                if w4_packed_gpu[li][0].device != device:
+                    w4_packed_gpu[li] = tuple(t.to(device) for t in w4_packed_gpu[li])  # type: ignore[assignment]
+            else:
+                if w4_packed_gpu[li][0].device.type != "cpu":
+                    w4_packed_gpu[li] = tuple(t.cpu() for t in w4_packed_gpu[li])  # type: ignore[assignment]
+                if w2_packed_gpu[li][0].device != device:
+                    w2_packed_gpu[li] = tuple(t.to(device) for t in w2_packed_gpu[li])  # type: ignore[assignment]
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
     def _run_single_expert_branch(
         experts_mod: nn.Module,
         x_2d: torch.Tensor,
@@ -4562,6 +5014,11 @@ def run_moe_rco_search_and_qat(
         packed_tuple: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         wp_gu, ws_gu, wp_dn, ws_dn = packed_tuple
+        if wp_gu.device != x_2d.device:
+            wp_gu = wp_gu.to(x_2d.device, non_blocking=True)
+            ws_gu = ws_gu.to(x_2d.device, non_blocking=True)
+            wp_dn = wp_dn.to(x_2d.device, non_blocking=True)
+            ws_dn = ws_dn.to(x_2d.device, non_blocking=True)
         gu_3d = _unpack_3d_experts_gpu(wp_gu, ws_gu, group_size=group_size, dtype=x_2d.dtype)
         dn_3d = _unpack_3d_experts_gpu(wp_dn, ws_dn, group_size=group_size, dtype=x_2d.dtype)
         x_in = (
@@ -4628,27 +5085,63 @@ def run_moe_rco_search_and_qat(
     t_payload = torch.load(rco_w2_bank_dir / "qat_teacher_states.pt", map_location="cpu", weights_only=True)
     t_ids_list: list[torch.Tensor] = t_payload["input_ids"]
     t_norm_list: list[torch.Tensor] = t_payload["final_norm_states"]
+    t_ple_embeds: dict[str, list[torch.Tensor]] = {
+        str(k): v for k, v in (t_payload.get("ple_embeds") or {}).items()
+    }
+    for l_idx, pmod in enumerate(ple_mods):
+        if pmod is not None and str(l_idx) not in t_ple_embeds:
+            t_ple_embeds[str(l_idx)] = stream_gather_ple_embeds(
+                w4_ckpt_dir,
+                w4_shard_map,
+                pmod,
+                l_idx,
+                t_ids_list,
+                ple_group_size=32,
+            )
+
     n_tot_seqs = len(t_ids_list)
-    val_count = min(12, max(4, n_tot_seqs // 8))
+    val_count = min(12, max(2, n_tot_seqs // 4)) if n_tot_seqs < 16 else min(12, max(4, n_tot_seqs // 8))
     train_indices = list(range(0, n_tot_seqs - val_count))
     val_indices = list(range(n_tot_seqs - val_count, n_tot_seqs))
 
-    def _forward_student(ids_dev: torch.Tensor, *, use_ckpt: bool = False) -> torch.Tensor:
+    def _forward_student(
+        ids_dev: torch.Tensor,
+        *,
+        seq_idx: int | None = None,
+        use_ckpt: bool = False,
+    ) -> torch.Tensor:
         seq_len = ids_dev.shape[1]
-        h = F.embedding(ids_dev, embed_w)
+        inp_emb = F.embedding(ids_dev, embed_w)
         pos_ids = torch.arange(seq_len, device=device).view(1, 1, -1).expand(3, ids_dev.shape[0], -1)
-        cos, sin = rotary(h, pos_ids)
-        for layer in layers:
+        cos, sin = rotary(inp_emb, pos_ids)
+        h = inp_emb if is_qwen35_moe else inp_emb.repeat(1, 1, hc_count)
+        for l_idx, layer in enumerate(layers):
+            pmod = ple_mods[l_idx]
+            pemb = (
+                t_ple_embeds[str(l_idx)][seq_idx][:, :seq_len, :].to(device=device, dtype=h.dtype)
+                if (pmod is not None and seq_idx is not None and str(l_idx) in t_ple_embeds)
+                else None
+            )
             if use_ckpt and torch.is_grad_enabled():
 
-                def _l_fn(x_in, _l=layer, _c=cos, _s=sin):
-                    out = _l(x_in, position_embeddings=(_c, _s))
-                    return out[0] if isinstance(out, tuple) else out
+                def _l_fn(x_in, _l=layer, _c=cos, _s=sin, _pm=pmod, _pe=pemb):
+                    return _forward_decoder_layer_core(
+                        _l,
+                        x_in,
+                        (_c, _s),
+                        ple_layer=_pm,
+                        ple_embeds=_pe,
+                    )
 
                 h = grad_ckpt(_l_fn, h, use_reentrant=False)
             else:
-                out = layer(h, position_embeddings=(cos, sin))
-                h = out[0] if isinstance(out, tuple) else out
+                h = _forward_decoder_layer_core(
+                    layer,
+                    h,
+                    (cos, sin),
+                    ple_layer=pmod,
+                    ple_embeds=pemb,
+                )
         return final_norm(h)
 
     def _kl_loss_against_teacher(
@@ -4678,14 +5171,13 @@ def run_moe_rco_search_and_qat(
     @torch.no_grad()
     def _eval_choices_val_kl(choices: list[int], eval_idxs: list[int] | None = None) -> float:
         idxs = eval_idxs if eval_idxs is not None else val_indices
-        active_mode["mode"] = "fixed"
-        active_mode["choices"] = list(choices)
+        _activate_fixed_choices(choices)
         tot_kl = 0.0
         tot_toks = 0
         for idx in idxs:
             ids_d = t_ids_list[idx].to(device)
             t_nh = t_norm_list[idx].to(device, dtype=torch.bfloat16)
-            s_nh = _forward_student(ids_d, use_ckpt=False)
+            s_nh = _forward_student(ids_d, seq_idx=idx, use_ckpt=False)
             n_t = int(ids_d.numel())
             tot_kl += float(_kl_loss_against_teacher(s_nh, t_nh).item()) * n_t
             tot_toks += n_t
@@ -4740,57 +5232,60 @@ def run_moe_rco_search_and_qat(
         top_comb = torch.argsort(combined_prior, descending=True)[:k_w4].tolist()
         c_comb = [1 if i in set(top_comb) else 0 for i in range(num_layers)]
 
-        # Candidate 3: End-to-End Gumbel-Softmax STE RCO search
-        theta = torch.zeros((num_layers, 2), device=device, dtype=torch.float32)
-        theta[:, 1] = combined_prior.to(device=device, dtype=torch.float32) * 0.8
-        theta.requires_grad_(True)
-        opt_theta = torch.optim.Adam([theta], lr=lr)
-        target_bytes = min_bytes + b_frac * (max_bytes - min_bytes)
+        # Candidate 3: End-to-End Gumbel-Softmax STE RCO search (or Hessian top-K when streaming bank)
+        top_h = torch.argsort(h_loss_scores, descending=True)[:k_w4].tolist()
+        c_rco_proj = [1 if i in set(top_h) else 0 for i in range(num_layers)]
+        if steps > 0:
+            theta = torch.zeros((num_layers, 2), device=device, dtype=torch.float32)
+            theta[:, 1] = combined_prior.to(device=device, dtype=torch.float32) * 0.8
+            theta.requires_grad_(True)
+            opt_theta = torch.optim.Adam([theta], lr=lr)
+            target_bytes = min_bytes + b_frac * (max_bytes - min_bytes)
 
-        log_event("MOE_RCO_SEARCH_START", budget=b_frac, steps=steps, k_w4=k_w4)
-        for step_idx in range(steps):
-            progress = step_idx / max(steps - 1, 1)
-            tau = 1.0 * ((0.15 / 1.0) ** progress)
-            seq_idx = search_pool[step_idx % len(search_pool)]
-            ids_d = t_ids_list[seq_idx].to(device)
-            t_nh = t_norm_list[seq_idx].to(device, dtype=torch.bfloat16)
+            log_event("MOE_RCO_SEARCH_START", budget=b_frac, steps=steps, k_w4=k_w4)
+            for step_idx in range(steps):
+                progress = step_idx / max(steps - 1, 1)
+                tau = 1.0 * ((0.15 / 1.0) ** progress)
+                seq_idx = search_pool[step_idx % len(search_pool)]
+                ids_d = t_ids_list[seq_idx].to(device)
+                t_nh = t_norm_list[seq_idx].to(device, dtype=torch.bfloat16)
 
-            opt_theta.zero_grad(set_to_none=True)
-            z_ste = F.gumbel_softmax(theta, tau=tau, hard=True, dim=-1)
-            active_mode["mode"] = "rco_ste"
-            active_mode["z_tilde"] = z_ste[:, 1]
+                opt_theta.zero_grad(set_to_none=True)
+                z_ste = F.gumbel_softmax(theta, tau=tau, hard=True, dim=-1)
+                active_mode["mode"] = "rco_ste"
+                active_mode["z_tilde"] = z_ste[:, 1]
 
-            s_nh = _forward_student(ids_d, use_ckpt=True)
-            kl_l = _kl_loss_against_teacher(s_nh, t_nh)
-            probs = F.softmax(theta / tau, dim=-1)
-            exp_bytes = (probs * byte_costs).sum()
-            over_frac = F.relu(exp_bytes - target_bytes) / max(max_bytes - min_bytes, 1.0)
-            loss = kl_l + 15.0 * (over_frac**2)
-            loss.backward()
-            with torch.no_grad():
-                theta.grad.sub_(theta.grad.mean(dim=-1, keepdim=True))
-            opt_theta.step()
-            if (step_idx + 1) % 20 == 0 or step_idx == 0:
-                log_event(
-                    "MOE_RCO_SEARCH_STEP",
-                    budget=b_frac,
-                    step=step_idx + 1,
-                    kl=round(float(kl_l.item()), 5),
-                    tau=round(tau, 3),
-                )
-            del ids_d, t_nh, s_nh, kl_l, loss
+                s_nh = _forward_student(ids_d, seq_idx=seq_idx, use_ckpt=True)
+                kl_l = _kl_loss_against_teacher(s_nh, t_nh)
+                probs = F.softmax(theta / tau, dim=-1)
+                exp_bytes = (probs * byte_costs).sum()
+                over_frac = F.relu(exp_bytes - target_bytes) / max(max_bytes - min_bytes, 1.0)
+                loss = kl_l + 15.0 * (over_frac**2)
+                loss.backward()
+                with torch.no_grad():
+                    theta.grad.sub_(theta.grad.mean(dim=-1, keepdim=True))
+                opt_theta.step()
+                if (step_idx + 1) % 20 == 0 or step_idx == 0:
+                    log_event(
+                        "MOE_RCO_SEARCH_STEP",
+                        budget=b_frac,
+                        step=step_idx + 1,
+                        kl=round(float(kl_l.item()), 5),
+                        tau=round(tau, 3),
+                    )
+                del ids_d, t_nh, s_nh, kl_l, loss
 
-        active_mode["mode"] = "fixed"
-        active_mode["z_tilde"] = None
-        scores_rco = (theta.detach()[:, 1] - theta.detach()[:, 0]).cpu()
-        top_rco = torch.argsort(scores_rco, descending=True)[:k_w4].tolist()
-        c_rco_proj = [1 if i in set(top_rco) else 0 for i in range(num_layers)]
+            active_mode["mode"] = "fixed"
+            active_mode["z_tilde"] = None
+            scores_rco = (theta.detach()[:, 1] - theta.detach()[:, 0]).cpu()
+            top_rco = torch.argsort(scores_rco, descending=True)[:k_w4].tolist()
+            c_rco_proj = [1 if i in set(top_rco) else 0 for i in range(num_layers)]
 
         kl_out = _eval_choices_val_kl(c_out)
         kl_comb = _eval_choices_val_kl(c_comb)
         kl_rco = _eval_choices_val_kl(c_rco_proj)
         best_kl, best_c, best_src = min(
-            (kl_rco, c_rco_proj, "rco_gumbel_ste"),
+            (kl_rco, c_rco_proj, "rco_gumbel_ste" if steps > 0 else "h_loss_prior"),
             (kl_comb, c_comb, "combined_prior"),
             (kl_out, c_out, "out_l2_prior"),
             key=lambda x: x[0],
@@ -4813,7 +5308,7 @@ def run_moe_rco_search_and_qat(
             "winner_source": best_src,
         }
 
-    # 5. Collect trainable FP32-master Norm / GDN-gate / QK-norm / shared_expert_gate parameters for QAT
+    # 5. Collect trainable FP32-master Norm / GDN-gate / QK-norm / HC / PLE parameters for QAT
     trainable_params: list[tuple[str, nn.Parameter]] = []
     for l_idx, layer in enumerate(layers):
         lpref = f"model.language_model.layers.{l_idx}"
@@ -4823,6 +5318,8 @@ def run_moe_rco_search_and_qat(
                 for sfx in (
                     "input_layernorm.weight",
                     "post_attention_layernorm.weight",
+                    "hc_norm.weight",
+                    "block_inject_weight.weight",
                     "q_norm.weight",
                     "k_norm.weight",
                     "linear_attn.norm.weight",
@@ -4834,7 +5331,25 @@ def run_moe_rco_search_and_qat(
                 )
             ):
                 trainable_params.append((f"{lpref}.{sub_name}", param))
-    trainable_params.append(("model.language_model.norm.weight", final_norm.weight))
+        pmod = ple_mods[l_idx]
+        if pmod is not None:
+            for sub_name, param in pmod.named_parameters():
+                if any(
+                    sub_name.endswith(sfx)
+                    for sfx in (
+                        "norm_key.weight",
+                        "norm_query.weight",
+                        "norm_conv.weight",
+                        "conv1d.weight",
+                    )
+                ):
+                    trainable_params.append((f"{lpref}.ple.{sub_name}", param))
+    if is_qwen35_moe:
+        trainable_params.append(("model.language_model.norm.weight", final_norm.weight))
+    else:
+        trainable_params.append(
+            ("model.language_model.hyper_connection_mixer.hc_norm.weight", final_norm.hc_norm.weight)
+        )
 
     base_param_snapshot = {full_k: p.detach().clone() for full_k, p in trainable_params}
 
@@ -4858,8 +5373,7 @@ def run_moe_rco_search_and_qat(
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(
             opt_qat, T_max=max(len(qat_pool), 1), eta_min=qat_lr * 0.1
         )
-        active_mode["mode"] = "fixed"
-        active_mode["choices"] = list(choices)
+        _activate_fixed_choices(choices)
 
         log_event(
             "MOE_RCO_QAT_START",
@@ -4875,7 +5389,7 @@ def run_moe_rco_search_and_qat(
             for (_fk, p), mp in zip(trainable_params, fp32_masters, strict=True):
                 p.grad = None
                 mp.grad = None
-            s_nh = _forward_student(ids_d, use_ckpt=True).to(torch.bfloat16)
+            s_nh = _forward_student(ids_d, seq_idx=seq_idx, use_ckpt=True).to(torch.bfloat16)
             kl_l = _kl_loss_against_teacher(s_nh, t_nh)
             mse_l = F.mse_loss(s_nh.float(), t_nh.float())
             loss = kl_l + 0.1 * mse_l

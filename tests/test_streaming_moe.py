@@ -798,6 +798,243 @@ class TestQwen38FlashNextQuant(unittest.TestCase):
             self.assertEqual(rco_logits_0.shape, ref_logits_0.shape)
             self.assertTrue(torch.isfinite(rco_logits_0).all())
 
+    def test_ple_mse_scale_search_hcd_and_kv_mmse_compensation(self):
+        from warp_quant.streaming_moe import apply_ple_kv_mmse_compensation
+
+        torch.manual_seed(42)
+        d_h = 64
+        u_dir = torch.randn(1, d_h)
+        u_dir = u_dir / u_dir.norm()
+        wk = torch.randn(128, d_h) + 12.0 * torch.randn(128, 1) @ u_dir
+        wv = torch.randn(64, d_h) + 5.0 * torch.randn(64, 1) @ u_dir
+        n_rows = 1024
+        z = torch.randn(n_rows, d_h) * (1.0 + 0.35 * torch.randn(n_rows, d_h).abs())
+        w_batch = z + 2.0 * (z @ u_dir.T) @ u_dir
+
+        h_list, u_list = compute_ple_head_hessians(wk, wv, num_heads=1)
+        h_m, u_m = h_list[0], u_list[0]
+
+        q_legacy, _, _ = quantize_ple_batch_gptq_lut4(
+            w_batch,
+            h_m,
+            u_m,
+            group_size=32,
+            cd_passes=1,
+            mse_scale_search=False,
+            refine_scales=False,
+        )
+        q_upgraded, _, _ = quantize_ple_batch_gptq_lut4(
+            w_batch,
+            h_m,
+            u_m,
+            group_size=32,
+            cd_passes=1,
+            mse_scale_search=True,
+            refine_scales=True,
+        )
+        loss_legacy = float((((q_legacy - w_batch) @ h_m) * (q_legacy - w_batch)).sum().item())
+        loss_upgraded = float((((q_upgraded - w_batch) @ h_m) * (q_upgraded - w_batch)).sum().item())
+        self.assertLess(loss_upgraded, loss_legacy * 0.93)
+
+        dummy_ple = nn.Module()
+        dummy_ple.key_proj = nn.Linear(d_h, 128, bias=False)
+        dummy_ple.value_proj = nn.Linear(d_h, 64, bias=False)
+        dummy_ple.key_proj.weight.data.copy_(wk)
+        dummy_ple.value_proj.weight.data.copy_(wv)
+
+        k_ref = w_batch @ wk.T
+        k_err_pre = (q_upgraded @ dummy_ple.key_proj.weight.T - k_ref).norm().item()
+        g_m = (q_upgraded.T @ q_upgraded).to(torch.float64)
+        c_m = ((w_batch - q_upgraded).T @ q_upgraded).to(torch.float64)
+        comp_ratio = apply_ple_kv_mmse_compensation(dummy_ple, [g_m], [c_m], ridge_frac=0.01)
+        self.assertGreater(comp_ratio, 0.0)
+        k_err_post = (q_upgraded @ dummy_ple.key_proj.weight.T - k_ref).norm().item()
+        self.assertLess(k_err_post, k_err_pre)
+
+    def test_qwen4_exp_rco_search_qat_and_assembly(self):
+        from transformers.models.qwen4_exp.modeling_qwen4_exp import (
+            Qwen4ExpForConditionalGeneration,
+            Qwen4ExpTextGatedResidual,
+            Qwen4ExpTextRotaryEmbedding,
+        )
+
+        from warp_quant.streaming_moe import run_moe_rco_search_and_qat
+
+        torch.manual_seed(123)
+        cfg = _make_tiny_qwen4_exp_config()
+        device = torch.device("cpu")
+        model = Qwen4ExpForConditionalGeneration(cfg).to(torch.bfloat16).eval()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp) / "base_q4"
+            quant_dir = Path(tmp) / "quant_q4"
+            rco_bank_dir = Path(tmp) / "rco_bank_q4"
+            rco_out_dir = Path(tmp) / "rco_out_q4"
+            base_dir.mkdir()
+            quant_dir.mkdir()
+            rco_bank_dir.mkdir()
+
+            raw_cfg = cfg.to_dict()
+            (base_dir / "config.json").write_text(json.dumps(raw_cfg, indent=2) + "\n")
+
+            base_tensors: dict[str, torch.Tensor] = {}
+            for k, v in model.state_dict().items():
+                if k.endswith("mlp.experts.gate_up_proj"):
+                    pref = k[: -len("gate_up_proj")]
+                    inter = v.shape[1] // 2
+                    for e in range(v.shape[0]):
+                        base_tensors[f"{pref}{e}.gate_proj.weight"] = v[e, :inter].contiguous()
+                        base_tensors[f"{pref}{e}.up_proj.weight"] = v[e, inter:].contiguous()
+                elif k.endswith("mlp.experts.down_proj"):
+                    pref = k[: -len("down_proj")]
+                    for e in range(v.shape[0]):
+                        base_tensors[f"{pref}{e}.down_proj.weight"] = v[e].contiguous()
+                elif k == "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight":
+                    mid = v.shape[0] // 2
+                    pref = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+                    base_tensors[f"{pref}.shard_0.weight"] = v[:mid].contiguous()
+                    base_tensors[f"{pref}.shard_1.weight"] = v[mid:].contiguous()
+                else:
+                    base_tensors[k] = v.contiguous()
+
+            save_file(base_tensors, str(base_dir / "model-00001-of-00001.safetensors"))
+            wmap = {k: "model-00001-of-00001.safetensors" for k in base_tensors}
+            (base_dir / "model.safetensors.index.json").write_text(
+                json.dumps({"metadata": {"total_size": 0}, "weight_map": wmap}, indent=2) + "\n"
+            )
+
+            calib_ids = [
+                torch.randint(3, 250, (1, 16), dtype=torch.long),
+                torch.randint(3, 250, (1, 16), dtype=torch.long),
+            ]
+            rotary = Qwen4ExpTextRotaryEmbedding(cfg.text_config)
+            embed_w = model.model.language_model.embed_tokens.weight.detach()
+            h_calib = []
+            pos_list = []
+            for ids in calib_ids:
+                inp = F.embedding(ids, embed_w)
+                pids = torch.arange(ids.shape[1]).view(1, 1, -1).expand(3, 1, -1)
+                h_calib.append(inp.repeat(1, 1, cfg.text_config.hc_count))
+                pos_list.append(rotary(inp, pids))
+
+            teacher_qat_state = {
+                "input_ids": [c[:, :16].cpu().clone() for c in calib_ids * 4],
+                "h_list": [h[:, :16, :].cpu().clone() for h in h_calib * 4],
+                "pos_emb_list": [(p[0][:, :, :16], p[1][:, :, :16]) for p in pos_list * 4],
+                "ple_embeds": {},
+            }
+
+            quant_wmap: dict[str, str] = {}
+            embed_head = {
+                k: v.clone()
+                for k, v in base_tensors.items()
+                if k.startswith(
+                    (
+                        "model.language_model.embed_tokens.",
+                        "model.language_model.hyper_connection_mixer.",
+                        "lm_head.",
+                    )
+                )
+            }
+            save_file(embed_head, str(quant_dir / "model-embed-head.safetensors"))
+            for tk in embed_head:
+                quant_wmap[tk] = "model-embed-head.safetensors"
+
+            for l_idx in range(2):
+                layer = _build_lightweight_decoder_layer(cfg.text_config, l_idx, device)
+                l_pref = f"model.language_model.layers.{l_idx}"
+                _load_decoder_layer_weights(layer, l_pref, base_dir, wmap, device)
+                l_tensors, ple_wmap, _, _ = _quantize_decoder_layer_streaming(
+                    layer,
+                    l_pref,
+                    h_calib,
+                    pos_list,
+                    calib_ids,
+                    base_dir=base_dir,
+                    shard_map=wmap,
+                    output_dir=quant_dir,
+                    layer_idx=l_idx,
+                    group_size=32,
+                    hadamard_block_size=32,
+                    actorder="static",
+                    dampening_frac=0.01,
+                    ple_group_size=16,
+                    ple_cd_passes=1,
+                    rco_w2_bank_dir=rco_bank_dir,
+                    teacher_qat_state=teacher_qat_state,
+                )
+                l_fname = f"model-layer-{l_idx:02d}.safetensors"
+                save_file(l_tensors, str(quant_dir / l_fname))
+                for tk in l_tensors:
+                    quant_wmap[tk] = l_fname
+                quant_wmap.update(ple_wmap)
+
+            self.assertIn("1", teacher_qat_state["ple_embeds"])
+            fn_mixer = Qwen4ExpTextGatedResidual(cfg.text_config, use_combine=False).to(torch.bfloat16).eval()
+            fn_mixer.load_state_dict(
+                {
+                    k.removeprefix("model.language_model.hyper_connection_mixer."): v
+                    for k, v in base_tensors.items()
+                    if k.startswith("model.language_model.hyper_connection_mixer.")
+                },
+                strict=True,
+            )
+            with torch.no_grad():
+                t_norm_list = [fn_mixer(th) for th in teacher_qat_state["h_list"]]
+            torch.save(
+                {
+                    "input_ids": teacher_qat_state["input_ids"],
+                    "final_norm_states": t_norm_list,
+                    "ple_embeds": teacher_qat_state["ple_embeds"],
+                },
+                rco_bank_dir / "qat_teacher_states.pt",
+            )
+
+            (quant_dir / "model.safetensors.index.json").write_text(
+                json.dumps({"metadata": {"total_size": 0}, "weight_map": quant_wmap}, indent=2) + "\n"
+            )
+            _write_qwen4_exp_quant_config(
+                quant_dir,
+                raw_cfg,
+                group_size=32,
+                actorder="static",
+                hadamard_block_size=32,
+                quantize_mtp=False,
+                quantize_vision=False,
+                vision_fc2_channel=False,
+                ple_group_size=16,
+                ple_cd_passes=1,
+            )
+
+            rco_summary = run_moe_rco_search_and_qat(
+                model_key="flash-next",
+                base_dir=base_dir,
+                w4_ckpt_dir=quant_dir,
+                rco_w2_bank_dir=rco_bank_dir,
+                out_root_dir=rco_out_dir,
+                budgets=[0.5],
+                group_size=32,
+                hadamard_block_size=32,
+                search_samples=4,
+                steps=2,
+                lr=0.1,
+                scale_qat=True,
+                qat_samples=4,
+                qat_lr=1e-4,
+                assemble_names=["50pct_rco", "all_high"],
+            )
+            self.assertIn("50pct_rco", rco_summary["assembled"])
+            self.assertIn("all_high", rco_summary["assembled"])
+            rco_ckpt = rco_out_dir / "checkpoints" / "50pct_rco"
+            self.assertTrue((rco_ckpt / "model-layer-00.safetensors").is_file())
+            self.assertTrue((rco_ckpt / "model-layer-01.safetensors").is_file())
+            self.assertTrue((rco_ckpt / "model-ple-000.safetensors").is_file())
+            rco_final, _, rco_head = _stream_forward_qwen4_exp_states(
+                rco_ckpt, cfg.text_config, calib_ids, device
+            )
+            rco_logits = rco_head(rco_final[0])
+            self.assertTrue(torch.isfinite(rco_logits).all())
+
 
 if __name__ == "__main__":
     unittest.main()
