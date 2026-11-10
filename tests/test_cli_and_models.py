@@ -197,3 +197,88 @@ def test_readme_summary_table_matches_published_receipts():
         assert f"{vis_iso['top1_agreement'] * 100:.2f}%" in row_line, (
             f"{model_name} vis top1 mismatch: {row_line}"
         )
+
+
+def test_model_cards_match_published_receipts() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    pairs = [
+        (
+            "results/dense-w4a16-hgptq/0.8b-g64-h64/README.md",
+            "results/dense-w4a16-hgptq/0.8b-g64-h64/probe_results.json",
+        ),
+        (
+            "results/dense-w4a16-hgptq/g64-h64/README.md",
+            "results/dense-w4a16-hgptq/g64-h64/probe.json",
+        ),
+        (
+            "results/dense-w4a16-hgptq/4b-g64-h64/README.md",
+            "results/dense-w4a16-hgptq/4b-g64-h64/probe_results.json",
+        ),
+        (
+            "results/dense-w4a16-hgptq/9b-g64-h64/README.md",
+            "results/dense-w4a16-hgptq/9b-g64-h64/probe.json",
+        ),
+        (
+            "results/dense-w4a16-hgptq/9b-ornith-g64-h64/README.md",
+            "results/dense-w4a16-hgptq/9b-ornith-g64-h64/probe_results.json",
+        ),
+        (
+            "results/dense-w4a16-hgptq/27b-g64-h64/README.md",
+            "results/dense-w4a16-hgptq/27b-g64-h64/probe.json",
+        ),
+        (
+            "results/dense-w4a16-hgptq/27b-swift-g64-h64/README.md",
+            "results/dense-w4a16-hgptq/27b-swift-g64-h64/probe_results.json",
+        ),
+        (
+            "results/qwen36-35b-a3b-w4a16-hgptq/README.md",
+            "results/qwen36-35b-a3b-w4a16-hgptq/probe_results.json",
+        ),
+        (
+            "results/ornith-15-35b-a3b-w4a16-hgptq/README.md",
+            "results/ornith-15-35b-a3b-w4a16-hgptq/probe_results.json",
+        ),
+        (
+            "results/rco-9b-w2w4/README-W2.6A16-HGPTQ-RCO.md",
+            "results/rco-9b-w2w4/probe_30pct_rco.json",
+        ),
+        (
+            "results/rco-27b-w2w4/README-W2.6A16-HGPTQ-RCO.md",
+            "results/rco-27b-w2w4/probe_30pct_rco.json",
+        ),
+        (
+            "results/rco-27b-w2w4/README-W2.2A16-HGPTQ-RCO.md",
+            "results/rco-27b-w2w4/probe_10pct_rco.json",
+        ),
+        (
+            "results/rco-35b-w2w4/README-W2.6A16-HGPTQ-RCO.md",
+            "results/rco-35b-w2w4/probe_25pct_rco.json",
+        ),
+    ]
+    for md_rel, json_rel in pairs:
+        md = (repo_root / md_rel).read_text(encoding="utf-8")
+        d = json.loads((repo_root / json_rel).read_text(encoding="utf-8"))
+        t = d["probe-v4"]
+        g = d["probe-guard"]
+        m = d["mtp_fidelity"]
+        v = d["vision_fidelity"]
+        vg = d["vision_guard_fidelity"]
+        fidelity_bullet = next(line for line in md.splitlines() if line.startswith("- **Fidelity"))
+        for expected in (
+            f"{t['weighted_kl']:.4f}",
+            f"{t['mean_kl']:.4f}",
+            f"{g['mean_kl']:.4f}",
+            f"{m['isolated']['top1_agreement'] * 100:.2f}%",
+            f"{m['e2e']['top1_agreement'] * 100:.2f}%",
+            f"{v['isolated']['top1_agreement'] * 100:.2f}%",
+            f"{v['e2e']['top1_agreement'] * 100:.2f}%",
+        ):
+            assert expected in fidelity_bullet, f"{md_rel} bullet missing {expected}: {fidelity_bullet}"
+            assert expected in md, f"{md_rel} missing {expected}"
+        for expected_table in (
+            f"{t['ppl_quant']:.4f}",
+            f"{g['ppl_quant']:.4f}",
+            f"{vg['isolated']['top1_agreement'] * 100:.2f}%",
+            f"{vg['e2e']['top1_agreement'] * 100:.2f}%",
+        ):
+            assert expected_table in md, f"{md_rel} table missing {expected_table}"
