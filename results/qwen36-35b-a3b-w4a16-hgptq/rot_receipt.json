@@ -12,7 +12,9 @@
   "component_quant_mode": "gptq",
   "shard_counts": {
     "stripped_transform_weights": 0,
-    "mtp_quantized": 775,
+    "mtp_quantized": 776,
+    "mtp_fc_w8": 1,
+    "lm_head_w8": 1,
     "vision_quantized": 110,
     "vision_fc2_channel": 27,
     "ple_shards_quantized": 0,
@@ -23,6 +25,6 @@
   "calib": "data/calib-cascade-v1.jsonl",
   "num_samples": 999,
   "max_seq_length": 4096,
-  "quant_wall_s": 508.71,
+  "quant_wall_s": 809.16,
   "template_sha": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2"
 }

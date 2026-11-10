@@ -136,6 +136,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional existing checkpoint dir to reuse unchanged PLE/Vision/embed shards from",
     )
+    q.add_argument(
+        "--save-rco-bank-dir",
+        default=None,
+        help="Optional directory to save per-layer W2 routed-expert candidates + teacher QAT states during MoE streaming quantize",
+    )
 
     p = sub.add_parser(
         "probe", help="Evaluate text KL + Native MTP + Vision fidelity on one or more quantized checkpoints"

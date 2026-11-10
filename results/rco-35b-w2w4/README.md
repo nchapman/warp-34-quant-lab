@@ -1,0 +1,6 @@
+# `Qwen/Qwen3.6-35B-A3B` `W2/W4` `HGPTQ-RCO` (`16 GB` Target) Receipt Summary
+
+| Allocation | Published Checkpoint | Routed Expert Bits | Backbone Avg Bits | Safetensors Size | `probe-v4` PPL (`Δ%`) | `probe-v4` Weighted KL (`Mean KL`) | `probe-guard` Weighted KL (`Mean KL`) | Native MTP Iso KL (`Top-1`) | Vision `v2` Iso KL (`Top-1`) | Vision `v2` Guard Iso KL (`Top-1`) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **`25pct_rco` (`16 GB` Target)** | [`nchapman/Qwen3.6-35B-A3B-W2.6A16-HGPTQ-RCO`](https://huggingface.co/nchapman/Qwen3.6-35B-A3B-W2.6A16-HGPTQ-RCO) | `2.50 bpw` (`30` W2 / `10` W4 layers) | `2.62 bpw` | **`13.15 GiB`** (`14,121,080,536 B`) | `4.0208 → 3.7230` (`-7.407%`) | **`0.212116`** (`0.388539`) | **`0.208017`** (`0.194310`) | `0.010490` (`95.80%`) | `0.007169` (`99.34%`) | `0.004848` (`98.52%`) |
+| **`all_high` (`24 GB` Target)** | [`nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ`](https://huggingface.co/nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ) | `4.00 bpw` (`40` W4 layers) | `4.00 bpw` | **`18.78 GiB`** (`20,160,901,544 B`) | `4.0208 → 3.7522` (`-6.682%`) | **`0.084694`** (`0.210300`) | **`0.050908`** (`0.046230`) | `0.010490` (`95.80%`) | `0.007135` (`99.34%`) | `0.004904` (`98.52%`) |

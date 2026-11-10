@@ -14,9 +14,9 @@ tags:
 
 # Qwen3.8-27B-W4A16-HGPTQ
 
-4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ (`HGPTQ`)** quantization of [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) across **Text (`400` linears), Native MTP (`7` linears), and Vision (`110` linears)**, reducing the checkpoint payload from `51.75 GiB` in BF16 to **`17.33 GiB` (`2.99×` smaller)**.
+4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ + Hessian Coordinate Descent + FP32-Master Norm QAT (`HGPTQ`)** quantization of [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) across **Text (`400` backbone linears in `W4` + `lm_head` in `W8_g64`), Native MTP (`7` transformer linears in `W4` + `mtp.fc` in `W8_g64`), and Vision (`110` linears in `W4`)**, reducing the checkpoint payload from `51.75 GiB` in BF16 to **`16.14 GiB` (`3.21×` smaller)**.
 
-> **Summary:** Compresses a `51.8 GiB` dense model by `3.0×` (`17.33 GiB`, saving `34.4 GiB` of VRAM) so it fits on a **single 24 GB GPU (RTX 3090 / 4090)** with ~6.5 GiB left for KV cache. At 27B scale, 4-bit Hadamard GPTQ is nearly lossless: text perplexity matches BF16 (`8.54 → 8.52`), speculative drafter top-1 agreement is `96.2%`, and vision top-1 agreement is `97.5%`.
+> **Summary:** Compresses a `51.8 GiB` dense multimodal model by `3.21×` (`16.14 GiB`, saving `35.6 GiB` of VRAM) so it fits on a **single 24 GB GPU (RTX 3090 / 4090 / 5090)** with ~`7.8 GiB` left for KV cache, Vision, Native MTP speculative decoding, and CUDA graphs. Combining MSE-initialized Cholesky GPTQ + 2-pass Gauss–Seidel Hessian Coordinate Descent (`H-CD`) + end-to-end FP32-master `RMSNorm` KL tuning + `W8_g64` untied head cuts `probe-v4` weighted KL to **`0.1002`** (`−13.6%` vs. standard `HGPTQ`), holdout KL to **`0.0530`** (`−17.1%`), and lifts E2E speculative drafter (`89.16%`) and Vision (`92.05%`) Top-1 agreement while saving an extra `1.20 GiB`.
 
 ## Quality vs. BF16 Base Model (`Qwen/Qwen3.8-27B`)
 
@@ -24,22 +24,23 @@ Teacher-forced evaluation comparing this checkpoint directly against the unquant
 
 | Evaluation | BF16 Base (`Qwen/Qwen3.8-27B`) | **`Qwen3.8-27B-W4A16-HGPTQ`** | Notes |
 |---|---:|---:|---|
-| **Safetensors Size** | `51.75 GiB` (`55,563,006,776 B`) | **`17.33 GiB` (`18,612,467,976 B`)** | **`2.99×` compression** (`−34.41 GiB`) |
-| **Text Perplexity** (378 prompts, 852k tokens) ↓ | `8.5438` | **`8.5189` (`−0.29%`)** | Chat, math, science, coding, tool use, multilingual |
-| **Text Divergence vs. BF16** (weighted KL / token mean KL) ↓ | `0.0000` | **`0.1160` / `0.3016`** | Full-vocabulary FP32 KL divergence |
-| **General & Multilingual Holdout Perplexity** (76 prompts, 23k tokens) ↓ | `60.3169` | **`56.1987` (`−6.83%`)** | Token mean KL `0.0639` (weighted KL `0.0811`) |
-| **Native MTP (Speculative Drafter)** (12,339 positions) | `100.0%` Top-1 (`NLL 2.9579`) | **`96.22%` Top-1 (`NLL 2.9660`)** | Isolated MTP KL `0.0109` (end-to-end Top-1 `87.14%`, KL `0.2131`) |
-| **Vision (VQA & Charts)** (48 images, 157 answer tokens) | `1.0000` cos sim · `100.0%` Top-1 | **`0.9940` cos sim · `97.45%` Top-1** | Isolated ViT KL `0.0157` (end-to-end Top-1 `89.81%`, KL `0.2671`) |
+| **Safetensors Size** | `51.75 GiB` (`55,563,006,776 B`) | **`16.14 GiB` (`17,330,005,464 B`)** | **`3.21×` compression** (`−35.61 GiB`) |
+| **Text Perplexity** (378 prompts, 840k tokens) ↓ | `8.5332` | **`8.1841` (`−4.09%`)** | Chat, math, science, coding, tool use, multilingual |
+| **Text Divergence vs. BF16** (weighted KL / token mean KL) ↓ | `0.0000` | **`0.1002` / `0.2583`** | Full-vocabulary FP32 KL (`math` `0.0718`, `chat` `0.0223`, `if` `0.0354`, `science` `0.0607`, `swe` `0.7075`) |
+| **General & Multilingual Holdout Perplexity** (76 prompts, 23k tokens) ↓ | `61.0805` | **`56.6664` (`−7.23%`)** | Token mean KL `0.0530` (weighted KL `0.0739`, 9-lang Belebele macro KL `0.0628`) |
+| **Native MTP (Speculative Drafter)** (12,339 positions) | `100.0%` Top-1 (`NLL 2.9579`) | **`96.64%` Isolated Top-1 (`NLL 2.9813`)** | Isolated MTP KL `0.0090` (end-to-end Top-1 `89.16%`, KL `0.1782`) |
+| **Vision (`vision-probe-v2`)** (96 images, 302 answer tokens) | `100.0%` Top-1 | **`97.68%` Isolated Top-1 · `92.05%` E2E Top-1** | Isolated ViT KL `0.0056`, E2E KL `0.1808` (`vision-guard-v2` E2E Top-1 `94.81%`, KL `0.0856`) |
 
 ## What Is Quantized
 
-- **Quantized (`517` linear layers total: `510` in `model.safetensors` + `7` in `model_mtp.safetensors`)**:
-  - **Language (`400` linears)**: All 64 hybrid GatedDeltaNet + full-attention blocks (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `in_proj_qkv`, `in_proj_z`, `out_proj`, `gate_proj`, `up_proj`, `down_proj`) with online block-Hadamard rotation (`head_dim=64`) + Cholesky GPTQ (`group_size=64`, `actorder="static"`).
-  - **Native MTP (`7` linears)**: `mtp.layers.0.self_attn.{q,k,v,o}_proj` and `mtp.layers.0.mlp.{gate,up,down}_proj` (`head_dim=64`, `group_size=64`).
-  - **Vision (`110` linears)**: All 27 ViT blocks (`visual.blocks.*.{attn.qkv,attn.proj,mlp.linear_fc1,mlp.linear_fc2}`) plus the 2 spatial merger projections (`visual.merger.{linear_fc1,linear_fc2}`). `visual.blocks.*.mlp.linear_fc2` (`K=4304`) uses per-channel Cholesky GPTQ + `head_dim=16` online Hadamard rotation (`v_vision_fc2`); all other Vision linears use `group_size=64` + `head_dim=64`.
+- **Quantized (`519` linear layers total across `model-00001-of-00018.safetensors` .. `model-00018-of-00018.safetensors`)**:
+  - **Language (`400` linears in `W4A16-HGPTQ`)**: All 64 hybrid GatedDeltaNet + full-attention blocks (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `in_proj_qkv`, `in_proj_z`, `out_proj`, `gate_proj`, `up_proj`, `down_proj`) with online block-Hadamard rotation (`head_dim=64`) + MSE-initialized Cholesky GPTQ (`group_size=64`) + 2-pass Gauss–Seidel Hessian Coordinate Descent (`H-CD`) + end-to-end FP32-master `RMSNorm` KL tuning.
+  - **Untied Output Head & MTP Fusion (`2` linears in `W8_g64`)**: `lm_head` (`[248320, 5120]`) and `mtp.fc` (`[5120, 10240]`) quantized to unrotated 8-bit group-64 Cholesky GPTQ (`w8_head`), saving `1.20 GiB` with `+0.00001` weighted KL impact and zero online Hadamard overhead.
+  - **Native MTP (`7` transformer linears in `W4A16-HGPTQ`)**: `mtp.layers.0.self_attn.{q,k,v,o}_proj` and `mtp.layers.0.mlp.{gate,up,down}_proj` (`head_dim=64`, `group_size=64`).
+  - **Vision (`110` linears in `W4A16-HGPTQ`)**: All 27 ViT blocks (`visual.blocks.*.{attn.qkv,attn.proj,mlp.linear_fc1,mlp.linear_fc2}`) plus the 2 spatial merger projections (`visual.merger.{linear_fc1,linear_fc2}`). `visual.blocks.*.mlp.linear_fc2` (`K=4304`) uses per-channel Cholesky GPTQ + `head_dim=16` online Hadamard rotation (`v_vision_fc2`); all other Vision linears use `group_size=64` + `head_dim=64`.
 - **Kept in BF16**:
-  - `embed_tokens` / `lm_head`, `linear_attn.in_proj_a`, `linear_attn.in_proj_b`, `mtp.fc`, `visual.patch_embed.proj`, norms, and biases.
-- **Default sampling** (`generation_config.json`): `temperature 1.0, top_p 0.95, top_k 20` (`eos_token_id: [248046, 248044]`, `pad_token_id: 248044`).
+  - `embed_tokens`, `linear_attn.in_proj_a`, `linear_attn.in_proj_b`, `visual.patch_embed.proj`, norms, and biases.
+- **Default sampling** (`generation_config.json`) & **release chat template** (`chat_template.jinja`): `temperature 1.0, top_p 0.95, top_k 20` (`eos_token_id: [248046, 248044]`, `pad_token_id: 248044`).
 
 ## Runtime & vLLM Notes
 

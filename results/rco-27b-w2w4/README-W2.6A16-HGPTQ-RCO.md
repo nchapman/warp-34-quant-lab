@@ -35,7 +35,7 @@ Teacher-forced evaluation comparing this checkpoint directly against the unquant
 | **Text Divergence vs. BF16 (`probe-v4`)** (weighted KL / token mean KL) ↓ | `0.0000` | **`0.2717` / `0.4265`** | 378 prompts, 840k tokens (`math` `0.1795`, `chat` `0.1744`, `if` `0.1764`, `science` `0.1803`) |
 | **General & Multilingual Holdout (`probe-guard`)** (token mean KL / weighted KL) ↓ | `0.0000` | **`0.3272` / `0.4159`** | 76 prompts, 23k tokens (held-out FineWeb-Edu + 9-lang Belebele macro KL `0.4070`) |
 | **Native MTP (Speculative Drafter)** (12,339 positions) | `100.0%` Top-1 (`NLL 2.9579`) | **`96.64%` Isolated Top-1 (`NLL 2.9813`)** | Isolated MTP KL `0.0090` (end-to-end Top-1 `74.47%`, KL `0.6399`) |
-| **Vision (`vision-probe-v2`)** (48 images, 151 answer tokens) | `100.0%` Top-1 | **`97.68%` Isolated Top-1 · `88.74%` E2E Top-1** | Isolated ViT KL `0.0056`, E2E KL `0.4969` (`vision-guard-v2` E2E Top-1 `88.15%`, KL `0.5311`) |
+| **Vision (`vision-probe-v2`)** (96 images, 302 answer tokens) | `100.0%` Top-1 | **`97.68%` Isolated Top-1 · `88.74%` E2E Top-1** | Isolated ViT KL `0.0056`, E2E KL `0.4969` (`vision-guard-v2` E2E Top-1 `88.15%`, KL `0.5311`) |
 
 ## What Is Quantized
 

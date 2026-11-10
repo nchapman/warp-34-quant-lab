@@ -14,9 +14,9 @@ tags:
 
 # Swift-1.5-Qwen3.8-27b-W4A16-HGPTQ
 
-4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ (`HGPTQ`)** quantization of [ukisai/Swift-1.5-Qwen3.8-27b](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b) across **Text (`400` linears), Native MTP (`7` linears), and Vision (`110` linears)**, reducing the checkpoint payload from `51.75 GiB` in BF16 to **`17.33 GiB` (`2.99×` smaller)**.
+4-bit (`W4A16`, group size 64) **Hadamard + Cholesky GPTQ (`HGPTQ`, `MSE + 2-Pass H-CD + FP32 Norm/GDN QAT + W8_g64 Head`)** quantization of [ukisai/Swift-1.5-Qwen3.8-27b](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b) across **Text (`400` W4A16 linears + `1` `W8_g64` `lm_head`), Native MTP (`7` W4A16 linears + `1` `W8_g64` `mtp.fc`), and Vision (`110` linears)**, reducing the checkpoint payload from `51.75 GiB` in BF16 to **`16.14 GiB` (`3.21×` smaller)**.
 
-> **Summary:** Compresses `Swift-1.5-Qwen3.8-27b` by `3.0×` (`51.8 GiB → 17.33 GiB`) to fit on a **single 24 GB GPU**. Tracks the BF16 fine-tune closely across text (`0.127` KL divergence), speculative drafting (`96.2%` top-1 agreement), and vision (`97.0%–97.8%` top-1 agreement). *(Note: Perplexity reads `4.1%` lower than BF16 because 4-bit quantization slightly softens the fine-tune’s sharp logit spikes on low-probability tokens.)*
+> **Summary:** Compresses `Swift-1.5-Qwen3.8-27b` by `3.21×` (`51.75 GiB → 16.14 GiB`, saving `35.61 GiB` of VRAM) to fit comfortably on a **single 24 GB GPU**. Tracks the BF16 fine-tune closely across text (`0.1074` weighted KL divergence, `0.0555` holdout mean KL), speculative drafting (`96.43%` top-1 agreement), and vision (`98.01%–99.26%` top-1 agreement).
 
 ## Quality vs. BF16 Base Model (`ukisai/Swift-1.5-Qwen3.8-27b`)
 
@@ -24,22 +24,22 @@ Teacher-forced evaluation comparing this checkpoint directly against the unquant
 
 | Evaluation | BF16 Base (`ukisai/Swift-1.5-Qwen3.8-27b`) | **`Swift-1.5-Qwen3.8-27b-W4A16-HGPTQ`** | Notes |
 |---|---:|---:|---|
-| **Safetensors Size** | `51.75 GiB` (`55,563,006,776 B`) | **`17.33 GiB` (`18,612,467,944 B`)** | **`2.99×` compression** (`−34.41 GiB`) |
-| **Text Perplexity** (378 prompts, 852k tokens) ↓ | `9.6265` | **`9.2328` (`−4.09%`)** | Chat, math, science, coding, tool use, multilingual |
-| **Text Divergence vs. BF16** (weighted KL / token mean KL) ↓ | `0.0000` | **`0.1265` / `0.3309`** | Full-vocabulary FP32 KL divergence |
-| **General & Multilingual Holdout Perplexity** (76 prompts, 23k tokens) ↓ | `79.6973` | **`70.6735` (`−11.32%`)** | Token mean KL `0.0790` (weighted KL `0.1133`) |
-| **Native MTP (Speculative Drafter)** (12,339 positions) | `100.0%` Top-1 (`NLL 3.1061`) | **`96.21%` Top-1 (`NLL 3.1118`)** | Isolated MTP KL `0.0114` (end-to-end Top-1 `86.85%`, KL `0.2703`) |
-| **Vision (VQA, Charts, Documents & OCR)** (96 images, 302 tokens) | `1.0000` cos sim · `100.0%` Top-1 | **`0.9934` cos sim · `97.02%` Top-1** | Isolated ViT KL `0.0127` (end-to-end Top-1 `92.38%`, KL `0.1516`) |
-| **Vision (UI / ScreenSpot & Math OCR)** (48 images, 135 tokens) | `1.0000` cos sim · `100.0%` Top-1 | **`0.9948` cos sim · `97.78%` Top-1** | Isolated ViT KL `0.0195` (end-to-end Top-1 `95.56%`, KL `0.2000`) |
+| **Safetensors Size** | `51.75 GiB` (`55,563,006,776 B`) | **`16.14 GiB` (`17,328,747,912 B`)** | **`3.21×` compression** (`−35.61 GiB`) |
+| **Text Perplexity** (378 prompts, 852k tokens) ↓ | `9.6265` | **`9.0881` (`−5.59%`)** | Chat, math, science, coding, tool use, multilingual |
+| **Text Divergence vs. BF16** (weighted KL / token mean KL) ↓ | `0.0000` | **`0.1074` / `0.2831`** | Full-vocabulary FP32 KL divergence |
+| **General & Multilingual Holdout Perplexity** (76 prompts, 23k tokens) ↓ | `79.6973` | **`72.1364` (`−9.49%`)** | Token mean KL `0.0555` (weighted KL `0.0720`) |
+| **Native MTP (Speculative Drafter)** (12,339 positions) | `100.0%` Top-1 (`NLL 3.1061`) | **`96.43%` Top-1 (`NLL 3.1229`)** | Isolated MTP KL `0.0090` (end-to-end Top-1 `89.03%`, KL `0.2086`) |
+| **Vision (VQA, Charts, Documents & OCR)** (96 images, 302 tokens) | `1.0000` cos sim · `100.0%` Top-1 | **`98.01%` Top-1 (`NLL 0.5043`)** | Isolated ViT KL `0.0071` (end-to-end Top-1 `91.39%`, KL `0.1444`) |
+| **Vision (UI / ScreenSpot & Math OCR)** (48 images, 135 tokens) | `1.0000` cos sim · `100.0%` Top-1 | **`99.26%` Top-1 (`NLL 0.8749`)** | Isolated ViT KL `0.0024` (end-to-end Top-1 `92.59%`, KL `0.1440`) |
 
 ## What Is Quantized
 
-- **Quantized (`517` linear layers total: `510` in `model.safetensors` + `7` in `model_mtp.safetensors`)**:
-  - **Language (`400` linears)**: All 64 hybrid GatedDeltaNet + full-attention blocks (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `in_proj_qkv`, `in_proj_z`, `out_proj`, `gate_proj`, `up_proj`, `down_proj`) with online block-Hadamard rotation (`head_dim=64`) + Cholesky GPTQ (`group_size=64`, `actorder="static"`).
-  - **Native MTP (`7` linears)**: `mtp.layers.0.self_attn.{q,k,v,o}_proj` and `mtp.layers.0.mlp.{gate,up,down}_proj` (`head_dim=64`, `group_size=64`).
+- **Quantized (`519` linear layers total)**:
+  - **Language (`400` W4A16 linears + `1` `W8_g64` linear)**: All 64 hybrid GatedDeltaNet + full-attention blocks (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `in_proj_qkv`, `in_proj_z`, `out_proj`, `gate_proj`, `up_proj`, `down_proj`) with online block-Hadamard rotation (`head_dim=64`) + Cholesky GPTQ (`group_size=64`, MSE scale search, 2-pass H-CD) + End-to-End FP32-master `RMSNorm` + GDN-gate KL QAT, plus `lm_head` in unrotated `W8_g64`.
+  - **Native MTP (`7` W4A16 linears + `1` `W8_g64` linear)**: `mtp.layers.0.self_attn.{q,k,v,o}_proj` and `mtp.layers.0.mlp.{gate,up,down}_proj` (`head_dim=64`, `group_size=64`), plus `mtp.fc` in unrotated `W8_g64`.
   - **Vision (`110` linears)**: All 27 ViT blocks (`visual.blocks.*.{attn.qkv,attn.proj,mlp.linear_fc1,mlp.linear_fc2}`) plus the 2 spatial merger projections (`visual.merger.{linear_fc1,linear_fc2}`). `visual.blocks.*.mlp.linear_fc2` (`K=4304`) uses per-channel Cholesky GPTQ + `head_dim=16` online Hadamard rotation (`v_vision_fc2`); all other Vision linears use `group_size=64` + `head_dim=64`.
 - **Kept in BF16**:
-  - `embed_tokens` / `lm_head`, `linear_attn.in_proj_a`, `linear_attn.in_proj_b`, `mtp.fc`, `visual.patch_embed.proj`, norms, and biases.
+  - `embed_tokens`, `linear_attn.in_proj_a`, `linear_attn.in_proj_b`, `visual.patch_embed.proj`, norms, and biases.
 - **Default sampling** (`generation_config.json`): `temperature 1.0, top_p 0.95, top_k 20` (`eos_token_id: [248046, 248044]`, `pad_token_id: 248044`).
 
 ## Runtime & vLLM Notes

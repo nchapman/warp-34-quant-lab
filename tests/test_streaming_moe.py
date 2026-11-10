@@ -693,6 +693,14 @@ class TestQwen38FlashNextQuant(unittest.TestCase):
             }
             s2_tensors = {"lm_head.weight": base_tensors["lm_head.weight"].clone()}
 
+            rco_bank_dir = Path(tmp) / "rco_bank"
+            rco_bank_dir.mkdir()
+            teacher_qat_state = {
+                "ids": [c[:, :16].cpu().clone() for c in calib_ids * 4],
+                "h_list": [h[:, :16, :].cpu().clone() for h in h_calib * 4],
+                "pos_emb_list": [(p[0][:, :, :16], p[1][:, :, :16]) for p in pos_list * 4],
+            }
+
             for l_idx in range(2):
                 layer = _build_lightweight_decoder_layer(cfg.text_config, l_idx, device)
                 l_pref = f"model.language_model.layers.{l_idx}"
@@ -711,9 +719,20 @@ class TestQwen38FlashNextQuant(unittest.TestCase):
                     hadamard_block_size=32,
                     actorder="static",
                     dampening_frac=0.01,
+                    rco_w2_bank_dir=rco_bank_dir,
+                    teacher_qat_state=teacher_qat_state,
                 )
                 s1_tensors.update(l_tensors)
                 self.assertEqual(l_counts["routed_experts"], 12)
+                self.assertTrue((rco_bank_dir / f"layer_{l_idx:02d}_w2.pt").is_file())
+
+            final_norm_t = model.model.language_model.norm
+            with torch.no_grad():
+                t_norm_list = [final_norm_t(th) for th in teacher_qat_state["h_list"]]
+            torch.save(
+                {"input_ids": teacher_qat_state["ids"], "final_norm_states": t_norm_list},
+                rco_bank_dir / "qat_teacher_states.pt",
+            )
 
             save_file(s1_tensors, str(quant_dir / "model-00001-of-00002.safetensors"))
             save_file(s2_tensors, str(quant_dir / "model-00002-of-00002.safetensors"))
@@ -746,6 +765,38 @@ class TestQwen38FlashNextQuant(unittest.TestCase):
                 ref_logits_0.float().flatten(), q_logits_0.float().flatten(), dim=0
             ).item()
             self.assertGreater(cos_sim, 0.95)
+
+            # Verify MoE RCO search + QAT + checkpoint assembly + streaming forward on mixed W2/W4 checkpoint
+            from warp_quant.streaming_moe import run_moe_rco_search_and_qat
+
+            rco_out_dir = Path(tmp) / "rco_out"
+            rco_summary = run_moe_rco_search_and_qat(
+                model_key="35b",
+                base_dir=base_dir,
+                w4_ckpt_dir=quant_dir,
+                rco_w2_bank_dir=rco_bank_dir,
+                out_root_dir=rco_out_dir,
+                budgets=[0.5],
+                group_size=32,
+                hadamard_block_size=32,
+                search_samples=4,
+                steps=4,
+                lr=0.1,
+                scale_qat=True,
+                qat_samples=4,
+                qat_lr=1e-4,
+                assemble_names=["50pct_rco"],
+            )
+            self.assertIn("50pct_rco", rco_summary["assembled"])
+            rco_ckpt = rco_out_dir / "checkpoints" / "50pct_rco"
+            self.assertTrue((rco_ckpt / "rco_manifest.json").is_file())
+            self.assertTrue((rco_ckpt / "chat_template.jinja").is_file())
+            rco_final, _, rco_head = _stream_forward_qwen4_exp_states(
+                rco_ckpt, cfg.text_config, calib_ids, device
+            )
+            rco_logits_0 = rco_head(rco_final[0])
+            self.assertEqual(rco_logits_0.shape, ref_logits_0.shape)
+            self.assertTrue(torch.isfinite(rco_logits_0).all())
 
 
 if __name__ == "__main__":

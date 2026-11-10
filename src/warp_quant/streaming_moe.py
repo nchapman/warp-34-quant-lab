@@ -29,6 +29,7 @@ import time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -915,19 +916,20 @@ def _load_decoder_layer_weights(
     )
     packed_prefix_set = set(packed_prefixes)
 
-    scheme = QuantizationScheme(
-        targets=["Linear"],
-        weights=QuantizationArgs(
-            num_bits=4, type="int", symmetric=True, strategy="group", group_size=group_size
-        ),
-    )
+    def _make_scheme(nb: int, gs: int):
+        return QuantizationScheme(
+            targets=["Linear"],
+            weights=QuantizationArgs(
+                num_bits=nb, type="int", symmetric=True, strategy="group", group_size=gs
+            ),
+        )
 
     experts = layer.mlp.experts
     num_exp = experts.num_experts
     inter = experts.intermediate_dim
     hidden = experts.hidden_dim
 
-    # 1. Load routed experts (either pre-concatenated W4A16, packed W4A16, 2D per-expert BF16, or 3D fused BF16)
+    # 1. Load routed experts (either pre-concatenated W2/W4A16, packed W2/W4A16, 2D per-expert BF16, or 3D fused BF16)
     if "__cat_gate_proj.weight_packed" in raw_tensors:
         for proj_name, out_dim, in_dim in (
             ("gate_proj", inter, hidden),
@@ -936,13 +938,15 @@ def _load_decoder_layer_weights(
         ):
             wp_cat = raw_tensors.pop(f"__cat_{proj_name}.weight_packed").to(device)
             ws_cat = raw_tensors.pop(f"__cat_{proj_name}.weight_scale").to(device)
+            nb = (int(wp_cat.shape[1]) * 32) // in_dim
+            gs = in_dim // int(ws_cat.shape[1])
             deq = PackedQuantizationCompressor.decompress(
                 {
                     "weight_packed": wp_cat,
                     "weight_scale": ws_cat,
                     "weight_shape": torch.tensor([num_exp * out_dim, in_dim]),
                 },
-                scheme,
+                _make_scheme(nb, gs),
             )["weight"].view(num_exp, out_dim, in_dim)
             if proj_name == "gate_proj":
                 experts.gate_up_proj.data[:, :inter].copy_(deq)
@@ -967,13 +971,17 @@ def _load_decoder_layer_weights(
             wss = [raw_tensors.pop(f"mlp.experts.{e}.{proj_name}.weight_scale") for e in range(num_exp)]
             for e in range(num_exp):
                 raw_tensors.pop(f"mlp.experts.{e}.{proj_name}.weight_shape", None)
+            wp_cat = torch.cat(wps, dim=0).to(device)
+            ws_cat = torch.cat(wss, dim=0).to(device)
+            nb = (int(wp_cat.shape[1]) * 32) // in_dim
+            gs = in_dim // int(ws_cat.shape[1])
             deq = PackedQuantizationCompressor.decompress(
                 {
-                    "weight_packed": torch.cat(wps, dim=0).to(device),
-                    "weight_scale": torch.cat(wss, dim=0).to(device),
+                    "weight_packed": wp_cat,
+                    "weight_scale": ws_cat,
                     "weight_shape": torch.tensor([num_exp * out_dim, in_dim]),
                 },
-                scheme,
+                _make_scheme(nb, gs),
             )["weight"].view(num_exp, out_dim, in_dim)
             if proj_name == "gate_proj":
                 experts.gate_up_proj.data[:, :inter].copy_(deq)
@@ -981,7 +989,7 @@ def _load_decoder_layer_weights(
                 experts.gate_up_proj.data[:, inter:].copy_(deq)
             else:
                 experts.down_proj.data.copy_(deq)
-            del wps, wss, deq
+            del wps, wss, wp_cat, ws_cat, deq
         if hadamard_block_size > 0:
             _attach_expert_hadamard_hooks(
                 experts,
@@ -1013,9 +1021,12 @@ def _load_decoder_layer_weights(
         wp = raw_tensors.pop(f"{p_rel}.weight_packed").to(device)
         ws = raw_tensors.pop(f"{p_rel}.weight_scale").to(device)
         wsh = raw_tensors.pop(f"{p_rel}.weight_shape")
+        in_dim_2d = int(wsh[1].item())
+        nb_2d = (int(wp.shape[1]) * 32) // in_dim_2d
+        gs_2d = in_dim_2d // int(ws.shape[1])
         deq = PackedQuantizationCompressor.decompress(
             {"weight_packed": wp, "weight_scale": ws, "weight_shape": wsh},
-            scheme,
+            _make_scheme(nb_2d, gs_2d),
         )["weight"].to(torch.bfloat16)
         mod = layer.get_submodule(p_rel)
         mod.weight.data.copy_(deq)
@@ -1124,16 +1135,22 @@ def _gptq_quantize_and_pack_3d_experts(
     dampening_frac: float,
     expert_chunk: int = 512,
     cd_passes: int = 2,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_bits: int = 4,
+    return_loss: bool = False,
+) -> (
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]
+):
     """Batch MSE-init Cholesky GPTQ + H-CD and batch-pack a 3D expert tensor [E, N_out, K_in].
 
     hessians can be either [1, K_in, K_in] (shared across all experts, e.g. gate_proj / up_proj)
     or [E, K_in, K_in] (per-expert, e.g. down_proj).
     Returns:
       q_w_3d: [E, N_out, K_in] bfloat16 on device
-      packed_3d_cpu: [E, N_out, K_in // 8] int32 on CPU
+      packed_3d_cpu: [E, N_out, K_in * num_bits // 32] int32 on CPU
       scales_3d_cpu: [E, N_out, K_in // group_size] bfloat16 on CPU
       shape_tensor_cpu: [2] int64 ([N_out, K_in])
+      (optional) h_loss: float Hessian-weighted reconstruction error
     """
     from compressed_tensors.quantization import QuantizationArgs
     from llmcompressor.modifiers.gptq.gptq_quantize import quantize_weight
@@ -1149,9 +1166,11 @@ def _gptq_quantize_and_pack_3d_experts(
     num_exp, n_out, k_in = weights_3d.shape
     eff_group_size = min(group_size, k_in)
     num_groups = k_in // eff_group_size
+    qmin = -(1 << (num_bits - 1))
+    qmax = (1 << (num_bits - 1)) - 1
 
     qargs = QuantizationArgs(
-        num_bits=4,
+        num_bits=num_bits,
         type="int",
         symmetric=True,
         strategy="group",
@@ -1163,11 +1182,12 @@ def _gptq_quantize_and_pack_3d_experts(
     codes_3d = torch.empty((num_exp, n_out, k_in), dtype=torch.int8, device=weights_3d.device)
     all_scale_3d = find_mse_scale(
         weights_3d.detach().float().reshape(num_exp * n_out, k_in),
-        4,
+        num_bits,
         eff_group_size,
     ).view(num_exp, n_out, num_groups)
     all_zp_3d = torch.zeros_like(all_scale_3d, dtype=torch.int32)
     shared_h = hessians.shape[0] == 1
+    h_loss = 0.0
 
     if shared_h:
         h_shared_2d = hessians[0].float().contiguous()
@@ -1190,19 +1210,23 @@ def _gptq_quantize_and_pack_3d_experts(
             if used_rtn.any().item():
                 raise RuntimeError(f"GPTQ fell back to RTN on shared-H experts [{e0}:{e1}]")
             s_exp_2d = s_2d.float().repeat_interleave(eff_group_size, dim=1)
-            c_2d = torch.clamp(torch.round(q_chunk[0].float() / s_exp_2d), -8, 7).to(torch.int8)
+            c_2d = torch.clamp(torch.round(q_chunk[0].float() / s_exp_2d), qmin, qmax).to(torch.int8)
             if cd_passes > 0:
                 c_2d, s_2d = refine_hessian_cd(
                     w_2d,
                     h_shared_2d,
                     c_2d,
                     s_2d,
-                    4,
+                    num_bits,
                     eff_group_size,
                     passes=cd_passes,
                     dampening_frac=dampening_frac,
                 )
             dec_2d = decode_candidate(c_2d, s_2d, eff_group_size, dtype=weights_3d.dtype)
+            if return_loss:
+                diff_2d = w_2d - dec_2d.float()
+                h_loss += 0.5 * float(((diff_2d @ h_shared_2d) * diff_2d).sum().item())
+                del diff_2d
             q_w_3d[e0:e1].copy_(dec_2d.view(cur_e, n_out, k_in))
             codes_3d[e0:e1].copy_(c_2d.view(cur_e, n_out, k_in))
             all_scale_3d[e0:e1].copy_(s_2d.view(cur_e, n_out, num_groups))
@@ -1227,14 +1251,14 @@ def _gptq_quantize_and_pack_3d_experts(
             if used_rtn.any().item():
                 raise RuntimeError(f"GPTQ fell back to RTN on per-expert H [{e0}:{e1}]")
             s_exp_3d = scale_chunk.float().repeat_interleave(eff_group_size, dim=-1)
-            c_chunk = torch.clamp(torch.round(q_chunk.float() / s_exp_3d), -8, 7).to(torch.int8)
+            c_chunk = torch.clamp(torch.round(q_chunk.float() / s_exp_3d), qmin, qmax).to(torch.int8)
             if cd_passes > 0:
                 c_chunk, scale_chunk = refine_hessian_cd_3d(
                     w_chunk,
                     h_chunk,
                     c_chunk,
                     scale_chunk,
-                    4,
+                    num_bits,
                     eff_group_size,
                     passes=cd_passes,
                     dampening_frac=dampening_frac,
@@ -1243,6 +1267,10 @@ def _gptq_quantize_and_pack_3d_experts(
                 c_chunk.float().view(e1 - e0, n_out, num_groups, eff_group_size)
                 * scale_chunk.float().unsqueeze(-1)
             ).view(e1 - e0, n_out, k_in)
+            if return_loss:
+                diff_3d = w_chunk - dec_3d
+                h_loss += 0.5 * float((torch.bmm(diff_3d, h_chunk) * diff_3d).sum().item())
+                del diff_3d
             q_w_3d[e0:e1].copy_(dec_3d.to(weights_3d.dtype))
             codes_3d[e0:e1].copy_(c_chunk)
             all_scale_3d[e0:e1].copy_(scale_chunk)
@@ -1252,11 +1280,13 @@ def _gptq_quantize_and_pack_3d_experts(
     comp_2d = pack_candidate(
         codes_3d.reshape(num_exp * n_out, k_in),
         all_scale_3d.reshape(num_exp * n_out, num_groups),
-        4,
+        num_bits,
     )
     packed_3d_cpu = comp_2d["weight_packed"].view(num_exp, n_out, -1).contiguous().cpu()
     scales_3d_cpu = comp_2d["weight_scale"].view(num_exp, n_out, num_groups).contiguous().cpu()
     shape_tensor_cpu = torch.tensor([n_out, k_in], dtype=torch.int64)
+    if return_loss:
+        return q_w_3d, packed_3d_cpu, scales_3d_cpu, shape_tensor_cpu, h_loss
     return q_w_3d, packed_3d_cpu, scales_3d_cpu, shape_tensor_cpu
 
 
@@ -1405,6 +1435,8 @@ def _quantize_decoder_layer_streaming(
     ple_cd_passes: int = 1,
     dense_expert_calib_seqs: int = 32,
     reuse_ple_dir: Path | None = None,
+    rco_w2_bank_dir: Path | None = None,
+    teacher_qat_state: dict[str, Any] | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, str], int, dict[str, int]]:
     """Quantize a single Qwen4ExpTextDecoderLayer or Qwen3_5MoeDecoderLayer (or MTP layer) in-place, advance h_calib, and return shard dict."""
     device = next(layer.parameters()).device
@@ -1412,6 +1444,24 @@ def _quantize_decoder_layer_streaming(
     counts = {"attn_linears": 0, "shared_experts": 0, "routed_experts": 0, "ple_shards": 0}
     ple_weight_map: dict[str, str] = {}
     ple_bytes = 0
+
+    if teacher_qat_state is not None and getattr(layer, "ple", None) is None:
+        t_h_list = teacher_qat_state["h_list"]
+        t_pos_list = teacher_qat_state["pos_emb_list"]
+        for ti in range(len(t_h_list)):
+            h_t = t_h_list[ti].to(device, non_blocking=True)
+            cos_t, sin_t = t_pos_list[ti]
+            h_out_t = layer(
+                h_t,
+                position_embeddings=(
+                    cos_t.to(device, non_blocking=True),
+                    sin_t.to(device, non_blocking=True),
+                ),
+            )
+            if isinstance(h_out_t, tuple):
+                h_out_t = h_out_t[0]
+            t_h_list[ti] = h_out_t.detach().to(t_h_list[ti].device, non_blocking=True)
+            del h_t, h_out_t
 
     # ------------------------------------------------------------------
     # Stage A: Layer-1 PLE (runs FIRST in Qwen4ExpTextDecoderLayer.forward!)
@@ -1750,14 +1800,45 @@ def _quantize_decoder_layer_streaming(
                     experts.gate_up_proj.data[e0:e1], had_moe_in, compute_dtype=torch.float64
                 )
             )
+    w2_layer_tensors: dict[str, torch.Tensor] = {}
+    w2_packed_3d: dict[str, torch.Tensor] = {}
+    q_w2_gate_up = torch.empty_like(experts.gate_up_proj.data) if rco_w2_bank_dir is not None else None
+    h_loss_w2_total = 0.0
+    h_loss_w4_total = 0.0
     for proj_name, sl in (("gate_proj", slice(0, inter)), ("up_proj", slice(inter, 2 * inter))):
-        q_3d, wp_3d, ws_3d, wsh_1d = _gptq_quantize_and_pack_3d_experts(
-            experts.gate_up_proj.data[:, sl, :].contiguous(),
+        w_proj_3d = experts.gate_up_proj.data[:, sl, :].contiguous()
+        if rco_w2_bank_dir is not None:
+            q_w2_3d, wp_w2_3d, ws_w2_3d, wsh_w2_1d, h_loss_w2_p = _gptq_quantize_and_pack_3d_experts(
+                w_proj_3d,
+                norm_h_moe_in,
+                group_size=group_size,
+                actorder=None,
+                dampening_frac=dampening_frac,
+                num_bits=2,
+                return_loss=True,
+            )
+            assert q_w2_gate_up is not None
+            q_w2_gate_up[:, sl, :].copy_(q_w2_3d)
+            h_loss_w2_total += h_loss_w2_p
+            w2_packed_3d[f"{proj_name}_packed"] = wp_w2_3d
+            w2_packed_3d[f"{proj_name}_scale"] = ws_w2_3d
+            w2_packed_3d[f"{proj_name}_shape"] = wsh_w2_1d
+            for e in range(num_exp):
+                epref = f"{layer_prefix}.mlp.experts.{e}.{proj_name}"
+                w2_layer_tensors[f"{epref}.weight_packed"] = wp_w2_3d[e].clone()
+                w2_layer_tensors[f"{epref}.weight_scale"] = ws_w2_3d[e].clone()
+                w2_layer_tensors[f"{epref}.weight_shape"] = wsh_w2_1d.clone()
+            del q_w2_3d
+        q_3d, wp_3d, ws_3d, wsh_1d, h_loss_w4_p = _gptq_quantize_and_pack_3d_experts(
+            w_proj_3d,
             norm_h_moe_in,
             group_size=group_size,
             actorder=actorder,
             dampening_frac=dampening_frac,
+            num_bits=4,
+            return_loss=True,
         )
+        h_loss_w4_total += h_loss_w4_p
         experts.gate_up_proj.data[:, sl, :].copy_(q_3d)
         for e in range(num_exp):
             epref = f"{layer_prefix}.mlp.experts.{e}.{proj_name}"
@@ -1765,7 +1846,7 @@ def _quantize_decoder_layer_streaming(
             layer_tensors[f"{epref}.weight_scale"] = ws_3d[e].clone()
             layer_tensors[f"{epref}.weight_shape"] = wsh_1d.clone()
             counts["routed_experts"] += 1
-        del q_3d, wp_3d, ws_3d
+        del w_proj_3d, q_3d, wp_3d, ws_3d
     del norm_h_moe_in
 
     # C.2 Accumulate [E, inter, inter] post-SwiGLU (H_{had_moe_down}-rotated) Hessians for down_proj on device
@@ -1841,13 +1922,38 @@ def _quantize_decoder_layer_streaming(
                     experts.down_proj.data[e0:e1], had_moe_down, compute_dtype=torch.float64
                 )
             )
-    q_down_3d, wp_down_3d, ws_down_3d, wsh_down_1d = _gptq_quantize_and_pack_3d_experts(
+    q_down_w2_3d: torch.Tensor | None = None
+    if rco_w2_bank_dir is not None:
+        q_down_w2_3d, wp_down_w2_3d, ws_down_w2_3d, wsh_down_w2_1d, h_loss_down_w2 = (
+            _gptq_quantize_and_pack_3d_experts(
+                experts.down_proj.data,
+                norm_h_moe_down,
+                group_size=group_size,
+                actorder=None,
+                dampening_frac=dampening_frac,
+                num_bits=2,
+                return_loss=True,
+            )
+        )
+        h_loss_w2_total += h_loss_down_w2
+        w2_packed_3d["down_proj_packed"] = wp_down_w2_3d
+        w2_packed_3d["down_proj_scale"] = ws_down_w2_3d
+        w2_packed_3d["down_proj_shape"] = wsh_down_w2_1d
+        for e in range(num_exp):
+            epref = f"{layer_prefix}.mlp.experts.{e}.down_proj"
+            w2_layer_tensors[f"{epref}.weight_packed"] = wp_down_w2_3d[e].clone()
+            w2_layer_tensors[f"{epref}.weight_scale"] = ws_down_w2_3d[e].clone()
+            w2_layer_tensors[f"{epref}.weight_shape"] = wsh_down_w2_1d.clone()
+    q_down_3d, wp_down_3d, ws_down_3d, wsh_down_1d, h_loss_down_w4 = _gptq_quantize_and_pack_3d_experts(
         experts.down_proj.data,
         norm_h_moe_down,
         group_size=group_size,
         actorder=actorder,
         dampening_frac=dampening_frac,
+        num_bits=4,
+        return_loss=True,
     )
+    h_loss_w4_total += h_loss_down_w4
     experts.down_proj.data.copy_(q_down_3d)
     for e in range(num_exp):
         epref = f"{layer_prefix}.mlp.experts.{e}.down_proj"
@@ -1855,10 +1961,47 @@ def _quantize_decoder_layer_streaming(
         layer_tensors[f"{epref}.weight_scale"] = ws_down_3d[e].clone()
         layer_tensors[f"{epref}.weight_shape"] = wsh_down_1d.clone()
         counts["routed_experts"] += 1
-    del norm_h_moe_down, q_down_3d, wp_down_3d, ws_down_3d
+    del norm_h_moe_down, wp_down_3d, ws_down_3d
 
     # C.3 Advance H_all through the quantized MoE sub-block on device using grouped_mm + online Hadamard hooks
     exp_hooks = _attach_expert_hadamard_hooks(experts, had_moe_in, had_moe_down)
+    if rco_w2_bank_dir is not None and q_w2_gate_up is not None and q_down_w2_3d is not None:
+        sample_toks = min(n_tot, 65536)
+        mlp_in_sample = mlp_in_all[:sample_toks]
+        y_w4_s = layer.mlp(mlp_in_sample.unsqueeze(0)).squeeze(0).detach()
+        q_w4_gate_up_bak = experts.gate_up_proj.data.clone()
+        experts.gate_up_proj.data.copy_(q_w2_gate_up)
+        experts.down_proj.data.copy_(q_down_w2_3d)
+        y_w2_s = layer.mlp(mlp_in_sample.unsqueeze(0)).squeeze(0).detach()
+        experts.gate_up_proj.data.copy_(q_w4_gate_up_bak)
+        experts.down_proj.data.copy_(q_down_3d)
+        diff_s = y_w2_s.float() - y_w4_s.float()
+        out_l2_sum = float(diff_s.pow(2).sum().item())
+        out_mse_w2_vs_w4 = out_l2_sum / max(y_w2_s.numel(), 1)
+        w2_bytes = sum(t.numel() * t.element_size() for t in w2_layer_tensors.values())
+        w4_bytes = sum(t.numel() * t.element_size() for k, t in layer_tensors.items() if ".mlp.experts." in k)
+        rco_w2_bank_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "layer_idx": layer_idx,
+                "layer_prefix": layer_prefix,
+                "w2_tensors": w2_layer_tensors,
+                "packed_3d": w2_packed_3d,
+                "metrics": {
+                    "layer_idx": layer_idx,
+                    "h_loss_w2": h_loss_w2_total,
+                    "h_loss_w4": h_loss_w4_total,
+                    "delta_h_loss": h_loss_w2_total - h_loss_w4_total,
+                    "out_l2_sum": out_l2_sum,
+                    "out_mse_w2_vs_w4": out_mse_w2_vs_w4,
+                    "w2_bytes": w2_bytes,
+                    "w4_bytes": w4_bytes,
+                },
+            },
+            rco_w2_bank_dir / f"layer_{layer_idx:02d}_w2.pt",
+        )
+        del q_w4_gate_up_bak, y_w4_s, y_w2_s, diff_s, w2_layer_tensors, w2_packed_3d
+    del q_w2_gate_up, q_down_w2_3d, q_down_3d
     for s0 in range(0, n_tot, tok_step):
         s1 = min(s0 + tok_step, n_tot)
         mlp_out = layer.mlp(mlp_in_all[s0:s1].unsqueeze(0)).squeeze(0)
@@ -2640,6 +2783,26 @@ def run_quantize_qwen4_exp(args: argparse.Namespace) -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
+    rco_w2_bank_dir = (
+        Path(args.save_rco_bank_dir).resolve() if getattr(args, "save_rco_bank_dir", None) else None
+    )
+    teacher_qat_state: dict[str, Any] | None = None
+    if rco_w2_bank_dir is not None and is_qwen35_moe:
+        rco_w2_bank_dir.mkdir(parents=True, exist_ok=True)
+        n_qat = min(len(h_calib), 128)
+        qat_max_toks = 2048
+        teacher_qat_state = {
+            "input_ids": [calib_ids_list[i][:, :qat_max_toks].cpu().clone() for i in range(n_qat)],
+            "h_list": [h_calib[i][:, :qat_max_toks, :].clone() for i in range(n_qat)],
+            "pos_emb_list": [
+                (
+                    pos_emb_list[i][0][..., :qat_max_toks, :].clone(),
+                    pos_emb_list[i][1][..., :qat_max_toks, :].clone(),
+                )
+                for i in range(n_qat)
+            ],
+        }
+
     # ------------------------------------------------------------------
     # Phase 3: Layer-by-Layer Streaming W4A16-HGPTQ + Layer-1 PLE
     # ------------------------------------------------------------------
@@ -2691,6 +2854,8 @@ def run_quantize_qwen4_exp(args: argparse.Namespace) -> None:
                 ple_group_size=ple_group_size,
                 ple_cd_passes=ple_cd_passes,
                 reuse_ple_dir=reuse_ple_vision_dir,
+                rco_w2_bank_dir=rco_w2_bank_dir,
+                teacher_qat_state=teacher_qat_state,
             )
 
             if is_qwen35_moe:
@@ -2781,6 +2946,19 @@ def run_quantize_qwen4_exp(args: argparse.Namespace) -> None:
                     del m_raw
                 n_head_cal = min(len(h_calib), args.component_calib_samples)
                 post_norm_states = [fn_head(h_calib[i].to(device)).cpu() for i in range(n_head_cal)]
+                if rco_w2_bank_dir is not None and teacher_qat_state is not None:
+                    teacher_post_norm = [
+                        fn_head(h_t.to(device)).detach().cpu() for h_t in teacher_qat_state["h_list"]
+                    ]
+                    torch.save(
+                        {
+                            "input_ids": teacher_qat_state["input_ids"],
+                            "final_norm_states": teacher_post_norm,
+                        },
+                        rco_w2_bank_dir / "qat_teacher_states.pt",
+                    )
+                    del teacher_post_norm, teacher_qat_state
+                    teacher_qat_state = None
                 del fn_head
                 packed_lm = calibrate_lm_head_w8(
                     head_raw["lm_head.weight"],
@@ -4025,6 +4203,761 @@ def run_probe_qwen4_exp(args: argparse.Namespace) -> None:
         out_p.write_text(json.dumps(results, indent=2) + "\n")
 
     run_done(quant=str(quant_dir))
+
+
+def _unpack_3d_experts_gpu(
+    packed_3d: torch.Tensor,
+    scales_3d: torch.Tensor,
+    *,
+    group_size: int = 64,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Fast pure-GPU unpack of [E, N_out, K_in // lanes] int32 + [E, N_out, K_in // gs] scales to BF16."""
+    num_exp, n_out, num_groups = scales_3d.shape
+    k_in = num_groups * group_size
+    num_bits = (int(packed_3d.shape[-1]) * 32) // k_in
+    lanes = 32 // num_bits
+    mask = (1 << num_bits) - 1
+    offset = 1 << (num_bits - 1)
+    shifts = torch.arange(lanes, device=packed_3d.device, dtype=torch.int32) * num_bits
+    codes = (((packed_3d.unsqueeze(-1) >> shifts) & mask) - offset).reshape(
+        num_exp, n_out, num_groups, group_size
+    )
+    return (codes.to(dtype) * scales_3d.to(dtype).unsqueeze(-1)).reshape(num_exp, n_out, k_in)
+
+
+def _write_moe_rco_quant_config(
+    save_dir: Path,
+    w4_cfg_dict: dict[str, Any],
+    layer_choices: list[int],
+    *,
+    group_size: int = 64,
+) -> None:
+    """Write compressed-tensors config.json for a W2/W4 HGPTQ-RCO Qwen3.5-MoE checkpoint."""
+    cfg = copy.deepcopy(w4_cfg_dict)
+    qcfg = cfg["quantization_config"]
+    old_groups = qcfg["config_groups"]
+    base_weights = {
+        "actorder": None,
+        "block_structure": None,
+        "dynamic": False,
+        "group_size": group_size,
+        "num_bits": 4,
+        "observer": "memoryless_minmax",
+        "observer_kwargs": {},
+        "scale_dtype": None,
+        "strategy": "group",
+        "symmetric": True,
+        "type": "int",
+        "zp_dtype": None,
+    }
+    w2_layers = [l_idx for l_idx, c in enumerate(layer_choices) if c == 0]
+    w4_layers = [l_idx for l_idx, c in enumerate(layer_choices) if c == 1]
+
+    new_groups: dict[str, Any] = {}
+    if w2_layers:
+        w2_targets = [
+            f"re:.*(?<!mtp\\.)layers\\.{l_idx}\\.mlp\\.experts\\.\\d+\\.(gate_proj|up_proj|down_proj)$"
+            for l_idx in w2_layers
+        ]
+        new_groups["w2_g64"] = {
+            "format": "pack-quantized",
+            "input_activations": None,
+            "output_activations": None,
+            "targets": w2_targets,
+            "weights": dict(base_weights, num_bits=2, group_size=group_size, actorder=None),
+        }
+
+    w4_targets = [
+        r"re:.*(?<!mtp\.)layers\.\d+\.(self_attn|linear_attn|mlp\.shared_expert)\.(q_proj|k_proj|v_proj|o_proj|in_proj_qkv|in_proj_z|out_proj|gate_proj|up_proj|down_proj)$"
+    ]
+    w4_targets.extend(
+        f"re:.*(?<!mtp\\.)layers\\.{l_idx}\\.mlp\\.experts\\.\\d+\\.(gate_proj|up_proj|down_proj)$"
+        for l_idx in w4_layers
+    )
+    new_groups["w4_g64"] = {
+        "format": "pack-quantized",
+        "input_activations": None,
+        "output_activations": None,
+        "targets": w4_targets,
+        "weights": dict(base_weights, num_bits=4, group_size=group_size, actorder=None),
+    }
+
+    aux_targets = [t for t in old_groups.get("group_0", {}).get("targets", []) if t != TEXT_TARGET_RE]
+    if aux_targets:
+        new_groups["group_0"] = {
+            "format": "pack-quantized",
+            "input_activations": None,
+            "output_activations": None,
+            "targets": aux_targets,
+            "weights": dict(base_weights, num_bits=4, group_size=group_size, actorder=None),
+        }
+    for extra_k in ("vision_fc2_channel", "w8_head"):
+        if extra_k in old_groups:
+            new_groups[extra_k] = copy.deepcopy(old_groups[extra_k])
+
+    qcfg["config_groups"] = new_groups
+    (save_dir / "config.json").write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
+
+
+@torch.no_grad()
+def assemble_moe_rco_checkpoint(
+    *,
+    model_key: str,
+    w4_ckpt_dir: Path,
+    rco_w2_bank_dir: Path,
+    out_dir: Path,
+    layer_choices: list[int],
+    allocation_name: str,
+    group_size: int = 64,
+    qat_state_dict: dict[str, torch.Tensor] | None = None,
+    summary_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Assemble a standalone Qwen3.5-MoE W2/W4 HGPTQ-RCO checkpoint from a W4 checkpoint + W2 expert bank."""
+    import shutil
+
+    from warp_quant.hadamard_gptq import _assert_packed_alignment
+    from warp_quant.stamp import stamp_release_template
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    s1_name = "model-00001-of-00002.safetensors"
+    s2_name = "model-00002-of-00002.safetensors"
+    s1_tensors: dict[str, torch.Tensor] = {}
+    with safe_open(str(w4_ckpt_dir / s1_name), framework="pt", device="cpu") as sf:
+        for k in sf.keys():
+            s1_tensors[k] = sf.get_tensor(k)
+
+    for l_idx, choice in enumerate(layer_choices):
+        if choice == 0:
+            b = torch.load(
+                rco_w2_bank_dir / f"layer_{l_idx:02d}_w2.pt",
+                map_location="cpu",
+                weights_only=True,
+            )
+            for tk, tv in b["w2_tensors"].items():
+                s1_tensors[tk] = tv.contiguous()
+            del b
+
+    if qat_state_dict:
+        for tk, tv in qat_state_dict.items():
+            if tk in s1_tensors:
+                s1_tensors[tk] = tv.detach().to(dtype=s1_tensors[tk].dtype, device="cpu").contiguous()
+
+    save_file(s1_tensors, str(out_dir / s1_name))
+    s1_bytes = sum(t.numel() * t.element_size() for t in s1_tensors.values())
+    del s1_tensors
+
+    other_bytes = 0
+    for extra_shard in (s2_name, "model_mtp.safetensors"):
+        src_p = w4_ckpt_dir / extra_shard
+        if src_p.is_file():
+            dst_p = out_dir / extra_shard
+            if dst_p.exists() or dst_p.is_symlink():
+                dst_p.unlink()
+            try:
+                os.link(src_p, dst_p)
+            except OSError:
+                shutil.copy2(src_p, dst_p)
+            other_bytes += dst_p.stat().st_size
+
+    for fpath in sorted(w4_ckpt_dir.iterdir()):
+        if fpath.is_file() and not fpath.name.endswith(".safetensors") and fpath.name != "config.json":
+            shutil.copy2(fpath, out_dir / fpath.name)
+
+    idx_path = out_dir / "model.safetensors.index.json"
+    if idx_path.is_file():
+        idx_data = json.loads(idx_path.read_text())
+        idx_data.setdefault("metadata", {})["total_size"] = int(s1_bytes + other_bytes)
+        idx_path.write_text(json.dumps(idx_data, indent=2, sort_keys=True) + "\n")
+
+    w4_cfg = json.loads((w4_ckpt_dir / "config.json").read_text())
+    if all(c == 1 for c in layer_choices):
+        (out_dir / "config.json").write_text(json.dumps(w4_cfg, indent=2, sort_keys=True) + "\n")
+    else:
+        _write_moe_rco_quant_config(out_dir, w4_cfg, layer_choices, group_size=group_size)
+
+    _assert_packed_alignment(out_dir)
+    stamp_release_template(out_dir)
+
+    tot_bytes = sum(p.stat().st_size for p in out_dir.glob("*.safetensors"))
+    n_w4 = sum(1 for c in layer_choices if c == 1)
+    n_w2 = sum(1 for c in layer_choices if c == 0)
+    routed_bpw = (2.0 * n_w2 + 4.0 * n_w4) / max(len(layer_choices), 1)
+    rco_manifest = {
+        "allocation_name": allocation_name,
+        "layer_choices": [int(c) for c in layer_choices],
+        "w2_layers": [l_idx for l_idx, c in enumerate(layer_choices) if c == 0],
+        "w4_layers": [l_idx for l_idx, c in enumerate(layer_choices) if c == 1],
+        "routed_expert_avg_bits": routed_bpw,
+        "total_safetensors_bytes": tot_bytes,
+        "total_safetensors_gib": tot_bytes / (1024**3),
+        **(summary_meta or {}),
+    }
+    (out_dir / "rco_manifest.json").write_text(json.dumps(rco_manifest, indent=2, sort_keys=True) + "\n")
+    log_event(
+        "MOE_RCO_ASSEMBLED",
+        allocation=allocation_name,
+        out_dir=str(out_dir),
+        routed_bpw=round(routed_bpw, 3),
+        total_gib=round(tot_bytes / (1024**3), 3),
+        w4_layers=n_w4,
+        w2_layers=n_w2,
+    )
+    return rco_manifest
+
+
+def run_moe_rco_search_and_qat(
+    *,
+    model_key: str,
+    base_dir: Path,
+    w4_ckpt_dir: Path,
+    rco_w2_bank_dir: Path,
+    out_root_dir: Path,
+    budgets: list[float],
+    group_size: int = 64,
+    hadamard_block_size: int = 64,
+    search_samples: int = 24,
+    steps: int = 60,
+    lr: float = 0.25,
+    scale_qat: bool = True,
+    qat_samples: int = 96,
+    qat_lr: float = 1e-4,
+    assemble_names: list[str] | None = None,
+) -> dict[str, Any]:
+    """Run 40-layer Gumbel-Softmax STE RCO search + E2E FP32-master Norm/GDN-gate KL QAT for Qwen3.5-MoE."""
+    from llmcompressor.utils.dev import skip_weights_initialize
+    from torch.utils.checkpoint import checkpoint as grad_ckpt
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        Qwen3_5MoeRMSNorm,
+        Qwen3_5MoeTextRotaryEmbedding,
+    )
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    raw_base_cfg = json.loads((base_dir / "config.json").read_text())
+    cfg = Qwen3_5MoeConfig.from_dict(raw_base_cfg)
+    _ensure_qwen4_exp_device_kernels(cfg.text_config, device)
+    num_layers = cfg.text_config.num_hidden_layers
+    num_exp = cfg.text_config.num_experts
+    inter = cfg.text_config.moe_intermediate_size
+    hidden = cfg.text_config.hidden_size
+
+    # 1. Load per-layer W2 bank metrics and packed 3D tensors onto GPU (only needed when budgets is non-empty)
+    layer_metrics: list[dict[str, Any]] = []
+    w2_packed_gpu: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    if budgets:
+        for l_idx in range(num_layers):
+            b = torch.load(
+                rco_w2_bank_dir / f"layer_{l_idx:02d}_w2.pt",
+                map_location="cpu",
+                weights_only=True,
+            )
+            layer_metrics.append(b["metrics"])
+            p3d = b["packed_3d"]
+            wp_gu_w2 = torch.cat([p3d["gate_proj_packed"], p3d["up_proj_packed"]], dim=1).to(device)
+            ws_gu_w2 = torch.cat([p3d["gate_proj_scale"], p3d["up_proj_scale"]], dim=1).to(device)
+            wp_dn_w2 = p3d["down_proj_packed"].to(device)
+            ws_dn_w2 = p3d["down_proj_scale"].to(device)
+            w2_packed_gpu.append((wp_gu_w2, ws_gu_w2, wp_dn_w2, ws_dn_w2))
+            del b, p3d
+
+    # 2. Load student model (W4 non-expert weights + W4 packed 3D routed experts) onto GPU
+    w4_shard_map, _ = _load_shard_map(w4_ckpt_dir)
+    base_shard_map, _ = _load_shard_map(base_dir)
+
+    embed_raw = _load_top_level_module_tensors(
+        w4_ckpt_dir, w4_shard_map, "model.language_model.embed_tokens."
+    )
+    embed_w = embed_raw["model.language_model.embed_tokens.weight"].to(device=device, dtype=torch.bfloat16)
+    del embed_raw
+
+    with torch.device(device), skip_weights_initialize():
+        final_norm = (
+            Qwen3_5MoeRMSNorm(hidden, eps=cfg.text_config.rms_norm_eps).to(dtype=torch.bfloat16).eval()
+        )
+    norm_raw = _load_top_level_module_tensors(w4_ckpt_dir, w4_shard_map, "model.language_model.norm.")
+    final_norm.weight.data.copy_(
+        norm_raw["model.language_model.norm.weight"].to(device=device, dtype=torch.bfloat16)
+    )
+    del norm_raw
+
+    base_head_raw = _load_top_level_module_tensors(base_dir, base_shard_map, "lm_head.")
+    base_lm_head_w = base_head_raw["lm_head.weight"].to(device=device, dtype=torch.bfloat16)
+    del base_head_raw
+
+    w4_head_raw = _load_top_level_module_tensors(w4_ckpt_dir, w4_shard_map, "lm_head.")
+    if "lm_head.weight_packed" in w4_head_raw:
+        wp_h = w4_head_raw["lm_head.weight_packed"].to(device).unsqueeze(0)
+        ws_h = w4_head_raw["lm_head.weight_scale"].to(device).unsqueeze(0)
+        student_lm_head_w = _unpack_3d_experts_gpu(wp_h, ws_h, group_size=group_size).squeeze(0)
+        del wp_h, ws_h
+    else:
+        student_lm_head_w = w4_head_raw["lm_head.weight"].to(device=device, dtype=torch.bfloat16)
+    del w4_head_raw
+
+    rotary = Qwen3_5MoeTextRotaryEmbedding(config=cfg.text_config).to(device)
+    layers = nn.ModuleList()
+    w4_packed_gpu: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+    had_moe_in = min(hadamard_block_size, hidden & -hidden) if hadamard_block_size > 0 else 0
+    had_moe_down = min(hadamard_block_size, inter & -inter) if hadamard_block_size > 0 else 0
+
+    for l_idx in range(num_layers):
+        layer_prefix = f"model.language_model.layers.{l_idx}"
+        raw_t = _prefetch_layer_raw_tensors(layer_prefix, w4_ckpt_dir, w4_shard_map)
+        wp_gate = raw_t["__cat_gate_proj.weight_packed"].view(num_exp, inter, -1)
+        ws_gate = raw_t["__cat_gate_proj.weight_scale"].view(num_exp, inter, -1)
+        wp_up = raw_t["__cat_up_proj.weight_packed"].view(num_exp, inter, -1)
+        ws_up = raw_t["__cat_up_proj.weight_scale"].view(num_exp, inter, -1)
+        wp_dn = raw_t["__cat_down_proj.weight_packed"].view(num_exp, hidden, -1)
+        ws_dn = raw_t["__cat_down_proj.weight_scale"].view(num_exp, hidden, -1)
+        w4_packed_gpu.append(
+            (
+                torch.cat([wp_gate, wp_up], dim=1).to(device),
+                torch.cat([ws_gate, ws_up], dim=1).to(device),
+                wp_dn.to(device),
+                ws_dn.to(device),
+            )
+        )
+        del wp_gate, ws_gate, wp_up, ws_up, wp_dn, ws_dn
+
+        layer = _build_lightweight_decoder_layer(cfg.text_config, l_idx, device)
+        _load_decoder_layer_weights(
+            layer,
+            layer_prefix,
+            w4_ckpt_dir,
+            w4_shard_map,
+            device,
+            group_size=group_size,
+            hadamard_block_size=hadamard_block_size,
+            prefetched_raw=raw_t,
+        )
+        del raw_t
+        # Free the 1.5 GiB BF16 expert buffers; experts will unpack on the fly from w2/w4_packed_gpu
+        layer.mlp.experts.gate_up_proj = nn.Parameter(
+            torch.empty(0, device=device, dtype=torch.bfloat16), requires_grad=False
+        )
+        layer.mlp.experts.down_proj = nn.Parameter(
+            torch.empty(0, device=device, dtype=torch.bfloat16), requires_grad=False
+        )
+        layers.append(layer)
+
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # Dynamic routed-expert execution mode per layer:
+    #   active_mode["mode"] == "fixed": uses active_mode["choices"][l_idx] in {0, 1}
+    #   active_mode["mode"] == "rco_ste": uses active_mode["z_tilde"][l_idx] (Gumbel-Softmax STE scalar)
+    active_mode: dict[str, Any] = {
+        "mode": "fixed",
+        "choices": [1] * num_layers,
+        "z_tilde": None,
+    }
+
+    def _run_single_expert_branch(
+        experts_mod: nn.Module,
+        x_2d: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+        packed_tuple: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        wp_gu, ws_gu, wp_dn, ws_dn = packed_tuple
+        gu_3d = _unpack_3d_experts_gpu(wp_gu, ws_gu, group_size=group_size, dtype=x_2d.dtype)
+        dn_3d = _unpack_3d_experts_gpu(wp_dn, ws_dn, group_size=group_size, dtype=x_2d.dtype)
+        x_in = (
+            _hadamard_rotate_last_dim(x_2d, had_moe_in, compute_dtype=torch.float32)
+            if had_moe_in > 0
+            else x_2d
+        )
+        final_h = torch.zeros_like(x_2d)
+        with torch.no_grad():
+            expert_mask = F.one_hot(top_k_index, num_classes=num_exp + 1).permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        for expert_idx in expert_hit:
+            e_idx = int(expert_idx[0].item())
+            if e_idx == num_exp:
+                continue
+            top_k_pos, token_idx = torch.where(expert_mask[e_idx])
+            cur = x_in.index_select(0, token_idx)
+            gate, up = F.linear(cur, gu_3d[e_idx]).chunk(2, dim=-1)
+            mid = experts_mod.act_fn(gate) * up
+            if had_moe_down > 0:
+                mid = _hadamard_rotate_last_dim(mid, had_moe_down, compute_dtype=torch.float32)
+            out_e = F.linear(mid, dn_3d[e_idx]) * top_k_weights[token_idx, top_k_pos, None]
+            final_h.index_add_(0, token_idx, out_e.to(final_h.dtype))
+        del gu_3d, dn_3d
+        return final_h
+
+    for l_idx in range(num_layers):
+        exp_mod = layers[l_idx].mlp.experts
+        exp_mod._forward_pre_hooks.clear()
+
+        def _make_exp_forward(li: int, emod: nn.Module):
+            def _custom_exp_forward(
+                hidden_states: torch.Tensor,
+                top_k_index: torch.Tensor,
+                top_k_weights: torch.Tensor,
+            ) -> torch.Tensor:
+                if active_mode["mode"] == "rco_ste" and active_mode["z_tilde"] is not None:
+                    z_t = active_mode["z_tilde"][li]
+                    choose_w4 = bool(float(z_t.detach().item()) >= 0.5)
+                    active_pack = w4_packed_gpu[li] if choose_w4 else w2_packed_gpu[li]
+                    inactive_pack = w2_packed_gpu[li] if choose_w4 else w4_packed_gpu[li]
+                    y_act = _run_single_expert_branch(
+                        emod, hidden_states, top_k_index, top_k_weights, active_pack
+                    )
+                    with torch.no_grad():
+                        y_inact = _run_single_expert_branch(
+                            emod,
+                            hidden_states.detach(),
+                            top_k_index,
+                            top_k_weights.detach(),
+                            inactive_pack,
+                        )
+                        y_diff = (y_act.detach() - y_inact) if choose_w4 else (y_inact - y_act.detach())
+                    return y_act + (z_t - z_t.detach()).to(y_act.dtype) * y_diff
+                choice = int(active_mode["choices"][li])
+                pack = w4_packed_gpu[li] if choice == 1 else w2_packed_gpu[li]
+                return _run_single_expert_branch(emod, hidden_states, top_k_index, top_k_weights, pack)
+
+            return _custom_exp_forward
+
+        exp_mod.forward = _make_exp_forward(l_idx, exp_mod)
+
+    # 3. Load teacher states
+    t_payload = torch.load(rco_w2_bank_dir / "qat_teacher_states.pt", map_location="cpu", weights_only=True)
+    t_ids_list: list[torch.Tensor] = t_payload["input_ids"]
+    t_norm_list: list[torch.Tensor] = t_payload["final_norm_states"]
+    n_tot_seqs = len(t_ids_list)
+    val_count = min(12, max(4, n_tot_seqs // 8))
+    train_indices = list(range(0, n_tot_seqs - val_count))
+    val_indices = list(range(n_tot_seqs - val_count, n_tot_seqs))
+
+    def _forward_student(ids_dev: torch.Tensor, *, use_ckpt: bool = False) -> torch.Tensor:
+        seq_len = ids_dev.shape[1]
+        h = F.embedding(ids_dev, embed_w)
+        pos_ids = torch.arange(seq_len, device=device).view(1, 1, -1).expand(3, ids_dev.shape[0], -1)
+        cos, sin = rotary(h, pos_ids)
+        for layer in layers:
+            if use_ckpt and torch.is_grad_enabled():
+
+                def _l_fn(x_in, _l=layer, _c=cos, _s=sin):
+                    out = _l(x_in, position_embeddings=(_c, _s))
+                    return out[0] if isinstance(out, tuple) else out
+
+                h = grad_ckpt(_l_fn, h, use_reentrant=False)
+            else:
+                out = layer(h, position_embeddings=(cos, sin))
+                h = out[0] if isinstance(out, tuple) else out
+        return final_norm(h)
+
+    def _kl_loss_against_teacher(
+        student_norm_h: torch.Tensor,
+        teacher_norm_h_dev: torch.Tensor,
+        *,
+        chunk_toks: int = 512,
+    ) -> torch.Tensor:
+        s_flat = student_norm_h.reshape(-1, hidden)
+        t_flat = teacher_norm_h_dev.reshape(-1, hidden)
+        n_toks = s_flat.shape[0]
+        kl_sum = torch.zeros((), device=device, dtype=torch.float32)
+        for c0 in range(0, n_toks, chunk_toks):
+            c1 = min(c0 + chunk_toks, n_toks)
+            with torch.no_grad():
+                t_logits = F.linear(t_flat[c0:c1], base_lm_head_w).float()
+                t_logp = F.log_softmax(t_logits, dim=-1)
+                t_p = t_logp.exp()
+                del t_logits
+            s_logits = F.linear(s_flat[c0:c1], student_lm_head_w).float()
+            s_logp = F.log_softmax(s_logits, dim=-1)
+            kl_chunk = (t_p * (t_logp - s_logp)).sum(dim=-1).sum()
+            kl_sum = kl_sum + kl_chunk
+            del s_logits, s_logp, t_logp, t_p
+        return kl_sum / max(n_toks, 1)
+
+    @torch.no_grad()
+    def _eval_choices_val_kl(choices: list[int], eval_idxs: list[int] | None = None) -> float:
+        idxs = eval_idxs if eval_idxs is not None else val_indices
+        active_mode["mode"] = "fixed"
+        active_mode["choices"] = list(choices)
+        tot_kl = 0.0
+        tot_toks = 0
+        for idx in idxs:
+            ids_d = t_ids_list[idx].to(device)
+            t_nh = t_norm_list[idx].to(device, dtype=torch.bfloat16)
+            s_nh = _forward_student(ids_d, use_ckpt=False)
+            n_t = int(ids_d.numel())
+            tot_kl += float(_kl_loss_against_teacher(s_nh, t_nh).item()) * n_t
+            tot_toks += n_t
+            del ids_d, t_nh, s_nh
+        return tot_kl / max(tot_toks, 1)
+
+    # 4. Solve discrete RCO allocations for each budget
+    allocations: dict[str, dict[str, Any]] = {
+        "all_low": {
+            "name": "all_low",
+            "budget": 0.0,
+            "choices": [0] * num_layers,
+        },
+        "all_high": {
+            "name": "all_high",
+            "budget": 1.0,
+            "choices": [1] * num_layers,
+        },
+    }
+
+    if budgets:
+        out_l2_scores = torch.tensor([float(m["out_l2_sum"]) for m in layer_metrics], dtype=torch.float64)
+        h_loss_scores = torch.tensor(
+            [max(float(m["delta_h_loss"]), 1e-12) for m in layer_metrics], dtype=torch.float64
+        )
+        z_out = (out_l2_scores.log() - out_l2_scores.log().mean()) / (out_l2_scores.log().std() + 1e-8)
+        z_h = (h_loss_scores.log() - h_loss_scores.log().mean()) / (h_loss_scores.log().std() + 1e-8)
+        combined_prior = 0.7 * z_out + 0.3 * z_h
+
+        byte_costs = torch.tensor(
+            [[float(m["w2_bytes"]), float(m["w4_bytes"])] for m in layer_metrics],
+            device=device,
+            dtype=torch.float32,
+        )
+        min_bytes = float(byte_costs[:, 0].sum().item())
+        max_bytes = float(byte_costs[:, 1].sum().item())
+    else:
+        out_l2_scores = h_loss_scores = z_out = z_h = combined_prior = byte_costs = None
+        min_bytes = max_bytes = 0.0
+
+    search_pool = train_indices[: min(len(train_indices), max(search_samples, 8))]
+    for b_frac in budgets:
+        b_name = f"{int(round(b_frac * 100))}pct_rco"
+        k_w4 = int(round(b_frac * num_layers))
+        k_w4 = max(0, min(num_layers, k_w4))
+
+        # Candidate 1: Empirical output-perturbation top-K
+        top_out = torch.argsort(out_l2_scores, descending=True)[:k_w4].tolist()
+        c_out = [1 if i in set(top_out) else 0 for i in range(num_layers)]
+
+        # Candidate 2: Combined output + Hessian sensitivity top-K
+        top_comb = torch.argsort(combined_prior, descending=True)[:k_w4].tolist()
+        c_comb = [1 if i in set(top_comb) else 0 for i in range(num_layers)]
+
+        # Candidate 3: End-to-End Gumbel-Softmax STE RCO search
+        theta = torch.zeros((num_layers, 2), device=device, dtype=torch.float32)
+        theta[:, 1] = combined_prior.to(device=device, dtype=torch.float32) * 0.8
+        theta.requires_grad_(True)
+        opt_theta = torch.optim.Adam([theta], lr=lr)
+        target_bytes = min_bytes + b_frac * (max_bytes - min_bytes)
+
+        log_event("MOE_RCO_SEARCH_START", budget=b_frac, steps=steps, k_w4=k_w4)
+        for step_idx in range(steps):
+            progress = step_idx / max(steps - 1, 1)
+            tau = 1.0 * ((0.15 / 1.0) ** progress)
+            seq_idx = search_pool[step_idx % len(search_pool)]
+            ids_d = t_ids_list[seq_idx].to(device)
+            t_nh = t_norm_list[seq_idx].to(device, dtype=torch.bfloat16)
+
+            opt_theta.zero_grad(set_to_none=True)
+            z_ste = F.gumbel_softmax(theta, tau=tau, hard=True, dim=-1)
+            active_mode["mode"] = "rco_ste"
+            active_mode["z_tilde"] = z_ste[:, 1]
+
+            s_nh = _forward_student(ids_d, use_ckpt=True)
+            kl_l = _kl_loss_against_teacher(s_nh, t_nh)
+            probs = F.softmax(theta / tau, dim=-1)
+            exp_bytes = (probs * byte_costs).sum()
+            over_frac = F.relu(exp_bytes - target_bytes) / max(max_bytes - min_bytes, 1.0)
+            loss = kl_l + 15.0 * (over_frac**2)
+            loss.backward()
+            with torch.no_grad():
+                theta.grad.sub_(theta.grad.mean(dim=-1, keepdim=True))
+            opt_theta.step()
+            if (step_idx + 1) % 20 == 0 or step_idx == 0:
+                log_event(
+                    "MOE_RCO_SEARCH_STEP",
+                    budget=b_frac,
+                    step=step_idx + 1,
+                    kl=round(float(kl_l.item()), 5),
+                    tau=round(tau, 3),
+                )
+            del ids_d, t_nh, s_nh, kl_l, loss
+
+        active_mode["mode"] = "fixed"
+        active_mode["z_tilde"] = None
+        scores_rco = (theta.detach()[:, 1] - theta.detach()[:, 0]).cpu()
+        top_rco = torch.argsort(scores_rco, descending=True)[:k_w4].tolist()
+        c_rco_proj = [1 if i in set(top_rco) else 0 for i in range(num_layers)]
+
+        kl_out = _eval_choices_val_kl(c_out)
+        kl_comb = _eval_choices_val_kl(c_comb)
+        kl_rco = _eval_choices_val_kl(c_rco_proj)
+        best_kl, best_c, best_src = min(
+            (kl_rco, c_rco_proj, "rco_gumbel_ste"),
+            (kl_comb, c_comb, "combined_prior"),
+            (kl_out, c_out, "out_l2_prior"),
+            key=lambda x: x[0],
+        )
+        log_event(
+            "MOE_RCO_BUDGET_SOLVED",
+            name=b_name,
+            budget=b_frac,
+            val_kl_rco=round(kl_rco, 6),
+            val_kl_comb=round(kl_comb, 6),
+            val_kl_out=round(kl_out, 6),
+            winner=best_src,
+            w4_layers=[i for i, c in enumerate(best_c) if c == 1],
+        )
+        allocations[b_name] = {
+            "name": b_name,
+            "budget": b_frac,
+            "choices": best_c,
+            "val_kl_pre_qat": best_kl,
+            "winner_source": best_src,
+        }
+
+    # 5. Collect trainable FP32-master Norm / GDN-gate / QK-norm / shared_expert_gate parameters for QAT
+    trainable_params: list[tuple[str, nn.Parameter]] = []
+    for l_idx, layer in enumerate(layers):
+        lpref = f"model.language_model.layers.{l_idx}"
+        for sub_name, param in layer.named_parameters():
+            if any(
+                sub_name.endswith(sfx)
+                for sfx in (
+                    "input_layernorm.weight",
+                    "post_attention_layernorm.weight",
+                    "q_norm.weight",
+                    "k_norm.weight",
+                    "linear_attn.norm.weight",
+                    "linear_attn.in_proj_a.weight",
+                    "linear_attn.in_proj_b.weight",
+                    "linear_attn.A_log",
+                    "linear_attn.dt_bias",
+                    "mlp.shared_expert_gate.weight",
+                )
+            ):
+                trainable_params.append((f"{lpref}.{sub_name}", param))
+    trainable_params.append(("model.language_model.norm.weight", final_norm.weight))
+
+    base_param_snapshot = {full_k: p.detach().clone() for full_k, p in trainable_params}
+
+    def _run_qat_for_choices(alloc_name: str, choices: list[int]) -> dict[str, torch.Tensor]:
+        for full_k, p in trainable_params:
+            p.data.copy_(base_param_snapshot[full_k])
+            p.requires_grad_(True)
+
+        init_val_kl = _eval_choices_val_kl(choices)
+        if not scale_qat:
+            for _full_k, p in trainable_params:
+                p.requires_grad_(False)
+            return {}
+
+        fp32_masters = [
+            nn.Parameter(base_param_snapshot[full_k].detach().float().clone())
+            for full_k, _ in trainable_params
+        ]
+        qat_pool = train_indices[: min(len(train_indices), qat_samples)]
+        opt_qat = torch.optim.AdamW(fp32_masters, lr=qat_lr, weight_decay=0.0)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt_qat, T_max=max(len(qat_pool), 1), eta_min=qat_lr * 0.1
+        )
+        active_mode["mode"] = "fixed"
+        active_mode["choices"] = list(choices)
+
+        log_event(
+            "MOE_RCO_QAT_START",
+            allocation=alloc_name,
+            train_rows=len(qat_pool),
+            val_rows=len(val_indices),
+            init_val_kl=round(init_val_kl, 6),
+        )
+        t0_qat = time.time()
+        for step_i, seq_idx in enumerate(qat_pool):
+            ids_d = t_ids_list[seq_idx].to(device)
+            t_nh = t_norm_list[seq_idx].to(device, dtype=torch.bfloat16)
+            for (_fk, p), mp in zip(trainable_params, fp32_masters, strict=True):
+                p.grad = None
+                mp.grad = None
+            s_nh = _forward_student(ids_d, use_ckpt=True).to(torch.bfloat16)
+            kl_l = _kl_loss_against_teacher(s_nh, t_nh)
+            mse_l = F.mse_loss(s_nh.float(), t_nh.float())
+            loss = kl_l + 0.1 * mse_l
+            loss.backward()
+            for (_fk, p), mp in zip(trainable_params, fp32_masters, strict=True):
+                if p.grad is not None:
+                    mp.grad = p.grad.detach().float()
+            torch.nn.utils.clip_grad_norm_(fp32_masters, 1.0)
+            opt_qat.step()
+            sched.step()
+            with torch.no_grad():
+                for (_fk, p), mp in zip(trainable_params, fp32_masters, strict=True):
+                    p.data.copy_(mp.data.to(p.dtype))
+            if (step_i + 1) % 24 == 0 or step_i == 0:
+                log_event(
+                    "MOE_RCO_QAT_STEP",
+                    allocation=alloc_name,
+                    step=step_i + 1,
+                    total_steps=len(qat_pool),
+                    train_kl=round(float(kl_l.item()), 5),
+                    elapsed_s=round(time.time() - t0_qat, 1),
+                )
+            del ids_d, t_nh, s_nh, kl_l, mse_l, loss
+
+        post_val_kl = _eval_choices_val_kl(choices)
+        log_event(
+            "MOE_RCO_QAT_DONE",
+            allocation=alloc_name,
+            init_val_kl=round(init_val_kl, 6),
+            post_val_kl=round(post_val_kl, 6),
+            elapsed_s=round(time.time() - t0_qat, 1),
+        )
+        out_sd: dict[str, torch.Tensor] = {}
+        use_qat = post_val_kl < init_val_kl
+        for full_k, p in trainable_params:
+            p.requires_grad_(False)
+            if use_qat:
+                out_sd[full_k] = p.detach().cpu().clone()
+            else:
+                p.data.copy_(base_param_snapshot[full_k])
+        return out_sd
+
+    out_root_dir.mkdir(parents=True, exist_ok=True)
+    target_alloc_names = (
+        list(allocations.keys()) if not assemble_names or assemble_names == ["all"] else assemble_names
+    )
+    assembled_manifests: dict[str, Any] = {}
+    for aname in target_alloc_names:
+        if aname not in allocations:
+            raise ValueError(f"Unknown allocation {aname!r}; available: {sorted(allocations)}")
+        ainfo = allocations[aname]
+        qat_sd = _run_qat_for_choices(aname, ainfo["choices"])
+        ckpt_out = out_root_dir / "checkpoints" / aname
+        if ckpt_out.exists():
+            import shutil
+
+            shutil.rmtree(ckpt_out)
+        man = assemble_moe_rco_checkpoint(
+            model_key=model_key,
+            w4_ckpt_dir=w4_ckpt_dir,
+            rco_w2_bank_dir=rco_w2_bank_dir,
+            out_dir=ckpt_out,
+            layer_choices=ainfo["choices"],
+            allocation_name=aname,
+            group_size=group_size,
+            qat_state_dict=qat_sd,
+            summary_meta={
+                "budget": ainfo["budget"],
+                "val_kl_pre_qat": ainfo.get("val_kl_pre_qat"),
+                "winner_source": ainfo.get("winner_source"),
+            },
+        )
+        assembled_manifests[aname] = man
+
+    summary = {
+        "model": model_key,
+        "layer_metrics": layer_metrics,
+        "allocations": allocations,
+        "assembled": assembled_manifests,
+    }
+    (out_root_dir / "pareto_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    return summary
 
 
 def main() -> None:

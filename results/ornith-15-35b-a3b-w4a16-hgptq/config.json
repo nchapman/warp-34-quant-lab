@@ -56,12 +56,34 @@
           "type": "int",
           "zp_dtype": null
         }
+      },
+      "w8_head": {
+        "format": "pack-quantized",
+        "input_activations": null,
+        "output_activations": null,
+        "targets": [
+          "re:(?:^|.*\\.)lm_head$",
+          "re:(?:^|.*\\.)mtp\\.fc$"
+        ],
+        "weights": {
+          "actorder": null,
+          "block_structure": null,
+          "dynamic": false,
+          "group_size": 64,
+          "num_bits": 8,
+          "observer": "memoryless_minmax",
+          "observer_kwargs": {},
+          "scale_dtype": null,
+          "strategy": "group",
+          "symmetric": true,
+          "type": "int",
+          "zp_dtype": null
+        }
       }
     },
     "format": "pack-quantized",
     "global_compression_ratio": null,
     "ignore": [
-      "lm_head",
       "re:.*linear_attn\\.in_proj_a$",
       "re:.*linear_attn\\.in_proj_b$",
       "re:.*mlp\\.gate$",

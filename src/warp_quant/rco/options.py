@@ -71,8 +71,8 @@ def resolve_option(spec: str | QuantOption) -> QuantOption:
 def resolve_options(
     specs: list[str | QuantOption] | tuple[str | QuantOption, ...],
 ) -> tuple[QuantOption, ...]:
-    if len(specs) < 2:
-        raise ValueError("RCO requires at least two quantization options")
+    if len(specs) < 1:
+        raise ValueError("RCO requires at least one quantization option")
     opts = tuple(resolve_option(s) for s in specs)
     names = [o.name for o in opts]
     if len(set(names)) != len(names):

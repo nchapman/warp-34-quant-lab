@@ -535,3 +535,64 @@ def test_w8_lm_head_and_mtp_fc_assembly_and_tie_guard(tmp_path) -> None:
     tied_qcfg = json.loads((out_tied / "config.json").read_text())["quantization_config"]
     assert "lm_head" in tied_qcfg["ignore"]
     assert "w8_head" not in tied_qcfg["config_groups"]
+
+
+def test_moe_w2_w4_3d_experts_and_rco_config(tmp_path) -> None:
+    import json
+
+    from warp_quant.hadamard_gptq import LM_HEAD_TARGET_RE, MTP_FC_TARGET_RE, TEXT_TARGET_RE
+    from warp_quant.streaming_moe import (
+        _gptq_quantize_and_pack_3d_experts,
+        _unpack_3d_experts_gpu,
+        _write_moe_rco_quant_config,
+    )
+
+    torch.manual_seed(29)
+    w_3d = torch.randn(4, 64, 64, dtype=torch.bfloat16) * 0.1
+    x = torch.randn(128, 64, dtype=torch.float32)
+    h_shared = ((x.T @ x) / 128.0).unsqueeze(0)
+
+    q_w2, wp_w2, ws_w2, wsh_w2, h_loss_w2 = _gptq_quantize_and_pack_3d_experts(
+        w_3d,
+        h_shared,
+        group_size=64,
+        actorder=None,
+        dampening_frac=0.01,
+        num_bits=2,
+        return_loss=True,
+    )
+    q_w4, wp_w4, ws_w4, wsh_w4, h_loss_w4 = _gptq_quantize_and_pack_3d_experts(
+        w_3d,
+        h_shared,
+        group_size=64,
+        actorder=None,
+        dampening_frac=0.01,
+        num_bits=4,
+        return_loss=True,
+    )
+    assert wp_w2.shape == (4, 64, 4)
+    assert wp_w4.shape == (4, 64, 8)
+    assert wsh_w2.tolist() == [64, 64] and wsh_w4.tolist() == [64, 64]
+    assert h_loss_w2 > h_loss_w4 >= 0.0
+
+    deq_w2 = _unpack_3d_experts_gpu(wp_w2, ws_w2, group_size=64)
+    deq_w4 = _unpack_3d_experts_gpu(wp_w4, ws_w4, group_size=64)
+    assert torch.equal(deq_w2, q_w2)
+    assert torch.equal(deq_w4, q_w4)
+
+    w4_cfg = {
+        "quantization_config": {
+            "config_groups": {
+                "group_0": {"targets": [TEXT_TARGET_RE]},
+                "w8_head": {"targets": [LM_HEAD_TARGET_RE, MTP_FC_TARGET_RE]},
+            }
+        }
+    }
+    _write_moe_rco_quant_config(tmp_path, w4_cfg, [0, 1, 0, 1], group_size=64)
+    out_qcfg = json.loads((tmp_path / "config.json").read_text())["quantization_config"]
+    assert "w2_g64" in out_qcfg["config_groups"]
+    assert "w4_g64" in out_qcfg["config_groups"]
+    assert out_qcfg["config_groups"]["w2_g64"]["weights"]["num_bits"] == 2
+    assert out_qcfg["config_groups"]["w4_g64"]["weights"]["num_bits"] == 4
+    assert len(out_qcfg["config_groups"]["w2_g64"]["targets"]) == 2
+    assert len(out_qcfg["config_groups"]["w4_g64"]["targets"]) == 3

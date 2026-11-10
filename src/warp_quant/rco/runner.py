@@ -469,8 +469,14 @@ def run_rco_cli(args: argparse.Namespace) -> None:
                     w.detach().to(torch.bfloat16).cpu().clone()
                 )
 
+    only_all_high = (
+        bool(args.assemble)
+        and list(args.assemble) == ["all_high"]
+        and all(float(b) <= 0.0 or float(b) >= 1.0 for b in args.budgets)
+    ) or len(args.options) == 1
+
     active_bank_dir = bank_dir
-    if getattr(args, "scale_qat", False):
+    if getattr(args, "scale_qat", False) and not only_all_high:
         import shutil
 
         manifest, candidates = load_rco_bank(bank_dir)
@@ -529,6 +535,25 @@ def run_rco_cli(args: argparse.Namespace) -> None:
     )
     if (active_bank_dir / "allocations.json").is_file():
         allocations = json.loads((active_bank_dir / "allocations.json").read_text())
+    elif only_all_high:
+        manifest_tmp = json.loads((active_bank_dir / "manifest.json").read_text())
+        n_g = len(manifest_tmp["groups"])
+        n_o = len(manifest_tmp["options"])
+        allocations = {
+            "all_low": {
+                "fraction": 0.0,
+                "choices": [0] * n_g,
+                "total_bytes": int(manifest_tmp["all_low_bytes"]),
+                "search_kl": 0.0,
+            },
+            "all_high": {
+                "fraction": 1.0,
+                "choices": [n_o - 1] * n_g,
+                "total_bytes": int(manifest_tmp["all_high_bytes"]),
+                "search_kl": 0.0,
+            },
+        }
+        (active_bank_dir / "allocations.json").write_text(json.dumps(allocations, indent=2) + "\n")
     else:
         allocations = run_rco_search_on_bank(
             model,
