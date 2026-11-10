@@ -33,10 +33,8 @@ class _TrainableScaleLinear(nn.Module):
         self.k_in = k_in
         self.group_size = group_size
         self.trainable = trainable
-        eff_codes = codes.detach().to(device=device, dtype=torch.float32)
-        if code_offset != 0.0:
-            eff_codes = eff_codes + code_offset
-        self.register_buffer("codes_bf16", eff_codes.to(torch.bfloat16))
+        self.code_offset = float(code_offset)
+        self.register_buffer("codes_i8", codes.detach().to(device=device, dtype=torch.int8))
         self.register_buffer("init_scales", scales.detach().to(device=device, dtype=torch.float32))
         if trainable:
             self.scales = nn.Parameter(scales.detach().to(device=device, dtype=torch.float32).clone())
@@ -48,7 +46,10 @@ class _TrainableScaleLinear(nn.Module):
             s_bf16 = self.scales.to(torch.bfloat16) + (self.scales - self.scales.detach()).to(torch.bfloat16)
         else:
             s_bf16 = self.scales.to(torch.bfloat16)
-        return (self.codes_bf16.view(self.n_out, -1, self.group_size) * s_bf16.unsqueeze(-1)).view(
+        c_bf16 = self.codes_i8.to(torch.bfloat16)
+        if self.code_offset != 0.0:
+            c_bf16 = c_bf16 + self.code_offset
+        return (c_bf16.view(self.n_out, -1, self.group_size) * s_bf16.unsqueeze(-1)).view(
             self.n_out, self.k_in
         )
 
@@ -114,6 +115,9 @@ def run_e2e_scale_qat(
     had_hooks = attach_online_hadamard_hooks(student_model, groups, had_block_size)
 
     scale_modules: dict[str, tuple[nn.Module, _TrainableScaleLinear]] = {}
+    offloaded_orig: dict[str, tuple[torch.Tensor, torch.device]] = {}
+    offload_base_weights = int(manifest.get("all_high_bytes", 0)) > 8 * (1024**3)
+    use_layer_ckpt = (not high_vram) or offload_base_weights
     scale_params: list[nn.Parameter] = []
     scale_inits: list[torch.Tensor] = []
 
@@ -121,21 +125,44 @@ def run_e2e_scale_qat(
         c_idx = int(choice)
         for m_name in grp["members"]:
             mod = student_model.get_submodule(m_name)
+            w_dev = mod.weight.device
+            if offload_base_weights and w_dev.type == "cuda":
+                offloaded_orig[m_name] = (mod.weight.data.cpu(), w_dev)
+                mod.weight.data = torch.empty(0, dtype=mod.weight.dtype, device=w_dev)
             cand = candidates[m_name][c_idx]
             is_trainable = int(cand["num_bits"]) <= int(train_scales_max_bits) and lr > 0.0
             ts = _TrainableScaleLinear(
                 cand["codes"],
                 cand["scales"],
                 int(cand["group_size"]),
-                mod.weight.device,
+                w_dev,
                 trainable=is_trainable,
                 code_offset=float(cand.get("code_offset", 0.0)),
             )
-            parametrize.register_parametrization(mod, "weight", ts)
+            parametrize.register_parametrization(mod, "weight", ts, unsafe=True)
             scale_modules[m_name] = (mod, ts)
             if is_trainable:
                 scale_params.append(ts.scales)
                 scale_inits.append(ts.init_scales)
+    if offload_base_weights and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    orig_layer_fwds = []
+    if use_layer_ckpt and hasattr(s_text, "layers"):
+        import functools
+
+        from torch.utils.checkpoint import checkpoint
+
+        for lyr in s_text.layers:
+            orig_fn = lyr.forward
+            orig_layer_fwds.append((lyr, orig_fn))
+
+            def _ckpt_fwd(*args, _orig=orig_fn, **kwargs):
+                if torch.is_grad_enabled():
+                    return checkpoint(functools.partial(_orig, **kwargs), *args, use_reentrant=False)
+                return _orig(*args, **kwargs)
+
+            lyr.forward = _ckpt_fwd
 
     bf16_modules: dict[str, tuple[nn.Module, _FP32MasterBF16Weight]] = {}
     bf16_params: list[nn.Parameter] = []
@@ -383,11 +410,16 @@ def run_e2e_scale_qat(
             "bf16_overrides": best_bf16,
         }
     finally:
+        for lyr, orig_fn in orig_layer_fwds:
+            lyr.forward = orig_fn
         for h in had_hooks:
             h.remove()
-        for _m_name, (mod, _) in scale_modules.items():
+        for m_name, (mod, _) in scale_modules.items():
             if parametrize.is_parametrized(mod, "weight"):
                 parametrize.remove_parametrizations(mod, "weight", leave_parametrized=False)
+            if m_name in offloaded_orig:
+                w_cpu, w_dev = offloaded_orig[m_name]
+                mod.weight.data = w_cpu.to(device=w_dev)
         for _full_name, (mod, _) in bf16_modules.items():
             if parametrize.is_parametrized(mod, "weight"):
                 parametrize.remove_parametrizations(mod, "weight", leave_parametrized=False)

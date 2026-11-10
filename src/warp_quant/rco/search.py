@@ -175,6 +175,7 @@ class SearchModel:
         )
         self.state: dict = {"choices": (0,) * len(self.groups), "soft": None}
         self._installed: list[nn.Module] = []
+        self._offloaded: dict[nn.Module, tuple[torch.Tensor, torch.device]] = {}
         self._flags: list[tuple[nn.Parameter, bool]] = []
         self._modes: list[tuple[nn.Module, bool]] = []
         self._active = False
@@ -198,12 +199,18 @@ class SearchModel:
                 for name in group:
                     m = self.model.get_submodule(name)
                     dev = m.weight.device
+                    if not cache_decoded and dev.type == "cuda":
+                        self._offloaded[m] = (m.weight.data.cpu(), dev)
+                        m.weight.data = torch.empty(0, dtype=m.weight.dtype, device=dev)
                     parametrize.register_parametrization(
                         m,
                         "weight",
                         _Weight(self.candidates[name], self.state, i, dev, cache_decoded=cache_decoded),
+                        unsafe=True,
                     )
                     self._installed.append(m)
+            if self._offloaded and torch.cuda.is_available():
+                torch.cuda.empty_cache()
         except Exception:
             self.__exit__(None, None, None)
             raise
@@ -213,7 +220,11 @@ class SearchModel:
         self.state["soft"] = None
         for m in reversed(self._installed):
             parametrize.remove_parametrizations(m, "weight", leave_parametrized=False)
+            if m in self._offloaded:
+                w_cpu, dev = self._offloaded.pop(m)
+                m.weight.data = w_cpu.to(device=dev)
         self._installed.clear()
+        self._offloaded.clear()
         for p, flag in self._flags:
             p.requires_grad_(flag)
         for m, mode in self._modes:

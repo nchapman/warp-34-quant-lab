@@ -146,9 +146,9 @@ def run_rco_search_on_bank(
     }
 
     had_hooks = attach_online_hadamard_hooks(model, groups, hadamard_block_size)
-    # Only wrap decoder layers in activation checkpointing when VRAM is tight; always checkpoint hidden_kl vocab chunks
+    # Wrap decoder layers in activation checkpointing when VRAM is tight or model is large (>8 GiB W4 text)
     high_vram = device.type == "cuda" and torch.cuda.mem_get_info(device)[0] > 48 * (1024**3)
-    use_layer_ckpt = (not high_vram) and int(manifest["all_high_bytes"]) > 6 * (1024**3)
+    use_layer_ckpt = (not high_vram) or int(manifest["all_high_bytes"]) > 8 * (1024**3)
     kl_ckpt = True
     restore_ckpt = _enable_eval_layer_checkpointing(text_model) if use_layer_ckpt else (lambda: None)
     try:
