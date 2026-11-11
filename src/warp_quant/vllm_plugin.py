@@ -99,7 +99,7 @@ def fast_block_hadamard(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
         hadacore_fn = None
 
     if hadacore_fn is not None:
-        return hadacore_fn(x.unflatten(-1, (-1, block_size)), inplace=False).flatten(-2, -1)
+        return hadacore_fn(x.clone().unflatten(-1, (-1, block_size)), inplace=True).flatten(-2, -1)
 
     orig_shape = x.shape
     orig_dtype = x.dtype
@@ -230,6 +230,12 @@ class CustomLut4PLEMethod:
 
 def _patch_ct_linear_transform() -> None:
     try:
+        importlib.import_module(
+            "vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors"
+        )
+    except Exception:
+        pass
+    try:
         ct_tfm = importlib.import_module("compressed_tensors.transform")
         TransformLocation = ct_tfm.TransformLocation
         par_state = importlib.import_module("vllm.distributed.parallel_state")
@@ -277,6 +283,17 @@ def _patch_ct_linear_transform() -> None:
     CompressedTensorsLinearTransformMethod._warp_quant_patched = True
 
     orig_ht_init = HadamardTransform.__init__
+    orig_ht_forward = getattr(HadamardTransform, "forward", None)
+
+    if orig_ht_forward is not None:
+
+        def _ht_forward(self: Any, value: torch.Tensor, part_id: int = 0) -> torch.Tensor:
+            # Clone input before HadamardTransform.forward so vLLM's in-place
+            # ops.hadacore_transform(value, inplace=True) does not corrupt shared
+            # caller activations (e.g. GatedDeltaNet in_proj_ba, MoE gates).
+            return orig_ht_forward(self, value.clone(), part_id=part_id)
+
+        HadamardTransform.forward = _ht_forward
 
     def _ht_init(
         self: Any,
@@ -331,10 +348,15 @@ def _patch_ct_moe_transform() -> None:
             "vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors"
         )
         CompressedTensorsConfig = ct_mod.CompressedTensorsConfig
-        ct_utils_mod = importlib.import_module(
-            "vllm.model_executor.layers.quantization.compressed_tensors.transform.utils"
+        lin_mod = importlib.import_module(
+            "vllm.model_executor.layers.quantization.compressed_tensors.transform.linear"
         )
-        get_linear_transform_schemes = ct_utils_mod.get_linear_transform_schemes
+        get_linear_transform_schemes = getattr(lin_mod, "get_linear_transform_schemes", None)
+        if get_linear_transform_schemes is None:
+            ct_utils_mod = importlib.import_module(
+                "vllm.model_executor.layers.quantization.compressed_tensors.transform.utils"
+            )
+            get_linear_transform_schemes = ct_utils_mod.get_linear_transform_schemes
     except Exception:
         return
 
@@ -371,18 +393,23 @@ def _patch_ct_moe_transform() -> None:
             if self.w2_head_dim is not None and self.w2_head_dim > 1:
                 if hasattr(experts, "post_activation_transform"):
                     experts.post_activation_transform = self.transform_post_act_inplace
-                else:
+                elif hasattr(experts, "activation") and not getattr(
+                    experts, "_warp_quant_act_wrapped", False
+                ):
                     orig_act = experts.activation
 
                     def _wrapped_activation(
-                        layer: torch.nn.Module,
+                        act_or_layer: Any,
                         output: torch.Tensor,
                         input_tensor: torch.Tensor,
+                        *args: Any,
+                        **kwargs: Any,
                     ) -> None:
-                        orig_act(layer, output, input_tensor)
+                        orig_act(act_or_layer, output, input_tensor, *args, **kwargs)
                         self.transform_post_act_inplace(output)
 
                     experts.activation = _wrapped_activation
+                    experts._warp_quant_act_wrapped = True
 
     def _resolve_moe_hadamard_dims(
         transform_config: Any, prefix: str, layer: torch.nn.Module
@@ -404,10 +431,21 @@ def _patch_ct_moe_transform() -> None:
         if gate_tfms != up_tfms:
             raise ValueError(f"Mismatched gate/up MoE transforms at {prefix}")
 
-        def _extract_head_dim(tfms: dict[Any, Any]) -> int | None:
-            if not tfms or (0, TransformLocation.INPUT) not in tfms:
+        def _extract_head_dim(tfms: Any) -> int | None:
+            if not tfms:
                 return None
-            _name, scheme, _args = tfms[(0, TransformLocation.INPUT)]
+            # vLLM transform.linear.get_linear_transform_schemes returns (input_tfms, output_tfms)
+            if isinstance(tfms, tuple) and len(tfms) == 2:
+                input_tfms = tfms[0]
+                if not input_tfms or 0 not in input_tfms:
+                    return None
+                _name, scheme, _args = input_tfms[0]
+            elif isinstance(tfms, dict) and (0, TransformLocation.INPUT) in tfms:
+                _name, scheme, _args = tfms[(0, TransformLocation.INPUT)]
+            elif isinstance(tfms, dict) and 0 in tfms:
+                _name, scheme, _args = tfms[0]
+            else:
+                return None
             if scheme.type != "hadamard":
                 raise NotImplementedError(f"Unsupported MoE transform type: {scheme.type}")
             return int(scheme.head_dim) if scheme.head_dim is not None else None
@@ -416,38 +454,62 @@ def _patch_ct_moe_transform() -> None:
 
     orig_get_quant_method = CompressedTensorsConfig.get_quant_method
 
+    def _get_moe_experts_obj(layer: torch.nn.Module) -> Any:
+        experts = getattr(layer, "experts", None)
+        if experts is not None:
+            return experts
+        qm = getattr(layer, "quant_method", None)
+        mk = getattr(qm, "moe_kernel", None)
+        return getattr(mk, "fused_experts", None) or getattr(mk, "experts", None)
+
     def _get_quant_method(self: Any, layer: torch.nn.Module, prefix: str) -> Any:
-        method = orig_get_quant_method(self, layer, prefix)
         if isinstance(layer, RoutedExperts) and self.transform_config is not None:
             if getattr(layer, "ct_transforms", None) is None:
                 w13_hd, w2_hd = _resolve_moe_hadamard_dims(self.transform_config, prefix, layer)
                 if w13_hd is not None or w2_hd is not None:
                     layer.ct_transforms = _MoEHadamardTransform(w13_hd, w2_hd)
+        method = orig_get_quant_method(self, layer, prefix)
+        if isinstance(layer, RoutedExperts) and method is not None:
+            cls = method.__class__
+            if not getattr(cls, "_warp_quant_moe_process_wrapped", False):
+                orig_qm_process = cls.process_weights_after_loading
+
+                def _qm_process_weights(qm_self: Any, lyr: torch.nn.Module, *a: Any, **kw: Any) -> Any:
+                    res = orig_qm_process(qm_self, lyr, *a, **kw)
+                    ct_tfms = getattr(lyr, "ct_transforms", None)
+                    if isinstance(ct_tfms, _MoEHadamardTransform):
+                        ct_tfms.process_weights_after_loading(_get_moe_experts_obj(lyr))
+                    return res
+
+                cls.process_weights_after_loading = _qm_process_weights
+                cls._warp_quant_moe_process_wrapped = True
         return method
 
     CompressedTensorsConfig.get_quant_method = _get_quant_method
 
     orig_forward_modular = RoutedExperts.forward_modular
-    orig_process_weights = RoutedExperts.process_weights_after_loading
+    orig_process_weights = getattr(RoutedExperts, "process_weights_after_loading", None)
 
     def _routed_forward_modular(self: Any, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         ct_tfms = getattr(self, "ct_transforms", None)
         if isinstance(ct_tfms, _MoEHadamardTransform):
-            experts = getattr(self, "experts", None)
+            experts = _get_moe_experts_obj(self)
             quant_cfg = getattr(experts, "quant_config", None)
             if not (quant_cfg is not None and getattr(quant_cfg, "w1_hadamard_block_size", None)):
                 x = ct_tfms(x)
         return orig_forward_modular(self, x, *args, **kwargs)
 
-    def _routed_process_weights(self: Any, *args: Any, **kwargs: Any) -> Any:
-        res = orig_process_weights(self, *args, **kwargs)
-        ct_tfms = getattr(self, "ct_transforms", None)
-        if isinstance(ct_tfms, _MoEHadamardTransform):
-            ct_tfms.process_weights_after_loading(getattr(self, "experts", None))
-        return res
-
     RoutedExperts.forward_modular = _routed_forward_modular
-    RoutedExperts.process_weights_after_loading = _routed_process_weights
+    if orig_process_weights is not None:
+
+        def _routed_process_weights(self: Any, *args: Any, **kwargs: Any) -> Any:
+            res = orig_process_weights(self, *args, **kwargs)
+            ct_tfms = getattr(self, "ct_transforms", None)
+            if isinstance(ct_tfms, _MoEHadamardTransform):
+                ct_tfms.process_weights_after_loading(_get_moe_experts_obj(self))
+            return res
+
+        RoutedExperts.process_weights_after_loading = _routed_process_weights
     CompressedTensorsConfig._warp_quant_moe_patched = True
 
 
@@ -497,27 +559,31 @@ def _patch_ct_w2a16() -> None:
     orig_linear_process = CompressedTensorsWNA16.process_weights_after_loading
     orig_linear_apply = CompressedTensorsWNA16.apply_weights
 
+    import inspect
+
+    orig_linear_sig = inspect.signature(orig_linear_create)
+
     def _linear_create_weights(
         self: Any,
         layer: torch.nn.Module,
-        input_size: int,
-        output_partition_sizes: list[int],
-        input_size_per_partition: int,
-        params_dtype: torch.dtype,
-        weight_loader: Any,
+        *args: Any,
         **kwargs: Any,
     ) -> None:
         if self.num_bits != 2 or has_humming():
-            return orig_linear_create(
-                self,
-                layer,
-                input_size,
-                output_partition_sizes,
-                input_size_per_partition,
-                params_dtype,
-                weight_loader,
-                **kwargs,
-            )
+            return orig_linear_create(self, layer, *args, **kwargs)
+
+        bound = orig_linear_sig.bind_partial(self, layer, *args, **kwargs)
+        b_args = bound.arguments
+        if "kwargs" in b_args and isinstance(b_args["kwargs"], dict):
+            extra_kw = b_args["kwargs"]
+        else:
+            extra_kw = {}
+        output_partition_sizes = b_args.get("output_partition_sizes") or extra_kw["output_partition_sizes"]
+        input_size_per_partition = (
+            b_args.get("input_size_per_partition") or extra_kw["input_size_per_partition"]
+        )
+        params_dtype = b_args.get("params_dtype") or extra_kw["params_dtype"]
+        weight_loader = b_args.get("weight_loader") or extra_kw["weight_loader"]
 
         repack_to_marlin = os.environ.get("VLLM_WARP_QUANT_W2_MARLIN", "0") == "1"
         if repack_to_marlin:
@@ -525,16 +591,7 @@ def _patch_ct_w2a16() -> None:
             self.num_bits = 4
             self.pack_factor = Fraction(32, 4)
             self.quant_type = scalar_types.uint4b8
-            orig_linear_create(
-                self,
-                layer,
-                input_size,
-                output_partition_sizes,
-                input_size_per_partition,
-                params_dtype,
-                weight_loader,
-                **kwargs,
-            )
+            orig_linear_create(self, layer, *args, **kwargs)
             self.num_bits = 2
             self.pack_factor = Fraction(32, 2)
             self.quant_type = scalar_types.uint2b2
@@ -616,14 +673,23 @@ def _patch_ct_w2a16() -> None:
             self.num_bits = 4
             self.pack_factor = Fraction(32, 4)
             self.quant_type = scalar_types.uint4b8
-            return orig_linear_process(self, layer)
-        if mode == "native_2bit":
+        elif mode == "native_2bit":
             layer.weight_packed = torch.nn.Parameter(
                 layer.weight_packed.data.contiguous(), requires_grad=False
             )
             layer.weight_scale = torch.nn.Parameter(layer.weight_scale.data.contiguous(), requires_grad=False)
             return
-        return orig_linear_process(self, layer)
+        orig_named_params = layer.named_parameters
+        try:
+            layer.named_parameters = (  # type: ignore[method-assign]
+                lambda prefix="", recurse=False, remove_duplicate=True: orig_named_params(
+                    prefix=prefix, recurse=False, remove_duplicate=remove_duplicate
+                )
+            )
+            return orig_linear_process(self, layer)
+        finally:
+            if "named_parameters" in layer.__dict__:
+                del layer.__dict__["named_parameters"]
 
     def _linear_apply_weights(
         self: Any,
@@ -687,6 +753,10 @@ def _patch_ct_w2a16() -> None:
                 expert_map[flat_ids.clamp(min=0)],
             )
 
+        is_transposed = bool(
+            getattr(layer.w13_weight_packed, "is_transposed", False)
+            or getattr(getattr(layer, "quant_method", None), "is_transposed", False)
+        )
         out = torch.zeros_like(x_flat)
         unique_experts = torch.unique(flat_ids)
         for exp_tensor in unique_experts:
@@ -697,9 +767,11 @@ def _patch_ct_w2a16() -> None:
             tok_idx = sel // top_k
             inp = x_flat.index_select(0, tok_idx)
 
+            w13_p = layer.w13_weight_packed[e].t() if is_transposed else layer.w13_weight_packed[e]
+            w13_s = layer.w13_weight_scale[e].t() if is_transposed else layer.w13_weight_scale[e]
             w13_dq = unpack_dequant_uint2b2(
-                layer.w13_weight_packed[e],
-                layer.w13_weight_scale[e],
+                w13_p,
+                w13_s,
                 group_size=group_size,
                 out_dtype=x_flat.dtype,
             )
@@ -709,9 +781,11 @@ def _patch_ct_w2a16() -> None:
             if w2_hd is not None and w2_hd > 1:
                 act = fast_block_hadamard(act, w2_hd)
 
+            w2_p = layer.w2_weight_packed[e].t() if is_transposed else layer.w2_weight_packed[e]
+            w2_s = layer.w2_weight_scale[e].t() if is_transposed else layer.w2_weight_scale[e]
             w2_dq = unpack_dequant_uint2b2(
-                layer.w2_weight_packed[e],
-                layer.w2_weight_scale[e],
+                w2_p,
+                w2_s,
                 group_size=group_size,
                 out_dtype=x_flat.dtype,
             )
@@ -723,10 +797,39 @@ def _patch_ct_w2a16() -> None:
 
     def _moe_init(
         self: Any,
-        quant_config: Any,
-        moe: Any,
-        layer_quant_config: Any = None,
+        *args: Any,
+        **kwargs: Any,
     ) -> None:
+        # Support both vLLM signatures:
+        # - (self, weight_quant, input_quant, moe, layer_name=None) [vLLM 0.26.x]
+        # - (self, quant_config, moe, layer_quant_config=None) [vLLM main / older]
+        first_arg = args[0] if args else kwargs.get("weight_quant") or kwargs.get("quant_config")
+        if hasattr(first_arg, "num_bits"):
+            # First signature: (weight_quant, input_quant, moe, ...)
+            weight_quant = first_arg
+            if getattr(weight_quant, "num_bits", None) == 2:
+                try:
+                    orig_moe_init(self, *args, **kwargs)
+                    return
+                except (ValueError, NotImplementedError, KeyError, AssertionError):
+                    patched_wq = weight_quant.model_copy(update={"num_bits": 4})
+                    new_args = (patched_wq, *args[1:]) if args else ()
+                    new_kwargs = dict(kwargs)
+                    if not args and "weight_quant" in new_kwargs:
+                        new_kwargs["weight_quant"] = patched_wq
+                    orig_moe_init(self, *new_args, **new_kwargs)
+                    self.num_bits = 2
+                    self.packed_factor = Fraction(32, 2)
+                    self.quant_type = scalar_types.uint2b2
+                    repack_to_marlin = os.environ.get("VLLM_WARP_QUANT_W2_MARLIN", "0") == "1"
+                    self._warp_quant_w2_moe_mode = "marlin_repack" if repack_to_marlin else "native_2bit"
+                    return
+            orig_moe_init(self, *args, **kwargs)
+            return
+
+        quant_config = first_arg
+        moe = args[1] if len(args) > 1 else kwargs.get("moe")
+        layer_quant_config = args[2] if len(args) > 2 else kwargs.get("layer_quant_config")
         scheme_map = getattr(quant_config, "target_scheme_map", None) or {}
         eff_lqc = layer_quant_config if layer_quant_config is not None else scheme_map.get("Linear")
         weight_quant = eff_lqc.get("weights") if isinstance(eff_lqc, dict) else None
@@ -758,14 +861,28 @@ def _patch_ct_w2a16() -> None:
     def _moe_process_weights(self: Any, layer: torch.nn.Module) -> None:
         mode = getattr(self, "_warp_quant_w2_moe_mode", None)
         if mode == "marlin_repack":
-            layer.w13_weight_packed = torch.nn.Parameter(
-                repack_uint2b2_to_uint4b8(layer.w13_weight_packed.data),
-                requires_grad=False,
+            is_transposed = bool(
+                getattr(layer.w13_weight_packed, "is_transposed", False)
+                or getattr(self, "is_transposed", False)
             )
-            layer.w2_weight_packed = torch.nn.Parameter(
-                repack_uint2b2_to_uint4b8(layer.w2_weight_packed.data),
-                requires_grad=False,
-            )
+            w13_data = layer.w13_weight_packed.data
+            w2_data = layer.w2_weight_packed.data
+            if is_transposed:
+                w13_repacked = (
+                    repack_uint2b2_to_uint4b8(w13_data.transpose(1, 2).contiguous())
+                    .transpose(1, 2)
+                    .contiguous()
+                )
+                w2_repacked = (
+                    repack_uint2b2_to_uint4b8(w2_data.transpose(1, 2).contiguous())
+                    .transpose(1, 2)
+                    .contiguous()
+                )
+            else:
+                w13_repacked = repack_uint2b2_to_uint4b8(w13_data)
+                w2_repacked = repack_uint2b2_to_uint4b8(w2_data)
+            layer.w13_weight_packed = torch.nn.Parameter(w13_repacked, requires_grad=False)
+            layer.w2_weight_packed = torch.nn.Parameter(w2_repacked, requires_grad=False)
             self.num_bits = 4
             self.packed_factor = Fraction(32, 4)
             self.quant_type = scalar_types.uint4b8
@@ -784,6 +901,8 @@ def _patch_ct_w2a16() -> None:
             layer.w2_weight_scale = torch.nn.Parameter(
                 layer.w2_weight_scale.data.contiguous(), requires_grad=False
             )
+            # Ensure get_fused_moe_quant_config succeeds if called by MoERunner
+            self.num_bits = 4
             return
         return orig_moe_process(self, layer)
 
@@ -1033,6 +1152,69 @@ try:
                 target_cls = CONFIG_MAPPING[model_type]
                 return target_cls.from_dict(config_dict, **kwargs)
             return PretrainedConfig.from_dict(config_dict, **kwargs)
+
+except Exception:
+    pass
+
+try:
+    from transformers.processing_utils import ProcessorMixin
+    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+    class WarpQuantProcessor(ProcessorMixin):
+        """Hugging Face `AutoProcessor` shim (`"auto_map": {"AutoProcessor": "vllm_warp_quant.WarpQuantProcessor"}`).
+
+        vLLM calls `AutoProcessor.from_pretrained(..., trust_remote_code=trust_remote_code)` in
+        both `process0` and `EngineCore` without overriding `trust_remote_code=False`.
+        """
+
+        @classmethod
+        def register_for_auto_class(cls, auto_class: str = "AutoProcessor") -> None:
+            del auto_class
+
+        @classmethod
+        def from_pretrained(
+            cls,
+            pretrained_model_name_or_path: str | os.PathLike[str],
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            register()
+            _install_subprocess_autoload()
+            kwargs.pop("trust_remote_code", None)
+            from transformers import AutoProcessor
+
+            return AutoProcessor.from_pretrained(
+                pretrained_model_name_or_path,
+                *args,
+                trust_remote_code=False,
+                **kwargs,
+            )
+
+    class WarpQuantTokenizer(PreTrainedTokenizerBase):
+        """Hugging Face `AutoTokenizer` shim (`"auto_map": {"AutoTokenizer": [..., "vllm_warp_quant.WarpQuantTokenizer"]}`)."""
+
+        @classmethod
+        def register_for_auto_class(cls, auto_class: str = "AutoTokenizer") -> None:
+            del auto_class
+
+        @classmethod
+        def from_pretrained(
+            cls,
+            pretrained_model_name_or_path: str | os.PathLike[str],
+            *inputs: Any,
+            **kwargs: Any,
+        ) -> Any:
+            register()
+            _install_subprocess_autoload()
+            kwargs.pop("trust_remote_code", None)
+            from transformers import AutoTokenizer
+
+            return AutoTokenizer.from_pretrained(
+                pretrained_model_name_or_path,
+                *inputs,
+                trust_remote_code=False,
+                **kwargs,
+            )
 
 except Exception:
     pass

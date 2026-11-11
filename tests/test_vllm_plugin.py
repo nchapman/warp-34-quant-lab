@@ -73,7 +73,7 @@ def test_fast_block_hadamard_validation_and_hadacore_dispatch(monkeypatch: pytes
 
     def _fake_hadacore(t: torch.Tensor, inplace: bool = False) -> torch.Tensor:
         calls.append((tuple(t.shape), inplace))
-        return t * 2.0
+        return t.mul_(2.0)
 
     fake_ops.hadacore_transform = _fake_hadacore  # type: ignore[attr-defined]
     fake_vllm = types.ModuleType("vllm")
@@ -81,9 +81,11 @@ def test_fast_block_hadamard_validation_and_hadacore_dispatch(monkeypatch: pytes
     monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
     monkeypatch.setitem(sys.modules, "vllm._custom_ops", fake_ops)
 
+    x_orig = x.clone()
     out = fast_block_hadamard(x, block_size=64)
-    assert calls == [((5, 3, 64), False)]
-    assert torch.equal(out, x * 2.0)
+    assert calls == [((5, 3, 64), True)]
+    assert torch.equal(x, x_orig)
+    assert torch.equal(out, x_orig * 2.0)
 
 
 def test_custom_lut4_ple_method_storage_dequant_and_tp_sharding() -> None:
@@ -353,3 +355,59 @@ def test_hf_auto_map_warp_quant_config_from_checkpoint_dir(
 
     cfg_untrusted = AutoConfig.from_pretrained(str(ckpt_dir), trust_remote_code=False)
     assert isinstance(cfg_untrusted, Qwen3_5MoeConfig)
+
+
+def test_hadamard_transform_forward_clones_input_and_humming_named_params_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import types
+
+    par_mod = types.ModuleType("vllm.distributed.parallel_state")
+    par_mod.get_tensor_model_parallel_world_size = lambda: 1
+    ct_mod = types.ModuleType("vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors")
+    lin_mod = types.ModuleType("vllm.model_executor.layers.quantization.compressed_tensors.transform.linear")
+    ht_mod = types.ModuleType("vllm.model_executor.layers.quantization.compressed_tensors.transform.module")
+
+    class FakeLinearTransformMethod:
+        pass
+
+    class FakeHadamardTransform(torch.nn.Module):
+        def __init__(
+            self, transforms, layer, weight_loader, input_size_per_partition, output_partition_sizes
+        ):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.eye(4), requires_grad=False)
+
+        def forward(self, value: torch.Tensor, part_id: int = 0) -> torch.Tensor:
+            # Simulate vLLM's in-place ops.hadacore_transform mutation
+            value.mul_(2.0)
+            return value
+
+    lin_mod.CompressedTensorsLinearTransformMethod = FakeLinearTransformMethod
+    ht_mod.HadamardTransform = FakeHadamardTransform
+
+    monkeypatch.setitem(sys.modules, "vllm.distributed.parallel_state", par_mod)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors",
+        ct_mod,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.layers.quantization.compressed_tensors.transform.linear",
+        lin_mod,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.layers.quantization.compressed_tensors.transform.module",
+        ht_mod,
+    )
+
+    _patch_ct_linear_transform()
+
+    ht = FakeHadamardTransform({}, torch.nn.Linear(4, 4), None, 4, [4])
+    x = torch.ones(2, 4)
+    out = ht(x)
+    # Caller's x must NOT be mutated in-place
+    assert torch.all(x == 1.0)
+    assert torch.all(out == 2.0)
