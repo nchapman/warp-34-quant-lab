@@ -261,10 +261,16 @@ def build_parser() -> argparse.ArgumentParser:
     h.add_argument("--good-dataset", default="mlabonne/harmless_alpaca")
     h.add_argument("--bad-dataset", default="mlabonne/harmful_behaviors")
     h.add_argument(
-        "--num-prompts", type=int, default=128, help="Number of good/bad prompts for direction extraction"
+        "--num-prompts",
+        type=int,
+        default=400,
+        help="Number of good/bad train prompts for direction extraction (Heretic default: 400)",
     )
     h.add_argument(
-        "--eval-prompts", type=int, default=16, help="Number of held-out good/bad prompts for trial scoring"
+        "--eval-prompts",
+        type=int,
+        default=100,
+        help="Number of held-out good/bad test prompts for trial scoring (Heretic default: 100)",
     )
     h.add_argument("--eval-max-tokens", type=int, default=24)
     h.add_argument("--batch-size", type=int, default=8)

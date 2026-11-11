@@ -63,6 +63,15 @@ class AbliterationParameters:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AbliterationParameters:
+        return cls(
+            direction_index=data["direction_index"],
+            weight_distributions={
+                comp: WeightDistribution(**wd) for comp, wd in data["weight_distributions"].items()
+            },
+        )
+
 
 REFUSAL_MARKERS: tuple[str, ...] = (
     "disclaimer",
@@ -434,6 +443,27 @@ def compute_kl_divergence(base_logits: Tensor, mod_logits: Tensor) -> float:
     return float(kl.mean().item())
 
 
+def compute_pareto_front(trial_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return non-dominated trials sorted by `(refusals, kl_divergence)` ascending (Heretic Pareto front)."""
+    pareto: list[dict[str, Any]] = []
+    for cand in trial_records:
+        c_ref = int(cand["refusals"])
+        c_kl = float(cand["kl_divergence"])
+        dominated = False
+        for other in trial_records:
+            if other is cand:
+                continue
+            o_ref = int(other["refusals"])
+            o_kl = float(other["kl_divergence"])
+            if (o_ref <= c_ref and o_kl <= c_kl) and (o_ref < c_ref or o_kl < c_kl):
+                dominated = True
+                break
+        if not dominated:
+            pareto.append(cand)
+    pareto.sort(key=lambda r: (int(r["refusals"]), float(r["kl_divergence"])))
+    return pareto
+
+
 class InMemoryLoRAApplicator:
     """Applies `(lora_A, lora_B)` deltas via forward hooks without mutating base weights."""
 
@@ -792,11 +822,18 @@ def run_heretic_lora(args: argparse.Namespace) -> dict[str, Any]:
         f"[heretic-lora] Found {num_layers} layers, {total_linears} target Linear modules across components {components}"
     )
 
-    good_all = list(load_dataset(args.good_dataset, split=f"train[:{n_train + n_eval}]")["text"])
-    bad_all = list(load_dataset(args.bad_dataset, split=f"train[:{n_train + n_eval}]")["text"])
-
-    good_train, good_eval = good_all[:n_train], good_all[n_train : n_train + n_eval]
-    bad_train, bad_eval = bad_all[:n_train], bad_all[n_train : n_train + n_eval]
+    good_train = list(load_dataset(args.good_dataset, split=f"train[:{n_train}]")["text"])
+    bad_train = list(load_dataset(args.bad_dataset, split=f"train[:{n_train}]")["text"])
+    try:
+        good_eval = list(load_dataset(args.good_dataset, split=f"test[:{n_eval}]")["text"])
+    except Exception:
+        good_eval = list(
+            load_dataset(args.good_dataset, split=f"train[{n_train}:{n_train + n_eval}]")["text"]
+        )
+    try:
+        bad_eval = list(load_dataset(args.bad_dataset, split=f"test[:{n_eval}]")["text"])
+    except Exception:
+        bad_eval = list(load_dataset(args.bad_dataset, split=f"train[{n_train}:{n_train + n_eval}]")["text"])
     if not good_train or not bad_train or not good_eval or not bad_eval:
         raise ValueError(
             f"Insufficient prompts loaded: good_train={len(good_train)}, good_eval={len(good_eval)}, "
@@ -906,6 +943,32 @@ def run_heretic_lora(args: argparse.Namespace) -> dict[str, Any]:
                 best_record = rec
 
         assert best_params is not None
+        pareto_trials = compute_pareto_front(trial_records)
+        print(f"\n[heretic-lora] Pareto front ({len(pareto_trials)} non-dominated trial(s)):")
+        for p_idx, p_rec in enumerate(pareto_trials):
+            p_params = AbliterationParameters.from_dict(p_rec["parameters"])
+            p_deltas = applicator.set_parameters(
+                p_params,
+                residual_directions,
+                row_normalization=row_norm,
+                lora_rank=lora_rank,
+                seed=args.seed,
+            )
+            sub_name = f"trial_{p_rec['trial']:03d}_ref{p_rec['refusals']}_kl{p_rec['kl_divergence']:.4f}"
+            pareto_dir = output_dir / "pareto" / sub_name
+            save_peft_lora_adapter(
+                pareto_dir,
+                p_deltas,
+                base_model_name_or_path=hub_id,
+                lora_rank=lora_rank,
+                summary=p_rec,
+            )
+            p_rec["pareto_dir"] = str(pareto_dir)
+            print(
+                f"  [Pareto {p_idx}] Trial {p_rec['trial']} -> refusals={p_rec['refusals']}/{p_rec['total_eval']} "
+                f"({p_rec['refusal_rate']:.1%}), KL={p_rec['kl_divergence']:.4f} -> {pareto_dir}"
+            )
+
         best_deltas = applicator.set_parameters(
             best_params,
             residual_directions,
@@ -928,6 +991,7 @@ def run_heretic_lora(args: argparse.Namespace) -> dict[str, Any]:
         "baseline_refusals": base_refusals,
         "eval_prompts": len(bad_eval),
         "best_trial": best_record,
+        "pareto_trials": pareto_trials,
         "trials": trial_records,
         "elapsed_sec": round(elapsed, 2),
     }

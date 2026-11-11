@@ -25,6 +25,7 @@ from warp_quant.heretic_lora import (
     compute_layer_weight,
     compute_lora_factors,
     compute_orthogonal_refusal_directions,
+    compute_pareto_front,
     get_last_token_logits,
     interpolate_direction,
     is_refusal_response,
@@ -237,3 +238,13 @@ def test_cli_heretic_lora_parser_and_presets() -> None:
 
     with pytest.raises(ValueError, match="prompts must not be empty"):
         get_last_token_logits(nn.Linear(4, 4), None, [])
+
+    pareto = compute_pareto_front(
+        [
+            {"trial": 0, "refusals": 3, "kl_divergence": 0.05},
+            {"trial": 1, "refusals": 0, "kl_divergence": 0.04},
+            {"trial": 2, "refusals": 2, "kl_divergence": 0.01},
+            {"trial": 3, "refusals": 5, "kl_divergence": 0.08},
+        ]
+    )
+    assert [r["trial"] for r in pareto] == [1, 2]
