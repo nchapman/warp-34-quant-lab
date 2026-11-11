@@ -882,14 +882,20 @@ tags:
 
 # {output_dir.name}
 
-Standalone, **unrotated BF16** Heretic (`p-e-w/heretic` v2.1) Magnitude-Preserving Orthogonal Ablation (`MPOA`, `r={lora_rank}`) LoRA adapter for `{base_model_name_or_path}`.
+Heretic (`p-e-w/heretic` v2.1) Magnitude-Preserving Orthogonal Ablation (`MPOA`, `r={lora_rank}`) BF16 LoRA adapter for `{base_model_name_or_path}`.
 
-Because vLLM's `CompressedTensorsLinearTransformMethod` applies the online Walsh–Hadamard transform ($H_{{64}}$) inside `quant_method.apply()` while `BaseLayerWithLoRA` evaluates the LoRA branch (`lora_B(lora_A(x))`) on the **unrotated** input activation $x$ in parallel, this single unrotated BF16 adapter works across **all** checkpoint variants of `{base_model_name_or_path}`:
-- Official BF16 / FP8 (`{base_model_name_or_path}`)
-- Hadamard-GPTQ (`{quant_repo_hint}`)
-- Mixed-precision `RCO` (`W2.6A16-HGPTQ-RCO` / `W2.2A16-HGPTQ-RCO`)
+Compatible with the official `{base_model_name_or_path}` checkpoint as well as quantized variants (such as `{quant_repo_hint}` and `RCO` checkpoints) in `vllm` (`--enable-lora`) and `transformers` + `peft`.
 
 {metrics_section}## Usage with vLLM (Per-Request Toggleable Abliteration)
+
+```bash
+vllm serve {base_model_name_or_path} \\
+  --enable-lora \\
+  --max-lora-rank {max(8, int(lora_rank))} \\
+  --lora-modules uncensored={repo_name}
+```
+
+Or with a quantized checkpoint:
 
 ```bash
 vllm serve {quant_repo_hint} \\
@@ -899,7 +905,7 @@ vllm serve {quant_repo_hint} \\
   --lora-modules uncensored={repo_name}
 ```
 
-Pass `"model": "uncensored"` in OpenAI-compatible `/v1/chat/completions` requests to enable the abliterated adapter, or pass `"model": "{quant_repo_hint}"` on the exact same server instance for unadapted baseline behavior.
+Pass `"model": "uncensored"` in OpenAI-compatible `/v1/chat/completions` requests to enable the adapter, or pass the base model name on the same server instance for unadapted baseline behavior.
 """
     (output_dir / "README.md").write_text(readme)
     return output_dir
