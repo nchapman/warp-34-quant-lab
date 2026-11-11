@@ -1237,6 +1237,11 @@ def run_quantize(args: argparse.Namespace) -> None:
 
     model.save_pretrained(str(output_dir), save_compressed=True)
     processor.save_pretrained(str(output_dir))
+    ensure_processor_configs(
+        str(output_dir),
+        fallback=info.get("processor_hub_fallback") or hub_id,
+        fallback_revision=info.get("processor_hub_fallback_revision"),
+    )
 
     # Clean *.v_input.weight and optionally quantize MTP / Vision / W8 head in-place
     shard_counts = _clean_and_augment_shards(

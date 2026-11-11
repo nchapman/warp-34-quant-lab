@@ -422,3 +422,60 @@ def test_hadamard_transform_forward_clones_input_and_humming_named_params_guard(
     # Caller's x must NOT be mutated in-place
     assert torch.all(x == 1.0)
     assert torch.all(out == 2.0)
+
+
+def test_stamp_vllm_autoload_normalizes_configs_and_synthesizes_preprocessors(
+    tmp_path: pytest.TempPathFactory,
+) -> None:
+    import json
+    from pathlib import Path
+
+    from warp_quant.stamp import stamp_vllm_autoload
+
+    d = Path(str(tmp_path))
+    (d / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen4_exp",
+                "text_config": {"model_type": "qwen4_exp_text"},
+                "quantization_config": {
+                    "ignore": ["re:^mtp\\.fc_.*"],
+                    "ple_quantization": {"format": "lut4-gptq", "group_size": 32},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (d / "processor_config.json").write_text(
+        json.dumps(
+            {
+                "processor_class": "Qwen3VLProcessor",
+                "image_processor": {"image_processor_type": "Qwen2VLImageProcessor"},
+                "video_processor": {"video_processor_type": "Qwen3VLVideoProcessor"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (d / "tokenizer_config.json").write_text(
+        json.dumps({"tokenizer_class": "Qwen3_5Tokenizer"}),
+        encoding="utf-8",
+    )
+
+    stamp_vllm_autoload(d)
+
+    assert (d / "vllm_warp_quant.py").is_file()
+    cfg = json.loads((d / "config.json").read_text(encoding="utf-8"))
+    assert cfg["quantization_config"]["ignore"] == ["re:.*mtp\\.fc_.*"]
+    assert cfg["text_config"]["ple_quantization"] == {"format": "lut4-gptq", "group_size": 32}
+    assert "auto_map" not in cfg  # qwen4_exp uses processor/tokenizer auto_map
+
+    pc = json.loads((d / "processor_config.json").read_text(encoding="utf-8"))
+    assert pc["auto_map"]["AutoProcessor"] == "vllm_warp_quant.WarpQuantProcessor"
+    assert (d / "preprocessor_config.json").is_file()
+    assert (d / "video_preprocessor_config.json").is_file()
+
+    tc = json.loads((d / "tokenizer_config.json").read_text(encoding="utf-8"))
+    assert tc["auto_map"]["AutoTokenizer"] == [
+        "vllm_warp_quant.WarpQuantTokenizer",
+        "vllm_warp_quant.WarpQuantTokenizer",
+    ]

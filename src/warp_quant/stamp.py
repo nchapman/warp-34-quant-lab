@@ -202,6 +202,91 @@ def build_generation_config(
     return gc
 
 
+def stamp_vllm_autoload(save_dir: str | Path) -> None:
+    """Stamp `vllm_warp_quant.py`, `auto_map` hooks, and canonical config normalizations."""
+    save_dir = Path(save_dir)
+    plugin_src = Path(__file__).parent / "vllm_plugin.py"
+    if plugin_src.is_file():
+        shutil.copyfile(plugin_src, save_dir / "vllm_warp_quant.py")
+
+    cfg_path = save_dir / "config.json"
+    if cfg_path.is_file():
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        is_dflash = cfg.get("architectures") == ["DFlash2DraftModel"]
+
+        def _norm_re(val: Any) -> Any:
+            if isinstance(val, str):
+                if val.startswith("re:^layers\\."):
+                    prefix = "re:.*" if is_dflash else "re:.*(?<!mtp\\.)"
+                    return prefix + val[4:]
+                if val.startswith("re:^mtp\\."):
+                    return "re:.*" + val[4:]
+                return val
+            if isinstance(val, list):
+                return [_norm_re(x) for x in val]
+            if isinstance(val, dict):
+                return {k: _norm_re(v) for k, v in val.items()}
+            return val
+
+        qcfg = cfg.get("quantization_config")
+        if isinstance(qcfg, dict):
+            cfg["quantization_config"] = _norm_re(qcfg)
+            ple_qcfg = cfg["quantization_config"].get("ple_quantization")
+            if isinstance(ple_qcfg, dict) and isinstance(cfg.get("text_config"), dict):
+                cfg["text_config"]["ple_quantization"] = dict(ple_qcfg)
+
+        model_type = cfg.get("model_type")
+        if model_type != "qwen4_exp":
+            am = dict(cfg.get("auto_map") or {})
+            am["AutoConfig"] = "vllm_warp_quant.WarpQuantConfig"
+            cfg["auto_map"] = am
+
+        tmp = cfg_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(cfg_path)
+
+    pc_path = save_dir / "processor_config.json"
+    if pc_path.is_file():
+        pc = json.loads(pc_path.read_text(encoding="utf-8"))
+        am = dict(pc.get("auto_map") or {})
+        am["AutoProcessor"] = "vllm_warp_quant.WarpQuantProcessor"
+        pc["auto_map"] = am
+        tmp = pc_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(pc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        tmp.replace(pc_path)
+
+        # Ensure standalone preprocessor_config.json & video_preprocessor_config.json exist
+        # when transformers 5.x nests them inside processor_config.json
+        img_proc = pc.get("image_processor")
+        pre_path = save_dir / "preprocessor_config.json"
+        if isinstance(img_proc, dict) and not pre_path.is_file():
+            pre_obj = dict(img_proc)
+            if "processor_class" in pc:
+                pre_obj.setdefault("processor_class", pc["processor_class"])
+            pre_path.write_text(json.dumps(pre_obj, indent=2) + "\n", encoding="utf-8")
+
+        vid_proc = pc.get("video_processor")
+        vpre_path = save_dir / "video_preprocessor_config.json"
+        if isinstance(vid_proc, dict) and not vpre_path.is_file():
+            vpre_obj = dict(vid_proc)
+            if "processor_class" in pc:
+                vpre_obj.setdefault("processor_class", pc["processor_class"])
+            vpre_path.write_text(json.dumps(vpre_obj, indent=2) + "\n", encoding="utf-8")
+
+    tc_path = save_dir / "tokenizer_config.json"
+    if tc_path.is_file():
+        tc = json.loads(tc_path.read_text(encoding="utf-8"))
+        am = dict(tc.get("auto_map") or {})
+        am["AutoTokenizer"] = [
+            "vllm_warp_quant.WarpQuantTokenizer",
+            "vllm_warp_quant.WarpQuantTokenizer",
+        ]
+        tc["auto_map"] = am
+        tmp = tc_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(tc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        tmp.replace(tc_path)
+
+
 def stamp_release_template(save_dir: str | Path) -> str:
     save_dir = Path(save_dir)
     if not RELEASE_TEMPLATE.is_file():
@@ -218,6 +303,7 @@ def stamp_release_template(save_dir: str | Path) -> str:
             tmp = tc_path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(tc, indent=2, ensure_ascii=False), encoding="utf-8")
             tmp.replace(tc_path)
+    stamp_vllm_autoload(save_dir)
     shipped = save_dir / "chat_template.jinja"
     if hashlib.sha256(shipped.read_bytes()).hexdigest() != RELEASE_TEMPLATE_SHA:
         raise RuntimeError(f"shipped template sha mismatch: {shipped}")

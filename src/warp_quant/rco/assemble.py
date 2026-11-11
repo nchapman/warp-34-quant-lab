@@ -526,7 +526,7 @@ def _assemble_rco_checkpoint_into(
         processor.save_pretrained(str(output_dir))
         ensure_processor_configs(
             str(output_dir),
-            fallback=info.get("processor_hub_fallback"),
+            fallback=info.get("processor_hub_fallback") or str(base_dir),
             fallback_revision=info.get("processor_hub_fallback_revision"),
         )
         gc = build_generation_config(processor, info, str(base_dir), {})
