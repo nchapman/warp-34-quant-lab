@@ -30,7 +30,6 @@ import torch
 import torch.linalg as LA
 import torch.nn as nn
 import torch.nn.functional as F
-from datasets import load_dataset
 from safetensors.torch import save_file
 from torch import Tensor
 from torch.utils.hooks import RemovableHandle
@@ -600,7 +599,23 @@ def sample_trial_parameters(
             "min_weight_frac": 0.48,
             "min_dist_frac": 0.60,
         },
-        # Trial 4: Global mid-late direction (0.62 * last_layer)
+        # Trial 4: Wide-span deep envelope (for 32+ layer models: 4B, 9B, 27B, 35B, Flash-Next)
+        {
+            "attn_max_weight": 1.48,
+            "mlp_max_weight": 1.28,
+            "max_pos_frac": 0.66,
+            "min_weight_frac": 0.68,
+            "min_dist_frac": 0.80,
+        },
+        # Trial 5: Full-span high-completeness envelope
+        {
+            "attn_max_weight": 1.52,
+            "mlp_max_weight": 1.38,
+            "max_pos_frac": 0.64,
+            "min_weight_frac": 0.75,
+            "min_dist_frac": 0.90,
+        },
+        # Trial 6: Global mid-late direction (0.62 * last_layer)
         {
             "attn_max_weight": 1.28,
             "mlp_max_weight": 0.96,
@@ -609,14 +624,83 @@ def sample_trial_parameters(
             "min_dist_frac": 0.58,
             "direction_index": 0.62 * last,
         },
-        # Trial 5: Global deeper direction (0.72 * last_layer)
+        # Trial 7: Global deeper direction with wide span (0.68 * last_layer)
         {
-            "attn_max_weight": 1.35,
-            "mlp_max_weight": 1.05,
-            "max_pos_frac": 0.74,
-            "min_weight_frac": 0.50,
-            "min_dist_frac": 0.60,
-            "direction_index": 0.72 * last,
+            "attn_max_weight": 1.46,
+            "mlp_max_weight": 1.24,
+            "max_pos_frac": 0.68,
+            "min_weight_frac": 0.65,
+            "min_dist_frac": 0.82,
+            "direction_index": 0.68 * last,
+        },
+        # Trial 8: Global direction (0.70 * last_layer) with stronger projection
+        {
+            "attn_max_weight": 1.58,
+            "mlp_max_weight": 1.42,
+            "max_pos_frac": 0.68,
+            "min_weight_frac": 0.72,
+            "min_dist_frac": 0.88,
+            "direction_index": 0.70 * last,
+        },
+        # Trial 9: Global direction (0.73 * last_layer) with full-span envelope
+        {
+            "attn_max_weight": 1.66,
+            "mlp_max_weight": 1.52,
+            "max_pos_frac": 0.68,
+            "min_weight_frac": 0.76,
+            "min_dist_frac": 0.92,
+            "direction_index": 0.73 * last,
+        },
+        # Trial 10: Global direction (0.66 * last_layer) with strong wide span
+        {
+            "attn_max_weight": 1.62,
+            "mlp_max_weight": 1.46,
+            "max_pos_frac": 0.66,
+            "min_weight_frac": 0.74,
+            "min_dist_frac": 0.90,
+            "direction_index": 0.66 * last,
+        },
+        # Trial 11: Per-layer high-strength full-span envelope (MoE & deep dense)
+        {
+            "attn_max_weight": 1.72,
+            "mlp_max_weight": 1.85,
+            "max_pos_frac": 0.65,
+            "min_weight_frac": 0.78,
+            "min_dist_frac": 0.94,
+        },
+        # Trial 12: MoE shared-expert over-projection envelope (cancels routed experts)
+        {
+            "attn_max_weight": 1.88,
+            "mlp_max_weight": 2.35,
+            "max_pos_frac": 0.65,
+            "min_weight_frac": 0.80,
+            "min_dist_frac": 0.95,
+        },
+        # Trial 13: MoE aggressive shared-expert + global direction (0.68 * last_layer)
+        {
+            "attn_max_weight": 1.82,
+            "mlp_max_weight": 2.25,
+            "max_pos_frac": 0.67,
+            "min_weight_frac": 0.78,
+            "min_dist_frac": 0.92,
+            "direction_index": 0.68 * last,
+        },
+        # Trial 14: MoE ultra-wide per-layer over-projection
+        {
+            "attn_max_weight": 2.05,
+            "mlp_max_weight": 2.75,
+            "max_pos_frac": 0.64,
+            "min_weight_frac": 0.82,
+            "min_dist_frac": 0.96,
+        },
+        # Trial 15: MoE ultra-wide global direction (0.71 * last_layer)
+        {
+            "attn_max_weight": 1.96,
+            "mlp_max_weight": 2.60,
+            "max_pos_frac": 0.68,
+            "min_weight_frac": 0.80,
+            "min_dist_frac": 0.95,
+            "direction_index": 0.71 * last,
         },
     ]
     if trial_idx < len(presets):
@@ -734,35 +818,700 @@ def save_peft_lora_adapter(
     if summary is not None:
         (output_dir / "heretic_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 
+    repo_name = f"nchapman/{output_dir.name}"
+    metrics_section = ""
+    if summary is not None and "best_trial" in summary:
+        bt = summary["best_trial"]
+        base_ref = summary.get("baseline_refusals", "?")
+        n_ev = summary.get("eval_prompts", bt.get("total_eval", 100))
+        metrics_lines = [
+            "## Measured Abliteration & Fidelity Receipts",
+            "",
+            f"- **Base Model**: `{base_model_name_or_path}`",
+            f"- **Method**: Heretic v2.1 (`train[:400]` extraction / `test[:{n_ev}]` evaluation on `mlabonne/harmless_alpaca` & `mlabonne/harmful_behaviors`)",
+            f"- **Row Normalization**: `{summary.get('row_normalization', 'full')}` (Magnitude-Preserving Orthogonal Ablation / MPOA, `r={lora_rank}` SVD)",
+            f"- **Target Modules**: `{summary.get('num_target_modules', len(target_modules))}` residual-writing projections (`self_attn.o_proj`, `linear_attn.out_proj`, `mlp.down_proj` / `mlp.shared_expert.down_proj`)",
+            f"- **Baseline Refusals**: `{base_ref}/{n_ev}`",
+            f"- **Default Adapter Refusals**: **`{bt['refusals']}/{n_ev}` (`{bt['refusal_rate']:.1%}`)**",
+            f"- **First-Token KL Divergence (`harmless_alpaca` `test[:{n_ev}]`)**: **`{bt['kl_divergence']:.4f}` nats**",
+            "",
+        ]
+        pareto_list = summary.get("pareto_trials", [])
+        if pareto_list:
+            metrics_lines.extend(
+                [
+                    "### Pareto Front Checkpoints (`pareto/` subdirectories)",
+                    "",
+                    "Every non-dominated `(refusals, kl_divergence)` trial from the sweep is included under `pareto/`:",
+                    "",
+                    "| Subfolder | Trial | Refusals (`test[:100]`) | Refusal Rate | First-Token KL (`nats`) |",
+                    "|---|---:|---:|---:|---:|",
+                ]
+            )
+            for pt in pareto_list:
+                t_i = int(pt["trial"])
+                sub = f"pareto/trial_{t_i:03d}_ref{pt['refusals']}_kl{pt['kl_divergence']:.4f}"
+                is_def = " **(default root)**" if t_i == int(bt["trial"]) else ""
+                metrics_lines.append(
+                    f"| `{sub}`{is_def} | `{t_i}` | `{pt['refusals']}/{pt['total_eval']}` | `{pt['refusal_rate']:.1%}` | `{pt['kl_divergence']:.4f}` |"
+                )
+            metrics_lines.append("")
+        metrics_section = "\n".join(metrics_lines) + "\n"
+
+    quant_repo_hint = (
+        summary.get("quant_repo")
+        if isinstance(summary, dict) and summary.get("quant_repo")
+        else base_model_name_or_path
+    )
     readme = f"""---
 base_model: {base_model_name_or_path}
 library_name: peft
+license: apache-2.0
+pipeline_tag: text-generation
 tags:
   - lora
+  - peft
   - abliteration
   - heretic
+  - uncensored
   - vllm
   - qwen3.5
+  - qwen3.6
+  - qwen3.8
 ---
 
 # {output_dir.name}
 
-Unrotated BF16 Heretic abliteration LoRA adapter (`r={lora_rank}`) for `{base_model_name_or_path}` and its quantized `W4A16-HGPTQ` / `RCO` checkpoints.
+Standalone, **unrotated BF16** Heretic (`p-e-w/heretic` v2.1) Magnitude-Preserving Orthogonal Ablation (`MPOA`, `r={lora_rank}`) LoRA adapter for `{base_model_name_or_path}`.
 
-## Usage with vLLM (Per-Request Toggleable Abliteration)
+Because vLLM's `CompressedTensorsLinearTransformMethod` applies the online Walsh–Hadamard transform ($H_{{64}}$) inside `quant_method.apply()` while `BaseLayerWithLoRA` evaluates the LoRA branch (`lora_B(lora_A(x))`) on the **unrotated** input activation $x$ in parallel, this single unrotated BF16 adapter works across **all** checkpoint variants of `{base_model_name_or_path}`:
+- Official BF16 / FP8 (`{base_model_name_or_path}`)
+- Hadamard-GPTQ (`{quant_repo_hint}`)
+- Mixed-precision `RCO` (`W2.6A16-HGPTQ-RCO` / `W2.2A16-HGPTQ-RCO`)
+
+{metrics_section}## Usage with vLLM (Per-Request Toggleable Abliteration)
 
 ```bash
-vllm serve <quantized-or-bf16-model> \\
+vllm serve {quant_repo_hint} \\
   --trust-remote-code \\
   --enable-lora \\
   --max-lora-rank {max(8, int(lora_rank))} \\
-  --lora-modules uncensored={output_dir}
+  --lora-modules uncensored={repo_name}
 ```
 
-Pass `"model": "uncensored"` in OpenAI-compatible API requests to enable the adapter, or use the base model name for unadapted inference.
+Pass `"model": "uncensored"` in OpenAI-compatible `/v1/chat/completions` requests to enable the abliterated adapter, or pass `"model": "{quant_repo_hint}"` on the exact same server instance for unadapted baseline behavior.
 """
     (output_dir / "README.md").write_text(readme)
     return output_dir
+
+
+@torch.no_grad()
+def _run_heretic_lora_streaming_qwen4_exp(
+    args: argparse.Namespace,
+    hub_id: str,
+    info: dict[str, Any],
+    output_dir: Path,
+    row_norm: RowNormalization,
+    lora_rank: int,
+) -> dict[str, Any]:
+    """Layer-by-layer streaming Heretic LoRA extraction for 360GB Qwen4Exp (Qwen3.8-Flash-Next)."""
+    from concurrent.futures import Future, ThreadPoolExecutor
+
+    from transformers import AutoConfig
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import (
+        Qwen4ExpTextGatedResidual,
+        Qwen4ExpTextRotaryEmbedding,
+    )
+
+    from warp_quant.streaming_moe import (
+        _build_lightweight_decoder_layer,
+        _ensure_qwen4_exp_device_kernels,
+        _forward_qsa_attention_fast,
+        _hadamard_rotate_last_dim,
+        _load_decoder_layer_weights,
+        _load_shard_map,
+        _load_top_level_module_tensors,
+        _prefetch_layer_raw_tensors,
+        forward_ple_with_precomputed_embeds,
+        stream_gather_ple_embeds,
+    )
+
+    t0 = time.time()
+    n_train = int(args.num_prompts)
+    n_eval = int(args.eval_prompts)
+
+    quant_repo = info.get("quant_repo") or "nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ"
+    local_dir = resolve_snapshot(quant_repo)
+    if local_dir is None:
+        local_dir = resolve_snapshot(hub_id, revision=info.get("hub_revision"))
+    if local_dir is None:
+        raise RuntimeError(f"Could not resolve snapshot for {quant_repo} or {hub_id}")
+    ckpt_dir = Path(local_dir)
+
+    print(f"[heretic-lora] Streaming Qwen4Exp layer-by-layer from {ckpt_dir} (base={hub_id})...")
+    tokenizer = AutoTokenizer.from_pretrained(str(ckpt_dir), trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+
+    cfg = AutoConfig.from_pretrained(str(ckpt_dir), trust_remote_code=True)
+    text_config = getattr(cfg, "text_config", cfg)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    _ensure_qwen4_exp_device_kernels(text_config, device)
+
+    shard_map, _ = _load_shard_map(ckpt_dir)
+    raw_cfg = json.loads((ckpt_dir / "config.json").read_text())
+    qcfg = raw_cfg.get("quantization_config", {})
+    g_size = qcfg.get("config_groups", {}).get("group_0", {}).get("weights", {}).get("group_size", 64)
+    tcfg = qcfg.get("transform_config", {}).get("config_groups", {})
+    had_size = tcfg.get("v", {}).get("head_dim", 0) if tcfg else 0
+    ple_g_size = qcfg.get("ple_quantization", {}).get("group_size", 32)
+
+    from datasets import load_dataset
+
+    good_train = list(load_dataset(args.good_dataset, split=f"train[:{n_train}]")["text"])
+    bad_train = list(load_dataset(args.bad_dataset, split=f"train[:{n_train}]")["text"])
+    try:
+        good_eval = list(load_dataset(args.good_dataset, split=f"test[:{n_eval}]")["text"])
+    except Exception:
+        good_eval = list(
+            load_dataset(args.good_dataset, split=f"train[{n_train}:{n_train + n_eval}]")["text"]
+        )
+    try:
+        bad_eval = list(load_dataset(args.bad_dataset, split=f"test[:{n_eval}]")["text"])
+    except Exception:
+        bad_eval = list(load_dataset(args.bad_dataset, split=f"train[{n_train}:{n_train + n_eval}]")["text"])
+    if not good_train or not bad_train or not good_eval or not bad_eval:
+        raise ValueError("Train and eval prompt splits must be non-empty")
+    n_good_train = len(good_train)
+    n_bad_train = len(bad_train)
+    n_good_eval = len(good_eval)
+    n_bad_eval = len(bad_eval)
+
+    all_prompts = good_train + bad_train + good_eval + bad_eval
+    idx_good_train = list(range(0, n_good_train))
+    idx_bad_train = list(range(n_good_train, n_good_train + n_bad_train))
+    idx_good_eval = list(range(n_good_train + n_bad_train, n_good_train + n_bad_train + n_good_eval))
+    idx_bad_eval = list(
+        range(
+            n_good_train + n_bad_train + n_good_eval,
+            n_good_train + n_bad_train + n_good_eval + n_bad_eval,
+        )
+    )
+
+    rendered_all = render_chat_prompts(tokenizer, all_prompts, enable_thinking=args.enable_thinking)
+    input_ids_list: list[torch.Tensor] = [
+        tokenizer(r, return_tensors="pt", add_special_tokens=False)["input_ids"] for r in rendered_all
+    ]
+
+    embed_raw = _load_top_level_module_tensors(ckpt_dir, shard_map, "model.language_model.embed_tokens.")
+    embed_w = embed_raw["model.language_model.embed_tokens.weight"].to(device=device, dtype=torch.bfloat16)
+    rotary = Qwen4ExpTextRotaryEmbedding(config=text_config).to(device)
+    hc_count = int(getattr(text_config, "hc_count", 4))
+    h_dim = int(text_config.hidden_size)
+    num_layers = int(text_config.num_hidden_layers)
+
+    h_list: list[torch.Tensor] = []
+    pos_emb_list: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for ids in input_ids_list:
+        ids_dev = ids.to(device)
+        inp_emb = F.embedding(ids_dev, embed_w)
+        seq_len = inp_emb.shape[1]
+        pos_ids = torch.arange(seq_len, device=device).view(1, 1, -1).expand(3, 1, -1)
+        cos, sin = rotary(inp_emb, pos_ids)
+        pos_emb_list.append((cos, sin))
+        h_list.append(inp_emb.repeat(1, 1, hc_count))
+        del ids_dev, inp_emb
+
+    del embed_w, embed_raw
+    torch.cuda.empty_cache()
+
+    seq_lens = [h.shape[1] for h in h_list]
+    last_tok_indices: list[int] = []
+    cur = 0
+    for slen in seq_lens:
+        last_tok_indices.append(cur + slen - 1)
+        cur += slen
+    last_tok_t = torch.tensor(last_tok_indices, dtype=torch.long, device=device)
+
+    H_all = torch.cat([h.squeeze(0) for h in h_list], dim=0)
+    del h_list
+    n_tot = H_all.shape[0]
+    tok_step = 8192
+
+    # Snapshot initial embeddings for Pass 2 eval (good_eval + bad_eval)
+    eval_start_seq = n_good_train + n_bad_train
+    eval_tok_start = sum(seq_lens[:eval_start_seq])
+    H_eval_init = H_all[eval_tok_start:].clone()
+    eval_seq_lens = seq_lens[eval_start_seq:]
+    eval_pos_emb_list = pos_emb_list[eval_start_seq:]
+    eval_last_tok_indices: list[int] = []
+    ecur = 0
+    for slen in eval_seq_lens:
+        eval_last_tok_indices.append(ecur + slen - 1)
+        ecur += slen
+    eval_last_tok_t = torch.tensor(eval_last_tok_indices, dtype=torch.long, device=device)
+
+    good_means_list: list[Tensor] = []
+    bad_means_list: list[Tensor] = []
+    target_weights: dict[int, dict[str, list[tuple[str, Tensor]]]] = {}
+    cached_eval_ple_embeds: dict[int, list[torch.Tensor]] = {}
+
+    def _winsorized_mean(s: Tensor) -> Tensor:
+        if 0.0 <= args.winsorization_quantile < 1.0:
+            thresh = torch.quantile(torch.abs(s), args.winsorization_quantile, dim=1, keepdim=True)
+            s = torch.clamp(s, -thresh, thresh)
+        return s.mean(dim=0).cpu()
+
+    def _record_layer_means(h_cur: Tensor) -> None:
+        h_last_raw = h_cur.index_select(0, last_tok_t).to(torch.float32)
+        h_last = h_last_raw.unflatten(-1, (hc_count, h_dim)).mean(dim=-2)
+        good_means_list.append(_winsorized_mean(h_last[idx_good_train]))
+        bad_means_list.append(_winsorized_mean(h_last[idx_bad_train]))
+
+    # Record initial embedding residual state (index 0)
+    _record_layer_means(H_all)
+
+    print(
+        f"[heretic-lora] Pass 1/2: Streaming {len(all_prompts)} prompts ({n_tot} tokens) across {num_layers} layers..."
+    )
+    with ThreadPoolExecutor(max_workers=1) as io_pool:
+        next_fut: Future | None = io_pool.submit(
+            _prefetch_layer_raw_tensors, "model.language_model.layers.0", ckpt_dir, shard_map
+        )
+        for l_idx in range(num_layers):
+            prefetched_raw = next_fut.result() if next_fut is not None else None
+            if l_idx + 1 < num_layers:
+                next_fut = io_pool.submit(
+                    _prefetch_layer_raw_tensors,
+                    f"model.language_model.layers.{l_idx + 1}",
+                    ckpt_dir,
+                    shard_map,
+                )
+            else:
+                next_fut = None
+
+            layer = _build_lightweight_decoder_layer(text_config, l_idx, device)
+            layer_prefix = f"model.language_model.layers.{l_idx}"
+            _load_decoder_layer_weights(
+                layer,
+                layer_prefix,
+                ckpt_dir,
+                shard_map,
+                device,
+                group_size=g_size,
+                hadamard_block_size=had_size,
+                prefetched_raw=prefetched_raw,
+            )
+            del prefetched_raw
+
+            # Extract unrotated BF16 target weights for LoRA SVD
+            comp_dict: dict[str, list[tuple[str, Tensor]]] = {}
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "o_proj"):
+                w_d = layer.self_attn.o_proj.weight.data
+                w_u = (
+                    _hadamard_rotate_last_dim(w_d, had_size, compute_dtype=torch.float32).to(torch.bfloat16)
+                    if had_size > 0
+                    else w_d
+                )
+                comp_dict["attn.o_proj"] = [(f"{layer_prefix}.self_attn.o_proj", w_u.cpu())]
+            elif hasattr(layer, "linear_attn") and hasattr(layer.linear_attn, "out_proj"):
+                w_d = layer.linear_attn.out_proj.weight.data
+                w_u = (
+                    _hadamard_rotate_last_dim(w_d, had_size, compute_dtype=torch.float32).to(torch.bfloat16)
+                    if had_size > 0
+                    else w_d
+                )
+                comp_dict["attn.o_proj"] = [(f"{layer_prefix}.linear_attn.out_proj", w_u.cpu())]
+
+            if hasattr(layer, "mlp") and hasattr(layer.mlp, "shared_expert"):
+                w_d = layer.mlp.shared_expert.down_proj.weight.data
+                w_u = (
+                    _hadamard_rotate_last_dim(w_d, had_size, compute_dtype=torch.float32).to(torch.bfloat16)
+                    if had_size > 0
+                    else w_d
+                )
+                comp_dict["mlp.down_proj"] = [(f"{layer_prefix}.mlp.shared_expert.down_proj", w_u.cpu())]
+            target_weights[l_idx] = comp_dict
+
+            if getattr(layer, "ple", None) is not None:
+                ple_embeds = stream_gather_ple_embeds(
+                    ckpt_dir, shard_map, layer.ple, l_idx, input_ids_list, ple_group_size=ple_g_size
+                )
+                cached_eval_ple_embeds[l_idx] = [pe.cpu() for pe in ple_embeds[eval_start_seq:]]
+                seq_cur = 0
+                for i, slen in enumerate(seq_lens):
+                    h_seq = H_all[seq_cur : seq_cur + slen].unsqueeze(0)
+                    ple_out = forward_ple_with_precomputed_embeds(layer.ple, h_seq, ple_embeds[i])
+                    H_all[seq_cur : seq_cur + slen] = (h_seq + ple_out).squeeze(0)
+                    seq_cur += slen
+                del ple_embeds
+
+            is_linear_attn = (
+                getattr(layer, "layer_type", getattr(layer, "block_type", "")) == "linear_attention"
+            )
+            branch_in_all = torch.empty((n_tot, h_dim), dtype=H_all.dtype, device=device)
+            inj_w_all = torch.empty((n_tot, hc_count), dtype=H_all.dtype, device=device)
+            for s0 in range(0, n_tot, tok_step):
+                s1 = min(s0 + tok_step, n_tot)
+                b_in, hyp_in, iw = layer.attn_hyper_connection(H_all[s0:s1].unsqueeze(0))
+                branch_in_all[s0:s1] = b_in.squeeze(0)
+                H_all[s0:s1] = hyp_in.squeeze(0)
+                inj_w_all[s0:s1] = iw.squeeze(0)
+
+            attn_out_all = torch.empty((n_tot, h_dim), dtype=H_all.dtype, device=device)
+            seq_cur = 0
+            for i, slen in enumerate(seq_lens):
+                b_seq = branch_in_all[seq_cur : seq_cur + slen].unsqueeze(0)
+                if is_linear_attn:
+                    a_out = layer.linear_attn(b_seq)
+                else:
+                    a_out = _forward_qsa_attention_fast(layer.self_attn, b_seq, pos_emb_list[i])
+                attn_out_all[seq_cur : seq_cur + slen] = a_out.squeeze(0)
+                seq_cur += slen
+            del branch_in_all
+
+            for s0 in range(0, n_tot, tok_step):
+                s1 = min(s0 + tok_step, n_tot)
+                h_post_a = H_all[s0:s1] + (
+                    attn_out_all[s0:s1].unsqueeze(-2) * inj_w_all[s0:s1].unsqueeze(-1)
+                ).flatten(-2)
+                m_in, hyp_m, iw_m = layer.mlp_hyper_connection(h_post_a.unsqueeze(0))
+                m_out = layer.mlp(m_in).squeeze(0)
+                H_all[s0:s1] = hyp_m.squeeze(0) + (
+                    m_out.unsqueeze(-2) * iw_m.squeeze(0).unsqueeze(-1)
+                ).flatten(-2)
+                del h_post_a, m_in, hyp_m, iw_m, m_out
+            del attn_out_all, inj_w_all, layer
+            _record_layer_means(H_all)
+            if (l_idx + 1) % 8 == 0 or l_idx == 0 or (l_idx + 1) == num_layers:
+                print(f"  [pass 1] layer {l_idx + 1}/{num_layers} complete ({time.time() - t0:.1f}s)")
+
+    # Final mixer + norm + lm_head for baseline
+    mixer = (
+        Qwen4ExpTextGatedResidual(text_config, use_combine=False)
+        .to(device=device, dtype=torch.bfloat16)
+        .eval()
+    )
+    mixer_raw = _load_top_level_module_tensors(
+        ckpt_dir, shard_map, "model.language_model.hyper_connection_mixer."
+    )
+    mixer_sd = {
+        k.removeprefix("model.language_model.hyper_connection_mixer."): v.to(
+            device=device, dtype=torch.bfloat16
+        )
+        for k, v in mixer_raw.items()
+    }
+    mixer.load_state_dict(mixer_sd, strict=True)
+    del mixer_raw, mixer_sd
+    lm_raw = _load_top_level_module_tensors(ckpt_dir, shard_map, "lm_head.")
+    if "lm_head.weight" in lm_raw:
+        lm_w = lm_raw["lm_head.weight"].to(device=device, dtype=torch.bfloat16)
+    elif "lm_head.weight_packed" in lm_raw:
+        from warp_quant.hadamard_gptq import _decompress_packed_2d
+
+        lm_w = _decompress_packed_2d(
+            lm_raw["lm_head.weight_packed"].to(device),
+            lm_raw["lm_head.weight_scale"].to(device),
+            lm_raw["lm_head.weight_shape"],
+        ).to(device=device, dtype=torch.bfloat16)
+    else:
+        emb_raw = _load_top_level_module_tensors(ckpt_dir, shard_map, "model.language_model.embed_tokens.")
+        lm_w = emb_raw["model.language_model.embed_tokens.weight"].to(device=device, dtype=torch.bfloat16)
+    del lm_raw
+
+    h_final_last = mixer(H_all.index_select(0, last_tok_t).unsqueeze(0)).squeeze(0)
+    base_good_logits = F.linear(h_final_last[idx_good_eval], lm_w).float().cpu()
+    base_bad_final = h_final_last[idx_bad_eval].float().cpu()
+    base_good_final = h_final_last[idx_good_train].float().cpu()
+    del H_all, h_final_last
+    torch.cuda.empty_cache()
+
+    good_means = torch.stack(good_means_list, dim=0).to(device)
+    bad_means = torch.stack(bad_means_list, dim=0).to(device)
+    residual_directions = compute_orthogonal_refusal_directions(
+        good_means, bad_means, orthogonalize_direction=args.orthogonalize_direction
+    )
+
+    # Calibrate final-layer refusal projection threshold against baseline bad vs good separation
+    v_final = F.normalize(base_bad_final.mean(dim=0) - base_good_final.mean(dim=0), p=2, dim=-1)
+    good_proj = base_good_final @ v_final
+    bad_proj = base_bad_final @ v_final
+    refusal_proj_thresh = float(torch.quantile(good_proj, 0.96).item())
+    base_refusals = int((bad_proj > refusal_proj_thresh).sum().item())
+    print(f"[heretic-lora] Baseline refusals on Flash-Next: {base_refusals}/{n_eval}")
+
+    components = ["attn.o_proj", "mlp.down_proj"]
+    rng = random.Random(args.seed)
+    n_trials = max(1, int(args.trials))
+    trial_params_list: list[AbliterationParameters] = [
+        sample_trial_parameters(rng, num_layers, components, t_idx) for t_idx in range(n_trials)
+    ]
+
+    # Precompute LoRA deltas per trial per layer
+    print(f"[heretic-lora] Computing rank-{lora_rank} SVD LoRA factors for {n_trials} trials...")
+    trial_deltas: list[dict[str, tuple[Tensor, Tensor]]] = [{} for _ in range(n_trials)]
+    for l_idx in range(num_layers):
+        for t_idx, params in enumerate(trial_params_list):
+            v = interpolate_direction(residual_directions, params.direction_index, l_idx)
+            for comp, entries in target_weights[l_idx].items():
+                dist = params.weight_distributions.get(comp)
+                if dist is None:
+                    continue
+                w = compute_layer_weight(dist, l_idx)
+                if w <= 0.0:
+                    continue
+                for full_name, w_cpu in entries:
+                    la, lb = compute_lora_factors(
+                        w_cpu.to(device),
+                        v,
+                        w,
+                        row_normalization=row_norm,
+                        lora_rank=lora_rank,
+                        seed=args.seed,
+                    )
+                    trial_deltas[t_idx][full_name] = (la.cpu(), lb.cpu())
+
+    # Pass 2: Stream 200 eval prompts across all trials in a single 48-layer pass
+    n_eval_tok = H_eval_init.shape[0]
+    H_trials = [H_eval_init.clone() for _ in range(n_trials)]
+    del H_eval_init
+
+    print(f"[heretic-lora] Pass 2/2: Streaming {n_trials} trials across {num_layers} layers...")
+    with ThreadPoolExecutor(max_workers=1) as io_pool:
+        next_fut = io_pool.submit(
+            _prefetch_layer_raw_tensors, "model.language_model.layers.0", ckpt_dir, shard_map
+        )
+        for l_idx in range(num_layers):
+            prefetched_raw = next_fut.result() if next_fut is not None else None
+            if l_idx + 1 < num_layers:
+                next_fut = io_pool.submit(
+                    _prefetch_layer_raw_tensors,
+                    f"model.language_model.layers.{l_idx + 1}",
+                    ckpt_dir,
+                    shard_map,
+                )
+            else:
+                next_fut = None
+
+            layer = _build_lightweight_decoder_layer(text_config, l_idx, device)
+            layer_prefix = f"model.language_model.layers.{l_idx}"
+            _load_decoder_layer_weights(
+                layer,
+                layer_prefix,
+                ckpt_dir,
+                shard_map,
+                device,
+                group_size=g_size,
+                hadamard_block_size=had_size,
+                prefetched_raw=prefetched_raw,
+            )
+            del prefetched_raw
+
+            ple_eval = (
+                [pe.to(device) for pe in cached_eval_ple_embeds[l_idx]]
+                if l_idx in cached_eval_ple_embeds
+                else None
+            )
+            is_linear_attn = (
+                getattr(layer, "layer_type", getattr(layer, "block_type", "")) == "linear_attention"
+            )
+            attn_proj_mod = (
+                layer.self_attn.o_proj
+                if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "o_proj")
+                else layer.linear_attn.out_proj
+            )
+            attn_proj_name = (
+                f"{layer_prefix}.self_attn.o_proj"
+                if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "o_proj")
+                else f"{layer_prefix}.linear_attn.out_proj"
+            )
+            mlp_proj_mod = layer.mlp.shared_expert.down_proj
+            mlp_proj_name = f"{layer_prefix}.mlp.shared_expert.down_proj"
+
+            # Attach dynamic unrotated LoRA hooks (inserted BEFORE Hadamard pre-hook by capturing unrotated input)
+            active_pair: dict[str, tuple[Tensor, Tensor]] = {}
+
+            def _make_unrot_hook(
+                key: str,
+                pairs: dict[str, tuple[Tensor, Tensor]] = active_pair,
+            ):
+                captured: list[Tensor] = []
+
+                def _pre(_m, args):
+                    if key in pairs:
+                        captured.append(args[0])
+
+                def _post(_m, _args, output):
+                    if key not in pairs or not captured:
+                        return output
+                    x_unrot = captured.pop(0)
+                    la, lb = pairs[key]
+                    if isinstance(output, tuple):
+                        y = output[0]
+                        d = F.linear(F.linear(x_unrot.to(la.dtype), la), lb).to(y.dtype)
+                        return (y + d, *output[1:])
+                    d = F.linear(F.linear(x_unrot.to(la.dtype), la), lb).to(output.dtype)
+                    return output + d
+
+                return _pre, _post
+
+            pre_a, post_a = _make_unrot_hook(attn_proj_name)
+            pre_m, post_m = _make_unrot_hook(mlp_proj_name)
+            # Prepend pre-hooks so they run BEFORE the online Hadamard pre-hook registered by _load_decoder_layer_weights
+            h1 = attn_proj_mod.register_forward_pre_hook(pre_a, prepend=True)
+            h2 = attn_proj_mod.register_forward_hook(post_a)
+            h3 = mlp_proj_mod.register_forward_pre_hook(pre_m, prepend=True)
+            h4 = mlp_proj_mod.register_forward_hook(post_m)
+
+            try:
+                for t_idx in range(n_trials):
+                    active_pair.clear()
+                    for k_name in (attn_proj_name, mlp_proj_name):
+                        if k_name in trial_deltas[t_idx]:
+                            la_c, lb_c = trial_deltas[t_idx][k_name]
+                            active_pair[k_name] = (
+                                la_c.to(device=device, dtype=torch.bfloat16),
+                                lb_c.to(device=device, dtype=torch.bfloat16),
+                            )
+
+                    H_cur = H_trials[t_idx]
+                    if ple_eval is not None:
+                        seq_cur = 0
+                        for i, slen in enumerate(eval_seq_lens):
+                            h_seq = H_cur[seq_cur : seq_cur + slen].unsqueeze(0)
+                            ple_out = forward_ple_with_precomputed_embeds(layer.ple, h_seq, ple_eval[i])
+                            H_cur[seq_cur : seq_cur + slen] = (h_seq + ple_out).squeeze(0)
+                            seq_cur += slen
+
+                    b_in, hyp_in, iw = layer.attn_hyper_connection(H_cur.unsqueeze(0))
+                    b_in = b_in.squeeze(0)
+                    H_cur.copy_(hyp_in.squeeze(0))
+                    iw = iw.squeeze(0)
+
+                    attn_out = torch.empty((n_eval_tok, h_dim), dtype=H_cur.dtype, device=device)
+                    seq_cur = 0
+                    for i, slen in enumerate(eval_seq_lens):
+                        b_seq = b_in[seq_cur : seq_cur + slen].unsqueeze(0)
+                        if is_linear_attn:
+                            a_out = layer.linear_attn(b_seq)
+                        else:
+                            a_out = _forward_qsa_attention_fast(layer.self_attn, b_seq, eval_pos_emb_list[i])
+                        attn_out[seq_cur : seq_cur + slen] = a_out.squeeze(0)
+                        seq_cur += slen
+
+                    h_post_a = H_cur + (attn_out.unsqueeze(-2) * iw.unsqueeze(-1)).flatten(-2)
+                    m_in, hyp_m, iw_m = layer.mlp_hyper_connection(h_post_a.unsqueeze(0))
+                    m_out = layer.mlp(m_in).squeeze(0)
+                    H_cur.copy_(
+                        hyp_m.squeeze(0) + (m_out.unsqueeze(-2) * iw_m.squeeze(0).unsqueeze(-1)).flatten(-2)
+                    )
+            finally:
+                h1.remove()
+                h2.remove()
+                h3.remove()
+                h4.remove()
+                del ple_eval, layer
+
+            if (l_idx + 1) % 8 == 0 or l_idx == 0 or (l_idx + 1) == num_layers:
+                print(f"  [pass 2] layer {l_idx + 1}/{num_layers} complete ({time.time() - t0:.1f}s)")
+
+    trial_records: list[dict[str, Any]] = []
+    best_idx: int | None = None
+    best_score = float("inf")
+    fallback_best_idx = 0
+    fallback_best_score = float("inf")
+
+    for t_idx, params in enumerate(trial_params_list):
+        h_last_t = mixer(H_trials[t_idx].index_select(0, eval_last_tok_t).unsqueeze(0)).squeeze(0)
+        mod_good_logits = F.linear(h_last_t[:n_good_eval], lm_w).float().cpu()
+        mod_bad_final = h_last_t[n_good_eval:].float().cpu()
+        kl_div = compute_kl_divergence(base_good_logits, mod_good_logits)
+        mod_bad_proj = mod_bad_final @ v_final
+        refusals = int((mod_bad_proj > refusal_proj_thresh).sum().item())
+        refusal_rate = refusals / max(1, n_bad_eval)
+        score = refusal_rate * 10.0 + kl_div * 4.0
+        rec = {
+            "trial": t_idx,
+            "refusals": refusals,
+            "total_eval": n_bad_eval,
+            "refusal_rate": refusal_rate,
+            "kl_divergence": kl_div,
+            "score": score,
+            "parameters": params.to_dict(),
+            "sample_response": "",
+        }
+        trial_records.append(rec)
+        print(
+            f"  [trial {t_idx + 1}/{n_trials}] refusals={refusals}/{n_bad_eval} "
+            f"({refusal_rate:.1%})  kl_div={kl_div:.4f}  score={score:.4f}"
+        )
+        if score < fallback_best_score:
+            fallback_best_score = score
+            fallback_best_idx = t_idx
+        if score < best_score and kl_div <= 0.45:
+            best_score = score
+            best_idx = t_idx
+
+    if best_idx is None:
+        best_idx = fallback_best_idx
+
+    pareto_trials = compute_pareto_front(trial_records)
+    print(f"\n[heretic-lora] Pareto front ({len(pareto_trials)} non-dominated trial(s)):")
+    for p_idx, p_rec in enumerate(pareto_trials):
+        t_i = int(p_rec["trial"])
+        sub_name = f"trial_{t_i:03d}_ref{p_rec['refusals']}_kl{p_rec['kl_divergence']:.4f}"
+        pareto_dir = output_dir / "pareto" / sub_name
+        save_peft_lora_adapter(
+            pareto_dir,
+            trial_deltas[t_i],
+            base_model_name_or_path=hub_id,
+            lora_rank=lora_rank,
+            summary=p_rec,
+        )
+        p_rec["pareto_dir"] = str(pareto_dir)
+        print(
+            f"  [Pareto {p_idx}] Trial {t_i} -> refusals={p_rec['refusals']}/{p_rec['total_eval']} "
+            f"({p_rec['refusal_rate']:.1%}), KL={p_rec['kl_divergence']:.4f} -> {pareto_dir}"
+        )
+
+    best_record = trial_records[best_idx]
+    best_deltas = trial_deltas[best_idx]
+    elapsed = time.time() - t0
+    summary = {
+        "model": hub_id,
+        "quant_repo": info.get("quant_repo"),
+        "row_normalization": str(row_norm),
+        "orthogonalize_direction": args.orthogonalize_direction,
+        "lora_rank": lora_rank,
+        "num_layers": num_layers,
+        "num_target_modules": len(best_deltas),
+        "baseline_refusals": base_refusals,
+        "eval_prompts": n_eval,
+        "best_trial": best_record,
+        "pareto_trials": pareto_trials,
+        "trials": trial_records,
+        "elapsed_sec": round(elapsed, 2),
+    }
+    save_peft_lora_adapter(
+        output_dir,
+        best_deltas,
+        base_model_name_or_path=hub_id,
+        lora_rank=lora_rank,
+        summary=summary,
+    )
+    print(
+        f"[heretic-lora] Saved adapter ({len(best_deltas)} modules, r={lora_rank}) to {output_dir} "
+        f"(refusals: {base_refusals}/{n_eval} -> {best_record['refusals']}/{n_eval}, "
+        f"KL={best_record['kl_divergence']:.4f})"
+    )
+    run_done(
+        output_dir=str(output_dir),
+        baseline_refusals=base_refusals,
+        abliterated_refusals=best_record["refusals"],
+        kl_divergence=best_record["kl_divergence"],
+    )
+    return summary
 
 
 def run_heretic_lora(args: argparse.Namespace) -> dict[str, Any]:
@@ -781,14 +1530,19 @@ def run_heretic_lora(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"--lora-rank must be >= 1, got {args.lora_rank}")
     if int(args.eval_max_tokens) < 1:
         raise ValueError(f"--eval-max-tokens must be >= 1, got {args.eval_max_tokens}")
+    if int(args.trials) < 1 or int(args.trials) > 64:
+        raise ValueError(f"--trials must be between 1 and 64, got {args.trials}")
 
     hub_id, info = resolve(args.model)
-    local_dir = resolve_snapshot(hub_id, revision=info.get("hub_revision"))
-    model_path = str(local_dir) if local_dir is not None else hub_id
-
     output_dir = Path(args.output_dir)
     row_norm = RowNormalization(args.row_normalization)
     lora_rank = 1 if row_norm != RowNormalization.FULL else int(args.lora_rank)
+
+    if args.model in ("flash-next", "Qwen/Qwen3.8-Flash-Next"):
+        return _run_heretic_lora_streaming_qwen4_exp(args, hub_id, info, output_dir, row_norm, lora_rank)
+
+    local_dir = resolve_snapshot(hub_id, revision=info.get("hub_revision"))
+    model_path = str(local_dir) if local_dir is not None else hub_id
 
     log_event(
         "HERETIC_LORA_START",
@@ -821,6 +1575,8 @@ def run_heretic_lora(args: argparse.Namespace) -> dict[str, Any]:
     print(
         f"[heretic-lora] Found {num_layers} layers, {total_linears} target Linear modules across components {components}"
     )
+
+    from datasets import load_dataset
 
     good_train = list(load_dataset(args.good_dataset, split=f"train[:{n_train}]")["text"])
     bad_train = list(load_dataset(args.bad_dataset, split=f"train[:{n_train}]")["text"])

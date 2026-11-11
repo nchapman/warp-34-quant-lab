@@ -232,9 +232,17 @@ def test_cli_heretic_lora_parser_and_presets() -> None:
     assert args.trials == 8
 
     rng = random.Random(42)
-    for idx in range(8):
+    for idx in range(18):
         p = sample_trial_parameters(rng, 32, ["attn.o_proj", "mlp.down_proj"], idx)
         assert set(p.weight_distributions.keys()) == {"attn.o_proj", "mlp.down_proj"}
+
+    bad_trials = parser.parse_args(
+        ["heretic-lora", "--model", "9b", "--output-dir", "/tmp/out", "--trials", "100"]
+    )
+    from warp_quant.heretic_lora import run_heretic_lora
+
+    with pytest.raises(ValueError, match="--trials must be between 1 and 64"):
+        run_heretic_lora(bad_trials)
 
     with pytest.raises(ValueError, match="prompts must not be empty"):
         get_last_token_logits(nn.Linear(4, 4), None, [])

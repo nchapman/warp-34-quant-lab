@@ -99,6 +99,7 @@ rssh "bash -se" "$REMOTE_DIR" <<'REMOTE'
 set -euo pipefail
 export PATH="$HOME/.local/bin:/root/.local/bin:$PATH"
 cd "$1"
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
 uv run --no-sync pytest -q
 .venv/bin/python - <<'PY'
 import torch
