@@ -1,0 +1,27 @@
+{
+  "model": "d3-nano",
+  "base_snapshot": "8198c9f763b046605b2f4827b4999971fa2c92c4",
+  "group_size": 64,
+  "hadamard_block_size": 64,
+  "actorder": "static",
+  "dampening_frac": 0.01,
+  "quantize_mtp": false,
+  "quantize_vision": true,
+  "attention_mode": "noncausal_full_attention",
+  "midloop_blocks": [],
+  "midloop_passes": 1,
+  "shard_counts": {
+    "stripped_transform_weights": 0,
+    "text_quantized": 150,
+    "mtp_quantized": 0,
+    "mtp_fc_w8": 0,
+    "lm_head_w8": 0,
+    "vision_quantized": 98,
+    "vision_fc2_channel": 0
+  },
+  "calib": "data/calib-cascade-v1.jsonl",
+  "num_samples": 999,
+  "max_seq_length": 4096,
+  "quant_wall_s": 1944.28,
+  "template_sha": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80"
+}

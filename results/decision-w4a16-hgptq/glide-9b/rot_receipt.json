@@ -1,0 +1,36 @@
+{
+  "model": "glide-9b",
+  "base_snapshot": "ab54df5acba0eebf7df45560ffdaacd64e32df3b",
+  "group_size": 64,
+  "hadamard_block_size": 64,
+  "actorder": "static",
+  "dampening_frac": 0.01,
+  "quantize_mtp": false,
+  "quantize_vision": false,
+  "attention_mode": "noncausal_full_attention",
+  "midloop_blocks": [
+    [
+      12,
+      17
+    ],
+    [
+      18,
+      23
+    ]
+  ],
+  "midloop_passes": 2,
+  "shard_counts": {
+    "stripped_transform_weights": 0,
+    "text_quantized": 200,
+    "mtp_quantized": 0,
+    "mtp_fc_w8": 0,
+    "lm_head_w8": 0,
+    "vision_quantized": 0,
+    "vision_fc2_channel": 0
+  },
+  "calib": "data/calib-cascade-v1.jsonl",
+  "num_samples": 999,
+  "max_seq_length": 4096,
+  "quant_wall_s": 948.23,
+  "template_sha": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+}

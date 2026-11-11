@@ -1,0 +1,27 @@
+{
+  "model": "d3",
+  "base_snapshot": "62f07e54c6c3a5ff5f695107377edc43e1a86ea8",
+  "group_size": 64,
+  "hadamard_block_size": 64,
+  "actorder": "static",
+  "dampening_frac": 0.01,
+  "quantize_mtp": false,
+  "quantize_vision": true,
+  "attention_mode": "noncausal_full_attention",
+  "midloop_blocks": [],
+  "midloop_passes": 1,
+  "shard_counts": {
+    "stripped_transform_weights": 0,
+    "text_quantized": 400,
+    "mtp_quantized": 0,
+    "mtp_fc_w8": 0,
+    "lm_head_w8": 0,
+    "vision_quantized": 110,
+    "vision_fc2_channel": 27
+  },
+  "calib": "data/calib-cascade-v1.jsonl",
+  "num_samples": 999,
+  "max_seq_length": 4096,
+  "quant_wall_s": 2306.18,
+  "template_sha": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+}

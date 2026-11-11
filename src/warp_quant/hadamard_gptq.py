@@ -294,33 +294,48 @@ def _gptq_pack_tensor(
     zp = torch.zeros_like(scale, dtype=torch.int32)
     norm_h = (hessian / num_samples.clamp(min=1).to(hessian.device)).to(torch.float32).contiguous()
 
-    q_w_batch, _losses, used_rtn = quantize_weight(
-        weights=w_f32.clone().unsqueeze(0),
-        hessians=norm_h.clone().unsqueeze(0),
-        scale=scale.unsqueeze(0),
-        zero_point=zp.unsqueeze(0),
-        global_scale=None,
-        quant_args=qargs,
-        blocksize=128,
-        percdamp=dampening_frac,
-    )
-    if used_rtn[0].item():
-        raise RuntimeError("GPTQ fell back to RTN during component quantization")
-    q_w = q_w_batch[0]
-    scale_exp = scale.float().repeat_interleave(eff_gs, dim=1)
-    codes = torch.clamp(torch.round(q_w.float() / scale_exp), qmin, qmax).to(torch.int8)
-    eff_cd = (2 if num_bits == 4 else (4 if num_bits == 2 else 0)) if cd_passes is None else cd_passes
-    if eff_cd > 0:
-        codes, scale = refine_hessian_cd(
-            w_f32,
-            norm_h,
-            codes,
-            scale,
-            num_bits,
-            eff_gs,
-            passes=eff_cd,
-            dampening_frac=dampening_frac,
-        )
+    prev_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        for damp in (dampening_frac, max(dampening_frac * 2.5, 0.025), max(dampening_frac * 5.0, 0.05), 0.1):
+            q_w_batch, _losses, used_rtn = quantize_weight(
+                weights=w_f32.clone().unsqueeze(0),
+                hessians=norm_h.clone().unsqueeze(0),
+                scale=scale.unsqueeze(0),
+                zero_point=zp.unsqueeze(0),
+                global_scale=None,
+                quant_args=qargs,
+                blocksize=128,
+                percdamp=damp,
+            )
+            if not used_rtn[0].item():
+                break
+        if used_rtn[0].item():
+            raise RuntimeError("GPTQ fell back to RTN during component quantization")
+        q_w = q_w_batch[0]
+        if (
+            torch.isnan(q_w).any()
+            or torch.isinf(q_w).any()
+            or torch.isnan(scale).any()
+            or torch.isinf(scale).any()
+        ):
+            raise RuntimeError("GPTQ produced NaN/Inf weights or scales")
+        scale_exp = scale.float().repeat_interleave(eff_gs, dim=1)
+        codes = torch.clamp(torch.round(q_w.float() / scale_exp), qmin, qmax).to(torch.int8)
+        eff_cd = (2 if num_bits == 4 else (4 if num_bits == 2 else 0)) if cd_passes is None else cd_passes
+        if eff_cd > 0:
+            codes, scale = refine_hessian_cd(
+                w_f32,
+                norm_h,
+                codes,
+                scale,
+                num_bits,
+                eff_gs,
+                passes=eff_cd,
+                dampening_frac=dampening_frac,
+            )
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev_tf32
     return {k: v.contiguous().cpu() for k, v in pack_candidate(codes, scale, num_bits).items()}
 
 
@@ -986,6 +1001,11 @@ def run_quantize(args: argparse.Namespace) -> None:
         hub_id = resolve_snapshot(hub_id, revision=info.get("hub_revision"))
         if not list(Path(hub_id).glob("*.safetensors")):
             raise RuntimeError(f"Base snapshot {hub_id} has no .safetensors shards")
+
+    from warp_quant.decision import is_code_readout_checkpoint, run_quantize_decision
+
+    if is_code_readout_checkpoint(hub_id):
+        return run_quantize_decision(args)
 
     cls_name = model_class(hub_id).__name__
     if cls_name.startswith("Qwen4Exp") or cls_name == "Qwen3_5MoeForConditionalGeneration":
@@ -1964,6 +1984,15 @@ def run_probe(args: argparse.Namespace) -> None:
         if Path(hub_id).exists()
         else Path(resolve_snapshot(hub_id, revision=info.get("hub_revision")))
     )
+    from warp_quant.decision import is_code_readout_checkpoint, run_probe_decision
+
+    if is_code_readout_checkpoint(base_dir):
+        for qd in quant_dirs:
+            sub_args = copy.copy(args)
+            sub_args.quant = str(qd)
+            run_probe_decision(sub_args)
+        return
+
     cls_name = model_class(str(base_dir)).__name__
     if cls_name.startswith("Qwen4Exp") or cls_name == "Qwen3_5MoeForConditionalGeneration":
         from warp_quant.streaming_moe import run_probe_qwen4_exp

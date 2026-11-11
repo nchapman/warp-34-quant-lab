@@ -1,0 +1,11 @@
+{
+  "decision_probe": {
+    "num_questions": 12,
+    "decision_top1_agree": 1.0,
+    "mean_option_kl": 0.000421,
+    "max_option_kl": 0.00405,
+    "mean_code255_kl": 0.002742,
+    "readout_logit_cos_sim": 0.998195,
+    "elapsed_s": 3.15
+  }
+}

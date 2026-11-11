@@ -1,0 +1,29 @@
+{
+  "decision_probe": {
+    "num_questions": 12,
+    "decision_top1_agree": 1.0,
+    "mean_option_kl": 0.000113,
+    "max_option_kl": 0.000943,
+    "mean_code255_kl": 0.000202,
+    "readout_logit_cos_sim": 0.999841,
+    "elapsed_s": 196.99
+  },
+  "vision": {
+    "manifest": "data/vision-probe-v2/manifest.json",
+    "num_images": 96,
+    "total_visual_tokens": 50596,
+    "mean_visual_token_cos_sim": 0.983215,
+    "min_visual_token_cos_sim": 0.941786,
+    "mean_visual_token_rel_l2": 0.177302,
+    "elapsed_s": 62.29
+  },
+  "vision_guard": {
+    "manifest": "data/vision-guard-v2/manifest.json",
+    "num_images": 48,
+    "total_visual_tokens": 33844,
+    "mean_visual_token_cos_sim": 0.985773,
+    "min_visual_token_cos_sim": 0.974843,
+    "mean_visual_token_rel_l2": 0.16653,
+    "elapsed_s": 32.19
+  }
+}
