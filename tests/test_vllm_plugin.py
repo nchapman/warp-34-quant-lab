@@ -297,21 +297,32 @@ def test_patch_qwen4_exp_ple_lut4_end_to_end_with_stub_vllm(monkeypatch: pytest.
     qmethod = FakePLEMethod.from_quant_config(None, hf_cfg)
     assert isinstance(qmethod, CustomLut4PLEMethod)
 
+    qcfg_lut4 = types.SimpleNamespace(ple_quantization={"format": "lut4-gptq", "group_size": 32})
+    qmethod_from_qcfg = FakePLEMethod.from_quant_config(qcfg_lut4, types.SimpleNamespace())
+    assert isinstance(qmethod_from_qcfg, CustomLut4PLEMethod)
+
     backend = FakePinnedHostEmbedding(qmethod, 160)
     ngram = FakeNGramEmbedding(backend, num_shards=1, dim_per_shard=160)
 
     w_packed = torch.randint(0, 256, (16, 80), dtype=torch.uint8)
     w_scale = (torch.randn(16, 5, dtype=torch.float16).abs() + 0.05).contiguous()
     w_lut = torch.linspace(-0.5, 0.5, 16, dtype=torch.bfloat16)
+    w_shape = torch.tensor([16, 160], dtype=torch.int64)
 
     loaded = ngram.load_weights(
         [
             ("shard_0.weight_packed", w_packed),
             ("shard_0.weight_scale", w_scale),
             ("shard_0.weight_lut", w_lut),
+            ("shard_0.weight_shape", w_shape),
         ]
     )
-    assert loaded == {"shard_0.weight_packed", "shard_0.weight_scale", "shard_0.weight_lut"}
+    assert loaded == {
+        "shard_0.weight_packed",
+        "shard_0.weight_scale",
+        "shard_0.weight_lut",
+        "shard_0.weight_shape",
+    }
     flat_ids = torch.tensor([1, 4, 7], dtype=torch.long)
     valid_mask = torch.tensor([True, False, True])
     out = backend.forward_SingleShard(0, flat_ids, valid_mask)

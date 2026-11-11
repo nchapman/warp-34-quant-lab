@@ -99,7 +99,7 @@ QWEN4_EXP_EXTRA_IGNORE: list[str] = [
     r"re:.*hyper_connection.*",
     r"re:.*self_attn\.indexer\..*",
     r"re:.*ple\.(key_proj|value_proj)$",
-    r"re:^mtp\.fc_.*",
+    r"re:.*mtp\.fc_.*",
 ]
 
 QWEN4_EXP_IGNORE: list[str] = list(BASE_IGNORE) + QWEN4_EXP_EXTRA_IGNORE
@@ -2723,7 +2723,7 @@ def _write_qwen4_exp_quant_config(
         "version": "0.14.0",
     }
     if not is_qwen35_moe and ple_group_size > 0:
-        qcfg_dict["ple_quantization"] = {
+        ple_qcfg = {
             "cd_passes": ple_cd_passes,
             "format": "lut4-gptq",
             "group_size": ple_group_size,
@@ -2733,6 +2733,9 @@ def _write_qwen4_exp_quant_config(
             "scale_dtype": "float16",
             "targets": ["model.language_model.layers.*.ple.ple_embedding.ngram_embedding.shard_*"],
         }
+        qcfg_dict["ple_quantization"] = ple_qcfg
+        if isinstance(cfg.get("text_config"), dict):
+            cfg["text_config"]["ple_quantization"] = dict(ple_qcfg)
     cfg["quantization_config"] = qcfg_dict
     (save_dir / "config.json").write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
 

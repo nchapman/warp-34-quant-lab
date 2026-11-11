@@ -452,6 +452,35 @@ def _patch_ct_moe_transform() -> None:
 
         return _extract_head_dim(gate_tfms), _extract_head_dim(down_tfms)
 
+    orig_from_config = getattr(CompressedTensorsConfig, "from_config", None)
+    if orig_from_config is not None and not getattr(
+        CompressedTensorsConfig, "_warp_quant_from_config_patched", False
+    ):
+
+        def _unanchor_re(val: Any) -> Any:
+            if isinstance(val, str):
+                if val.startswith("re:^layers\\."):
+                    return "re:.*(?<!mtp\\.)" + val[4:]
+                if val.startswith("re:^mtp\\."):
+                    return "re:.*" + val[4:]
+                return val
+            if isinstance(val, list):
+                return [_unanchor_re(x) for x in val]
+            if isinstance(val, dict):
+                return {k: _unanchor_re(v) for k, v in val.items()}
+            return val
+
+        @classmethod
+        def _from_config(cls: Any, config: dict[str, Any]) -> Any:
+            norm_cfg = _unanchor_re(config)
+            instance = orig_from_config(norm_cfg)
+            if isinstance(config, dict) and "ple_quantization" in config:
+                instance.ple_quantization = config["ple_quantization"]
+            return instance
+
+        CompressedTensorsConfig.from_config = _from_config
+        CompressedTensorsConfig._warp_quant_from_config_patched = True
+
     orig_get_quant_method = CompressedTensorsConfig.get_quant_method
 
     def _get_moe_experts_obj(layer: torch.nn.Module) -> Any:
@@ -964,8 +993,13 @@ def _patch_qwen4_exp_ple_lut4() -> None:
         quant_config: Any,
         hf_text_config: Any = None,
     ) -> Qwen4ExpPLEEmbeddingMethod:
-        ple_cfg = getattr(hf_text_config, "ple_quantization", None)
-        if isinstance(ple_cfg, dict) and ple_cfg.get("format") == "custom_lut4_g32_fp16scale":
+        ple_cfg = getattr(hf_text_config, "ple_quantization", None) or getattr(
+            quant_config, "ple_quantization", None
+        )
+        if isinstance(ple_cfg, dict) and ple_cfg.get("format") in (
+            "custom_lut4_g32_fp16scale",
+            "lut4-gptq",
+        ):
             return Qwen4ExpPLECustomLut4EmbeddingMethod(group_size=int(ple_cfg.get("group_size", 32)))
         return orig_from_quant_config(quant_config, hf_text_config)
 
