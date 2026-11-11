@@ -238,6 +238,46 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allocation names to assemble into checkpoints (or 'all' for all solved allocations)",
     )
 
+    h = sub.add_parser(
+        "heretic-lora",
+        help="Extract an unrotated BF16 Heretic abliteration LoRA adapter (MPOA / Projected Abliteration) for vLLM & PEFT",
+    )
+    h.add_argument("--model", default="9b", help="Model key from `warp-quant list-models` or HF repo/path")
+    h.add_argument("--output-dir", required=True, help="Destination directory for PEFT LoRA adapter")
+    h.add_argument(
+        "--row-normalization",
+        choices=["none", "pre", "full"],
+        default="full",
+        help="Heretic row normalization mode: 'none' (r=1), 'pre' (r=1), or 'full' (MPOA SVD, default r=3)",
+    )
+    h.add_argument("--lora-rank", type=int, default=3, help="LoRA rank when --row-normalization=full")
+    h.add_argument(
+        "--orthogonalize-direction",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Project refusal direction orthogonal to harmless residual mean (Projected Abliteration)",
+    )
+    h.add_argument("--winsorization-quantile", type=float, default=1.0)
+    h.add_argument("--good-dataset", default="mlabonne/harmless_alpaca")
+    h.add_argument("--bad-dataset", default="mlabonne/harmful_behaviors")
+    h.add_argument(
+        "--num-prompts", type=int, default=128, help="Number of good/bad prompts for direction extraction"
+    )
+    h.add_argument(
+        "--eval-prompts", type=int, default=16, help="Number of held-out good/bad prompts for trial scoring"
+    )
+    h.add_argument("--eval-max-tokens", type=int, default=24)
+    h.add_argument("--batch-size", type=int, default=8)
+    h.add_argument("--trials", type=int, default=6, help="Number of Heretic parameter trials to evaluate")
+    h.add_argument(
+        "--enable-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Evaluate residual stream inside <think> rather than after </think>",
+    )
+    h.add_argument("--device-map", default="auto")
+    h.add_argument("--seed", type=int, default=42)
+
     return parser
 
 
@@ -257,6 +297,10 @@ def main(argv: list[str] | None = None) -> None:
             from warp_quant.rco.runner import run_rco_cli
 
             run_rco_cli(args)
+        elif args.cmd == "heretic-lora":
+            from warp_quant.heretic_lora import run_heretic_lora
+
+            run_heretic_lora(args)
     except BaseException as exc:
         run_fail(error=str(exc))
         raise

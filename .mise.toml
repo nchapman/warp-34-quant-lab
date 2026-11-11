@@ -68,3 +68,8 @@ run = "uv run --no-sync warp-quant quantize"
 [tasks.probe]
 description = "Run W4A16-HGPTQ fidelity probe across text, MTP, and vision suites (pass CLI args after `--`)"
 run = "uv run --no-sync warp-quant probe"
+
+[tasks."heretic-lora"]
+description = "Extract an unrotated BF16 Heretic abliteration LoRA adapter for vLLM & PEFT (pass CLI args after `--`)"
+run = "uv run --no-sync warp-quant heretic-lora"
+
