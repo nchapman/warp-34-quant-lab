@@ -144,6 +144,25 @@ def test_compute_lora_factors_modes() -> None:
     err_full = (LA.vector_norm(W + lora_B_full @ lora_A_full, dim=1) - orig_norms).abs().mean()
     assert err_full < err_none
 
+    # 4. 3D fused expert tensor (E=4, d_out=32, d_in=24) for PEFT ParamWrapper target_parameters
+    W_3d = torch.randn(4, 32, 24)
+    a3, b3 = compute_lora_factors(W_3d, v, 1.0, row_normalization=RowNormalization.NONE, lora_rank=1)
+    assert a3.shape == (4, 24)
+    assert b3.shape == (32, 4)
+    delta_3d = torch.einsum("o r e, e r i -> e o i", b3.reshape(32, 1, 4), a3.reshape(4, 1, 24))
+    res_3d = torch.einsum("o, e o i -> e i", v, W_3d + delta_3d)
+    assert torch.allclose(res_3d, torch.zeros_like(res_3d), atol=1e-5)
+
+    a3_pre, b3_pre = compute_lora_factors(W_3d, v, 1.0, row_normalization=RowNormalization.PRE, lora_rank=1)
+    assert a3_pre.shape == (4, 24)
+    assert b3_pre.shape == (32, 4)
+
+    a3_full, b3_full = compute_lora_factors(
+        W_3d, v, 1.15, row_normalization=RowNormalization.FULL, lora_rank=2, seed=42
+    )
+    assert a3_full.shape == (8, 24)
+    assert b3_full.shape == (32, 8)
+
 
 def test_in_memory_lora_applicator_and_save(tmp_path: Path) -> None:
     torch.manual_seed(11)
@@ -181,7 +200,11 @@ def test_in_memory_lora_applicator_and_save(tmp_path: Path) -> None:
     applicator.remove()
     assert torch.allclose(mod0(x), base_out, atol=1e-6)
 
-    # Saving produces canonical PEFT + vLLM structure
+    # Saving produces canonical PEFT + vLLM structure (including 3D target_parameters)
+    deltas["model.language_model.layers.0.mlp.experts.down_proj"] = (
+        torch.randn(4, 8),
+        torch.randn(16, 4),
+    )
     save_peft_lora_adapter(
         tmp_path,
         deltas,
@@ -193,12 +216,15 @@ def test_in_memory_lora_applicator_and_save(tmp_path: Path) -> None:
     assert cfg["peft_type"] == "LORA"
     assert cfg["r"] == 1
     assert "model.language_model.layers.0.linear_attn.out_proj" in cfg["target_modules"]
+    assert cfg["target_parameters"] == ["model.language_model.layers.0.mlp.experts.down_proj"]
 
     tensors = load_file(str(tmp_path / "adapter_model.safetensors"))
     assert "base_model.model.model.language_model.layers.0.linear_attn.out_proj.lora_A.weight" in tensors
     assert (
         "base_model.model.model.language_model.layers.0.mlp.shared_expert.down_proj.lora_B.weight" in tensors
     )
+    assert "base_model.model.model.language_model.layers.0.mlp.experts.lora_A.weight" in tensors
+    assert "base_model.model.model.language_model.layers.0.mlp.experts.lora_B.weight" in tensors
 
 
 def test_refusal_matcher_and_helpers() -> None:

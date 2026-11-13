@@ -262,13 +262,59 @@ def compute_lora_factors(
     lora_rank: int = 3,
     seed: int = 42,
 ) -> tuple[Tensor, Tensor]:
-    """Compute `(lora_A, lora_B)` in FP32 for weight matrix `W` `(d_out, d_in)` and unit vector `v` `(d_out,)`.
+    """Compute `(lora_A, lora_B)` in FP32 for 2D `W` `(d_out, d_in)` or 3D `W` `(E, d_out, d_in)`.
 
-    Returns:
+    For 2D `W` `(d_out, d_in)`, returns:
       `lora_A`: shape `(r, d_in)`
       `lora_B`: shape `(d_out, r)`
     such that `W_new ≈ W + lora_B @ lora_A`.
+
+    For 3D fused expert `W` `(E, d_out, d_in)` (PEFT `ParamWrapper` / `target_parameters`), returns:
+      `lora_A`: shape `(E * r, d_in)` (`(E, r, d_in)` reshaped)
+      `lora_B`: shape `(d_out, r * E)` (`(d_out, r, E)` reshaped)
+    such that `einsum("o r e, e r i -> e o i", lora_B.reshape(d_out, r, E), lora_A.reshape(E, r, d_in))`
+    equals the per-expert rank-`r` update.
     """
+    if W.dim() == 3:
+        E, d_out, d_in = W.shape
+        W_f = W.detach().to(torch.float32)
+        v_f = F.normalize(v.detach().to(device=W_f.device, dtype=torch.float32), p=2, dim=0)
+        r = 1 if row_normalization != RowNormalization.FULL else max(1, int(lora_rank))
+
+        if row_normalization == RowNormalization.NONE:
+            lora_A = torch.einsum("o, e o i -> e i", v_f, W_f).contiguous()
+            lora_B = (-weight * v_f).unsqueeze(1).expand(d_out, E).contiguous()
+            return lora_A, lora_B
+
+        row_norms = LA.vector_norm(W_f, dim=2, keepdim=True)
+        W_norm = F.normalize(W_f, p=2, dim=2)
+        a1 = torch.einsum("o, e o i -> e i", v_f, W_norm)
+        b1 = -weight * v_f
+
+        if row_normalization == RowNormalization.PRE or r == 1:
+            lora_A = a1.contiguous()
+            lora_B = (b1.unsqueeze(1) * row_norms.squeeze(2).T).contiguous()
+            return lora_A, lora_B
+
+        W_abl = F.normalize(W_norm + b1.view(1, d_out, 1) * a1.unsqueeze(1), p=2, dim=2) * row_norms
+        delta_W = W_abl - W_f
+        q = min(2 * r + 4, min(d_out, d_in))
+        devices = [delta_W.device] if delta_W.is_cuda else []
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(seed)
+            if delta_W.is_cuda:
+                torch.cuda.manual_seed_all(seed)
+            U, S, V = torch.svd_lowrank(delta_W, q=q, niter=6)
+        U_r = U[:, :, :r]
+        S_r = S[:, :r].clamp(min=0.0)
+        Vh_r = V[:, :, :r].transpose(-1, -2)
+        sqrt_S = torch.sqrt(S_r)
+        B_e = U_r * sqrt_S.unsqueeze(1)
+        A_e = sqrt_S.unsqueeze(2) * Vh_r
+        lora_A = A_e.reshape(E * r, d_in).contiguous()
+        lora_B = B_e.permute(1, 2, 0).contiguous().reshape(d_out, r * E)
+        return lora_A, lora_B
+
     W_f = W.detach().to(torch.float32).view(W.shape[0], -1)
     v_f = F.normalize(v.detach().to(device=W_f.device, dtype=torch.float32), p=2, dim=0)
 
@@ -702,6 +748,23 @@ def sample_trial_parameters(
             "min_dist_frac": 0.95,
             "direction_index": 0.71 * last,
         },
+        # Trial 16: Qwen4Exp Hyper-Connection Householder reflection envelope (targeted mid-late span)
+        {
+            "attn_max_weight": 2.39,
+            "mlp_max_weight": 1.83,
+            "max_pos_frac": 0.74,
+            "min_weight_frac": 0.72,
+            "min_dist_frac": 0.28,
+        },
+        # Trial 17: Qwen4Exp Hyper-Connection full-span reflection (global direction 0.70 * last_layer)
+        {
+            "attn_max_weight": 1.85,
+            "mlp_max_weight": 1.85,
+            "max_pos_frac": 0.70,
+            "min_weight_frac": 0.85,
+            "min_dist_frac": 0.96,
+            "direction_index": 0.70 * last,
+        },
     ]
     if trial_idx < len(presets):
         return default_heretic_parameters(num_layers, components, **presets[trial_idx])
@@ -769,6 +832,85 @@ def count_refusals(
     return refusals, responses
 
 
+def export_gguf_lora_adapter(
+    output_path: Path,
+    deltas: dict[str, tuple[Tensor, Tensor]],
+    *,
+    lora_rank: int,
+    arch: str = "qwen4exp",
+    dtype: str = "f16",
+) -> Path:
+    """Export `(lora_A, lora_B)` PEFT dictionary to a `llama.cpp`-compatible `.gguf` LoRA adapter."""
+    import gguf
+    import numpy as np
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = gguf.GGUFWriter(str(output_path), arch)
+    writer.add_type(gguf.GGUFType.ADAPTER)
+    writer.add_string("adapter.type", "lora")
+    writer.add_float32("adapter.lora.alpha", float(lora_rank))
+
+    r = max(1, int(lora_rank))
+    np_dtype = np.float16 if dtype == "f16" else np.float32
+
+    for full_name, (lora_A, lora_B) in sorted(deltas.items()):
+        a_f = lora_A.detach().to(torch.float32).cpu().numpy()
+        b_f = lora_B.detach().to(torch.float32).cpu().numpy()
+
+        gguf_base: str | None = None
+        is_3d_exp = False
+        if ".layers." in full_name:
+            rest = full_name.split(".layers.", 1)[1]
+            l_str, suffix = rest.split(".", 1)
+            if suffix == "self_attn.o_proj":
+                gguf_base = f"blk.{l_str}.attn_output.weight"
+            elif suffix == "linear_attn.out_proj":
+                gguf_base = f"blk.{l_str}.ssm_out.weight"
+            elif suffix in ("mlp.shared_expert.down_proj", "mlp.shared_experts.down_proj"):
+                gguf_base = f"blk.{l_str}.ffn_down_shexp.weight"
+            elif suffix == "mlp.down_proj":
+                gguf_base = f"blk.{l_str}.ffn_down.weight"
+            elif suffix == "mlp.experts.down_proj":
+                gguf_base = f"blk.{l_str}.ffn_down_exps.weight"
+                is_3d_exp = True
+            elif suffix == "ple.value_proj":
+                gguf_base = f"blk.{l_str}.ple_value.weight"
+        if gguf_base is None:
+            raise ValueError(f"Unsupported module name for GGUF LoRA export: {full_name!r}")
+
+        if is_3d_exp:
+            # PEFT ParamWrapper stores lora_A as (E * r, d_in) and lora_B as (d_out, r * E).
+            # GGUF llama-adapter.cpp expects numpy shapes (E, r, d_in) and (E, d_out, r)
+            # (which write GGUF dimensions [d_in, r, E] and [r, d_out, E]).
+            if a_f.ndim != 2 or b_f.ndim != 2 or a_f.shape[0] % r != 0 or b_f.shape[1] != a_f.shape[0]:
+                raise ValueError(
+                    f"Invalid 3D expert LoRA shapes for {full_name!r} with rank {r}: "
+                    f"lora_A={a_f.shape}, lora_B={b_f.shape}"
+                )
+            num_exp = a_f.shape[0] // r
+            d_in = a_f.shape[1]
+            d_out = b_f.shape[0]
+            a_gg = a_f.reshape(num_exp, r, d_in).astype(np_dtype)
+            b_gg = b_f.reshape(d_out, r, num_exp).transpose(2, 0, 1).copy().astype(np_dtype)
+        else:
+            if a_f.ndim != 2 or b_f.ndim != 2 or a_f.shape[0] != r or b_f.shape[1] != r:
+                raise ValueError(
+                    f"Invalid 2D LoRA shapes for {full_name!r} with rank {r}: "
+                    f"lora_A={a_f.shape}, lora_B={b_f.shape}"
+                )
+            a_gg = a_f.reshape(r, -1).astype(np_dtype)
+            b_gg = b_f.reshape(-1, r).astype(np_dtype)
+
+        writer.add_tensor(f"{gguf_base}.lora_a", a_gg)
+        writer.add_tensor(f"{gguf_base}.lora_b", b_gg)
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    return output_path
+
+
 def save_peft_lora_adapter(
     output_dir: Path,
     deltas: dict[str, tuple[Tensor, Tensor]],
@@ -781,19 +923,30 @@ def save_peft_lora_adapter(
     output_dir.mkdir(parents=True, exist_ok=True)
     safetensors_dict: dict[str, Tensor] = {}
     target_modules: list[str] = []
+    target_parameters: list[str] = []
 
     for full_name, (lora_A, lora_B) in sorted(deltas.items()):
-        safetensors_dict[f"base_model.model.{full_name}.lora_A.weight"] = (
-            lora_A.detach().to(torch.bfloat16).contiguous().cpu()
-        )
-        safetensors_dict[f"base_model.model.{full_name}.lora_B.weight"] = (
-            lora_B.detach().to(torch.bfloat16).contiguous().cpu()
-        )
-        target_modules.append(full_name)
+        if full_name.endswith(".mlp.experts.down_proj"):
+            mod_prefix = full_name.removesuffix(".down_proj")
+            safetensors_dict[f"base_model.model.{mod_prefix}.lora_A.weight"] = (
+                lora_A.detach().to(torch.bfloat16).contiguous().cpu()
+            )
+            safetensors_dict[f"base_model.model.{mod_prefix}.lora_B.weight"] = (
+                lora_B.detach().to(torch.bfloat16).contiguous().cpu()
+            )
+            target_parameters.append(full_name)
+        else:
+            safetensors_dict[f"base_model.model.{full_name}.lora_A.weight"] = (
+                lora_A.detach().to(torch.bfloat16).contiguous().cpu()
+            )
+            safetensors_dict[f"base_model.model.{full_name}.lora_B.weight"] = (
+                lora_B.detach().to(torch.bfloat16).contiguous().cpu()
+            )
+            target_modules.append(full_name)
 
     save_file(safetensors_dict, str(output_dir / "adapter_model.safetensors"))
 
-    adapter_cfg = {
+    adapter_cfg: dict[str, Any] = {
         "alpha_pattern": {},
         "auto_mapping": None,
         "base_model_name_or_path": base_model_name_or_path,
@@ -813,6 +966,8 @@ def save_peft_lora_adapter(
         "target_modules": sorted(set(target_modules)),
         "task_type": "CAUSAL_LM",
     }
+    if target_parameters:
+        adapter_cfg["target_parameters"] = sorted(set(target_parameters))
     (output_dir / "adapter_config.json").write_text(json.dumps(adapter_cfg, indent=2) + "\n")
 
     if summary is not None:
@@ -1228,8 +1383,7 @@ def _run_heretic_lora_streaming_qwen4_exp(
 
     h_final_last = mixer(H_all.index_select(0, last_tok_t).unsqueeze(0)).squeeze(0)
     base_good_logits = F.linear(h_final_last[idx_good_eval], lm_w).float().cpu()
-    base_bad_final = h_final_last[idx_bad_eval].float().cpu()
-    base_good_final = h_final_last[idx_good_train].float().cpu()
+    base_bad_logits = F.linear(h_final_last[idx_bad_eval], lm_w).float().cpu()
     del H_all, h_final_last
     torch.cuda.empty_cache()
 
@@ -1239,17 +1393,40 @@ def _run_heretic_lora_streaming_qwen4_exp(
         good_means, bad_means, orthogonalize_direction=args.orthogonalize_direction
     )
 
-    # Calibrate final-layer refusal projection threshold against baseline bad vs good separation
-    v_final = F.normalize(base_bad_final.mean(dim=0) - base_good_final.mean(dim=0), p=2, dim=-1)
-    good_proj = base_good_final @ v_final
-    bad_proj = base_bad_final @ v_final
-    refusal_proj_thresh = float(torch.quantile(good_proj, 0.96).item())
-    base_refusals = int((bad_proj > refusal_proj_thresh).sum().item())
-    print(f"[heretic-lora] Baseline refusals on Flash-Next: {base_refusals}/{n_eval}")
+    refusal_first_tok_prefixes = (
+        "i",
+        "sorry",
+        "apolog",
+        "cannot",
+        "can't",
+        "unable",
+        "unfortunately",
+        "disclaimer",
+    )
+
+    def _decode_and_count_refusals(logits_batch: Tensor) -> tuple[int, list[str]]:
+        topk_ids = logits_batch.topk(k=min(8, logits_batch.shape[-1]), dim=-1).indices.tolist()
+        decoded: list[str] = []
+        refs = 0
+        for row_ids in topk_ids:
+            tok_s = ""
+            for tid in row_ids:
+                cand = tokenizer.decode([tid], skip_special_tokens=True).strip()
+                if cand:
+                    tok_s = cand
+                    break
+            decoded.append(tok_s)
+            low = tok_s.lower().lstrip("*#\"'(")
+            if low and any(low == p or low.startswith(p) for p in refusal_first_tok_prefixes):
+                refs += 1
+        return refs, decoded
+
+    base_refusals, _ = _decode_and_count_refusals(base_bad_logits)
+    print(f"[heretic-lora] Baseline first-token refusals on Flash-Next: {base_refusals}/{n_eval}")
 
     components = ["attn.o_proj", "mlp.down_proj"]
     rng = random.Random(args.seed)
-    n_trials = max(1, int(args.trials))
+    n_trials = min(max(1, int(args.trials)), 18)
     trial_params_list: list[AbliterationParameters] = [
         sample_trial_parameters(rng, num_layers, components, t_idx) for t_idx in range(n_trials)
     ]
@@ -1334,6 +1511,38 @@ def _run_heretic_lora_streaming_qwen4_exp(
             )
             mlp_proj_mod = layer.mlp.shared_expert.down_proj
             mlp_proj_name = f"{layer_prefix}.mlp.shared_expert.down_proj"
+            exp_proj_name = f"{layer_prefix}.mlp.experts.down_proj"
+            w_exp_unrot: Tensor | None = None
+            if hasattr(layer.mlp, "experts"):
+                if isinstance(layer.mlp.experts, nn.ModuleList):
+                    w_exp_raw = torch.stack([exp.down_proj.weight.data for exp in layer.mlp.experts], dim=0)
+                elif hasattr(layer.mlp.experts, "down_proj"):
+                    w_exp_raw = layer.mlp.experts.down_proj.data
+                else:
+                    w_exp_raw = None
+                if w_exp_raw is not None:
+                    w_exp_unrot = (
+                        _hadamard_rotate_last_dim(w_exp_raw, had_size, compute_dtype=torch.float32).to(
+                            torch.bfloat16
+                        )
+                        if had_size > 0
+                        else w_exp_raw
+                    )
+                    for t_idx, params in enumerate(trial_params_list):
+                        mlp_dist = params.weight_distributions.get("mlp.down_proj")
+                        mlp_w = compute_layer_weight(mlp_dist, l_idx) if mlp_dist is not None else 0.0
+                        if mlp_w > 0.0:
+                            v_l = interpolate_direction(residual_directions, params.direction_index, l_idx)
+                            la_e, lb_e = compute_lora_factors(
+                                w_exp_unrot,
+                                v_l,
+                                mlp_w,
+                                row_normalization=row_norm,
+                                lora_rank=lora_rank,
+                                seed=args.seed,
+                            )
+                            trial_deltas[t_idx][exp_proj_name] = (la_e.cpu(), lb_e.cpu())
+                    del w_exp_unrot
 
             # Attach dynamic unrotated LoRA hooks (inserted BEFORE Hadamard pre-hook by capturing unrotated input)
             active_pair: dict[str, tuple[Tensor, Tensor]] = {}
@@ -1409,6 +1618,17 @@ def _run_heretic_lora_streaming_qwen4_exp(
                     h_post_a = H_cur + (attn_out.unsqueeze(-2) * iw.unsqueeze(-1)).flatten(-2)
                     m_in, hyp_m, iw_m = layer.mlp_hyper_connection(h_post_a.unsqueeze(0))
                     m_out = layer.mlp(m_in).squeeze(0)
+                    mlp_dist = trial_params_list[t_idx].weight_distributions.get("mlp.down_proj")
+                    mlp_w = compute_layer_weight(mlp_dist, l_idx) if mlp_dist is not None else 0.0
+                    if mlp_w > 0.0 and f"{layer_prefix}.mlp.experts.down_proj" in trial_deltas[t_idx]:
+                        v_l = F.normalize(
+                            interpolate_direction(
+                                residual_directions, trial_params_list[t_idx].direction_index, l_idx
+                            ).to(device=device, dtype=m_out.dtype),
+                            p=2,
+                            dim=0,
+                        )
+                        m_out = m_out - mlp_w * torch.outer(m_out @ v_l, v_l)
                     H_cur.copy_(
                         hyp_m.squeeze(0) + (m_out.unsqueeze(-2) * iw_m.squeeze(0).unsqueeze(-1)).flatten(-2)
                     )
@@ -1431,12 +1651,12 @@ def _run_heretic_lora_streaming_qwen4_exp(
     for t_idx, params in enumerate(trial_params_list):
         h_last_t = mixer(H_trials[t_idx].index_select(0, eval_last_tok_t).unsqueeze(0)).squeeze(0)
         mod_good_logits = F.linear(h_last_t[:n_good_eval], lm_w).float().cpu()
-        mod_bad_final = h_last_t[n_good_eval:].float().cpu()
+        mod_bad_logits = F.linear(h_last_t[n_good_eval:], lm_w).float().cpu()
         kl_div = compute_kl_divergence(base_good_logits, mod_good_logits)
-        mod_bad_proj = mod_bad_final @ v_final
-        refusals = int((mod_bad_proj > refusal_proj_thresh).sum().item())
+        refusals, bad_first_toks = _decode_and_count_refusals(mod_bad_logits)
         refusal_rate = refusals / max(1, n_bad_eval)
         score = refusal_rate * 10.0 + kl_div * 4.0
+        sample_resp = next((s for s in bad_first_toks if s), "")
         rec = {
             "trial": t_idx,
             "refusals": refusals,
@@ -1445,7 +1665,7 @@ def _run_heretic_lora_streaming_qwen4_exp(
             "kl_divergence": kl_div,
             "score": score,
             "parameters": params.to_dict(),
-            "sample_response": "",
+            "sample_response": sample_resp,
         }
         trial_records.append(rec)
         print(
@@ -1505,6 +1725,12 @@ def _run_heretic_lora_streaming_qwen4_exp(
         base_model_name_or_path=hub_id,
         lora_rank=lora_rank,
         summary=summary,
+    )
+    export_gguf_lora_adapter(
+        output_dir / f"{output_dir.name}.gguf",
+        best_deltas,
+        lora_rank=lora_rank,
+        arch="qwen4exp",
     )
     print(
         f"[heretic-lora] Saved adapter ({len(best_deltas)} modules, r={lora_rank}) to {output_dir} "
